@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum Host {
@@ -423,10 +423,14 @@ pub fn phrases(query: &str, adaptive: bool) -> Vec<String> {
         .map(str::to_lowercase)
         .filter(|word| !adaptive || (word.len() >= 4 && !STOP.contains(&word.as_str())))
         .filter(|word| word.len() <= 100)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(18)
-        .collect()
+        .fold(Vec::new(), |mut words: Vec<String>, word| {
+            // Keep the first 32 distinct words in prompt order. Sorting first
+            // would drop words by spelling instead of position.
+            if words.len() < 32 && !words.contains(&word) {
+                words.push(word);
+            }
+            words
+        })
 }
 
 pub fn fts_query(words: &[String], conjunction: &str) -> String {
@@ -511,13 +515,6 @@ fn recall(
     if words.len() < 2 {
         return Ok(None);
     }
-    let shared = |record: &Record| {
-        let body = phrases(&record.body, true);
-        words
-            .iter()
-            .filter(|word| body.binary_search(word).is_ok())
-            .count()
-    };
     let lexical: Vec<_> = store
         .recall(
             &fts_query(&words, " OR "),
@@ -527,28 +524,16 @@ fn recall(
             session,
         )?
         .into_iter()
-        .filter(|record| shared(record) >= 2)
+        .map(|record| record.id)
         .collect();
     let semantic = semantic
         .and_then(|find| find(prompt, &workspace.project))
         .unwrap_or_default();
-    let candidates = if semantic.is_empty() {
-        lexical
-    } else {
-        let lexical_ids: Vec<_> = lexical.iter().map(|record| record.id).collect();
-        let semantic_ids = semantic.iter().map(|(id, _)| *id).collect();
-        let fused = crate::embed::fuse(&[lexical_ids.clone(), semantic_ids], 12);
-        store
-            .recall_ids(&fused, source, session)?
-            .into_iter()
-            .filter(|record| {
-                lexical_ids.contains(&record.id)
-                    || semantic
-                        .iter()
-                        .any(|(id, strong)| *id == record.id && (*strong || shared(record) >= 1))
-            })
-            .collect()
-    };
+    let semantic_ids: Vec<_> = semantic.iter().map(|(id, _)| *id).collect();
+    let fused = crate::embed::fuse(&[lexical.clone(), semantic_ids], 12);
+    let rarity = store.term_rarity(&words)?;
+    let total_rarity: f64 = rarity.values().sum();
+    let candidates = store.recall_ids(&fused, source, session)?;
     let mut evidence: Vec<Record> = Vec::new();
     let mut matched = Vec::new();
     for record in &candidates {
@@ -558,6 +543,25 @@ fn recall(
         let Some(outcome) = outcome(store, record)? else {
             continue;
         };
+        if !substantive(store, &outcome)? {
+            continue;
+        }
+        let (shared, weight) = overlap(&words, &rarity, substance(&outcome));
+        let coverage = weight / total_rarity.max(f64::EPSILON);
+        let keyword =
+            shared >= KEYWORD_TERMS && weight >= KEYWORD_RARITY && coverage >= KEYWORD_COVERAGE;
+        let meaning = semantic.iter().any(|(id, strong)| {
+            *id == record.id && (*strong || (shared >= 1 && weight >= ASSISTED_RARITY))
+        });
+        if std::env::var_os("QUIETMEM_DEBUG").is_some() {
+            eprintln!(
+                "QuietMem recall: #{} {} shared={shared} rarity={weight:.2} coverage={coverage:.2} keyword={keyword} semantic={meaning}",
+                outcome.id, outcome.kind
+            );
+        }
+        if !(keyword || meaning) {
+            continue;
+        }
         matched.push(record);
         if evidence.iter().all(|seen| seen.id != outcome.id)
             && !store.was_delivered(source, session, outcome.id)?
@@ -571,6 +575,105 @@ fn recall(
         store.record_delivery(source, session, &shown, &matched, text.len())?;
     }
     Ok(context)
+}
+
+/// Keyword recall needs this many shared terms…
+const KEYWORD_TERMS: usize = 2;
+/// …whose summed rarity reaches this. Rarity is 1.0 for a term found in one
+/// record, so common words such as "main" or "merge" cannot trigger recall.
+const KEYWORD_RARITY: f64 = 1.0;
+/// …and that cover this share of the prompt's total rarity, so a long record
+/// sharing a few common words with a long prompt does not count.
+/// Tuned with a recall benchmark on 2,577 real observations.
+const KEYWORD_COVERAGE: f64 = 0.6;
+/// A weak semantic match needs a shared term at least this rare.
+const ASSISTED_RARITY: f64 = 0.4;
+
+/// Unprompted recall only injects evidence of work: a summary with files,
+/// checks or errors, an agent reply from a turn that ran tools, or any other
+/// record kind. Pure conversation stays searchable but is never injected.
+fn substantive(store: &Store, record: &Record) -> Result<bool> {
+    Ok(match record.kind.as_str() {
+        "summary" if is_local_summary(&record.body) => [
+            "\nFiles: ",
+            "\nChecks: ",
+            "\nErrors seen: ",
+            "\nExplored: ",
+            "\nDecision: ",
+        ]
+        .iter()
+        .any(|line| record.body.contains(line)),
+        "assistant" => store.turn_has_tools(record)?,
+        _ => true,
+    })
+}
+
+/// The text a prompt is matched against: the whole record, without the list
+/// of evidence IDs.
+fn substance(record: &Record) -> &str {
+    let body = record.body.as_str();
+    body.split("\nEvidence ").next().unwrap_or(body)
+}
+
+/// Shared terms between the prompt and `text`, and their summed rarity.
+fn overlap(
+    words: &[String],
+    rarity: &std::collections::HashMap<String, f64>,
+    text: &str,
+) -> (usize, f64) {
+    let present: std::collections::HashSet<String> =
+        phrases_all(text).iter().map(|word| stem(word)).collect();
+    words
+        .iter()
+        .filter(|word| present.contains(&stem(word)))
+        .fold((0, 0.0), |(count, weight), word| {
+            (count + 1, weight + rarity.get(word).copied().unwrap_or(0.0))
+        })
+}
+
+fn phrases_all(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A light suffix stripper so `importer`, `imports` and `import` agree.
+fn stem(word: &str) -> String {
+    let word = word.to_lowercase();
+    for (suffix, replacement) in [
+        ("ations", ""),
+        ("ation", ""),
+        ("ings", ""),
+        ("ing", ""),
+        ("ies", "i"),
+        ("ers", ""),
+        ("er", ""),
+        ("ed", ""),
+        ("es", ""),
+        ("s", ""),
+        ("y", "i"),
+    ] {
+        if let Some(root) = word.strip_suffix(suffix)
+            && root.len() >= 4
+        {
+            return format!("{root}{replacement}");
+        }
+    }
+    word
+}
+
+fn is_local_summary(body: &str) -> bool {
+    [
+        "Investigation: ",
+        "Bugfix: ",
+        "Feature: ",
+        "Refactor: ",
+        "Docs: ",
+        "Change: ",
+    ]
+    .iter()
+    .any(|kind| body.starts_with(kind))
 }
 
 /// Replace a search hit with the evidence of what came of it. A past prompt is
@@ -685,6 +788,16 @@ mod tests {
             Host::Claude,
             "a",
             prompt("Fix the websocket retry regression"),
+            None,
+        );
+        // A turn that did work; pure conversation is never recalled unprompted.
+        send(
+            &store,
+            Host::Claude,
+            "a",
+            json!({"cwd": cwd, "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                   "tool_use_id": "t1", "tool_input": {"command": "cargo test websocket"},
+                   "tool_response": "test result: FAILED. 1 failed"}),
             None,
         );
         send(

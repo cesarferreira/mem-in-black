@@ -496,6 +496,47 @@ impl Store {
         Ok(records)
     }
 
+    /// The rarity of each term, scaled to the size of the history: 1.0 for a
+    /// term in a single record, near 0 for a term in every record. The search
+    /// index applies stemming, so `retries` also counts `retry`.
+    pub fn term_rarity(&self, terms: &[String]) -> Result<std::collections::HashMap<String, f64>> {
+        let _guard = self.read_guard()?;
+        let total: i64 = self
+            .db
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))?;
+        let mut frequency = self
+            .db
+            .prepare("SELECT count(*) FROM event_search WHERE event_search MATCH ?1")?;
+        let mut rarity = std::collections::HashMap::new();
+        for term in terms {
+            let query = format!("\"{}\"", term.replace('"', ""));
+            let documents: i64 = frequency.query_row([&query], |row| row.get(0))?;
+            if documents > 0 {
+                let records = total.max(1) as f64 + 1.0;
+                rarity.insert(
+                    term.clone(),
+                    (records / documents as f64).ln() / records.ln(),
+                );
+            }
+        }
+        Ok(rarity)
+    }
+
+    /// Whether the turn that produced `reply` ran any tools.
+    pub fn turn_has_tools(&self, reply: &Record) -> Result<bool> {
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events e
+               WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3 AND e.kind = 'tool'
+                 AND e.id < ?4
+                 AND e.id > coalesce((SELECT max(p.id) FROM events p
+                     WHERE p.source = ?1 AND p.session = ?2 AND p.workspace = ?3
+                       AND p.kind = 'prompt' AND p.id < ?4), 0))",
+            params![reply.source, reply.session, reply.workspace, reply.id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn has_work(&self, source: &str, session: &str) -> Result<bool> {
         let _guard = self.read_guard()?;
         Ok(self.db.query_row(

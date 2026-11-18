@@ -147,7 +147,7 @@ that look like credentials are not stored.
 | `RAYON_NUM_THREADS` | Threads for semantic search. Default 2 |
 | `QUIETMEM_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
 | `QUIETMEM_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
-| `QUIETMEM_DEBUG=1` | Print hook errors |
+| `QUIETMEM_DEBUG=1` | Print hook errors and why each record was or was not recalled |
 
 QuietMem uses WAL journaling on local disks and switches to rollback journaling on
 NFS and SMB mounts.

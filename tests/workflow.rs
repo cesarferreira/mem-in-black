@@ -1757,3 +1757,77 @@ fn t3code_install_configures_each_enabled_provider_home() {
         "only T3's providers are configured with --host t3code"
     );
 }
+
+fn context(output: &str) -> String {
+    serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| {
+            value["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn recall_sees_every_word_of_a_long_record() {
+    let workspace = Workspace::new();
+    // Many words that sort before the important ones used to push them out.
+    let filler = (b'a'..=b'z')
+        .map(|letter| format!("{0}{0}{0}{0}filler", letter as char))
+        .collect::<Vec<_>>()
+        .join(" ");
+    workspace.hook(
+        "claude",
+        "old",
+        "UserPromptSubmit",
+        json!({"prompt":"Investigate the import"}),
+    );
+    workspace.hook("claude", "old", "PostToolUse", json!({"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"quietmem import upstream.db"},"tool_response":format!("{filler}\nError: missing observations.sdk_session_id column")}));
+    workspace.hook(
+        "claude",
+        "old",
+        "Stop",
+        json!({"last_assistant_message":"The importer only accepts sdk_session_id."}),
+    );
+    let recalled = context(&workspace.hook(
+        "codex",
+        "new",
+        "UserPromptSubmit",
+        json!({"prompt":"the importer fails with missing observations sdk_session_id"}),
+    ));
+    assert!(recalled.contains("sdk_session_id column"), "{recalled}");
+}
+
+#[test]
+fn chat_turns_and_common_words_do_not_trigger_recall() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    // A pure conversation turn: no tools, so its summary carries no evidence.
+    workspace.hook(
+        "claude",
+        "chat",
+        "UserPromptSubmit",
+        json!({"prompt":"merge it to main, I will think about the name"}),
+    );
+    workspace.hook(
+        "claude",
+        "chat",
+        "Stop",
+        json!({"last_assistant_message":"Merged to main. Take your time on the name."}),
+    );
+    workspace.run(&["observe"], None);
+    for prompt in [
+        "merge it to main. i'll think about the name a bit more",
+        "yes go ahead and commit as you go along",
+        "please do that",
+    ] {
+        let recalled = context(&workspace.hook(
+            "codex",
+            &format!("probe {prompt}"),
+            "UserPromptSubmit",
+            json!({"prompt": prompt}),
+        ));
+        assert!(recalled.is_empty(), "{prompt}: {recalled}");
+    }
+}
