@@ -1421,37 +1421,59 @@ fn a_correction_hides_the_outdated_record_and_forget_removes_derived_summaries()
 #[test]
 fn a_version_three_database_upgrades_and_keeps_its_records() {
     let workspace = Workspace::new();
-    workspace.seed();
-    let database = workspace.temp.path().join("data/memory.sqlite3");
+    let data = workspace.temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let database = data.join("memory.sqlite3");
+    // The schema exactly as QuietMem version 3 created it.
     let legacy = rusqlite::Connection::open(&database).unwrap();
     legacy
         .execute_batch(
-            "DROP TRIGGER event_delete; DROP TRIGGER event_update;
-             ALTER TABLE events DROP COLUMN superseded_by; PRAGMA user_version=3;",
+            "CREATE TABLE events (
+               id INTEGER PRIMARY KEY, source TEXT NOT NULL, session TEXT NOT NULL, event_key TEXT,
+               kind TEXT NOT NULL, body TEXT NOT NULL, workspace TEXT NOT NULL, project TEXT NOT NULL,
+               head TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+               UNIQUE(source, session, event_key)
+             );
+             CREATE INDEX events_workspace ON events(workspace, id DESC);
+             CREATE INDEX events_session ON events(source, session, id DESC);
+             CREATE VIRTUAL TABLE event_search USING fts5(body, content='events', content_rowid='id');
+             CREATE TRIGGER event_insert AFTER INSERT ON events BEGIN
+               INSERT INTO event_search(rowid, body) VALUES (new.id, new.body);
+             END;
+             CREATE TABLE sessions (source TEXT NOT NULL, session TEXT NOT NULL, private INTEGER NOT NULL,
+               PRIMARY KEY(source, session));
+             CREATE TABLE deliveries (source TEXT NOT NULL, session TEXT NOT NULL, event_id INTEGER NOT NULL,
+               PRIMARY KEY(source, session, event_id));
+             CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             ALTER TABLE events ADD COLUMN turn_id TEXT;
+             CREATE TABLE turn_privacy (source TEXT NOT NULL, session TEXT NOT NULL, turn_id TEXT NOT NULL,
+               private INTEGER NOT NULL, PRIMARY KEY(source, session, turn_id));
+             CREATE TABLE private_tools (source TEXT NOT NULL, session TEXT NOT NULL, tool_id TEXT NOT NULL,
+               PRIMARY KEY(source, session, tool_id));
+             INSERT INTO events(source, session, kind, body, workspace, project)
+               VALUES ('claude', 'old', 'tool', 'cargo test websocket_retry: expected three retries', '/w', 'p'),
+                      ('claude', 'old', 'assistant', 'Retrying after the handshake fixed it', '/w', 'p');
+             INSERT INTO deliveries VALUES ('codex', 'later', 2);
+             PRAGMA user_version=3;",
         )
         .unwrap();
     drop(legacy);
     let hits: Value =
         serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
-    let id = hits[0]["id"].as_i64().unwrap().to_string();
-    workspace.run(&["forget", &id], None);
+    assert_eq!(hits[0]["id"], 1);
+    workspace.run(&["forget", "1"], None);
     let after: Value =
         serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
-    assert!(
-        after
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["id"] != hits[0]["id"])
-    );
+    assert!(after.as_array().unwrap().iter().all(|row| row["id"] != 1));
     let stemmed: Value =
-        serde_json::from_str(&workspace.run(&["search", "retrying"], None)).unwrap();
-    assert!(!stemmed.as_array().unwrap().is_empty(), "porter stemming");
+        serde_json::from_str(&workspace.run(&["search", "retries"], None)).unwrap();
+    assert_eq!(stemmed[0]["id"], 2, "porter stemming matches `Retrying`");
     let version: i64 = rusqlite::Connection::open(&database)
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -1514,4 +1536,69 @@ fn harness_notifications_neither_recall_nor_become_requests() {
             .iter()
             .all(|row| row["kind"] != "prompt")
     );
+}
+
+/// Downloads a 90 MB model. Run with `cargo test -- --ignored semantic_search_end_to_end`.
+#[test]
+#[ignore]
+fn semantic_search_end_to_end_with_a_real_model() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.hook(
+        "claude",
+        "unrelated",
+        "UserPromptSubmit",
+        json!({"prompt":"Rename the billing export columns"}),
+    );
+    workspace.hook("claude", "unrelated", "Stop", json!({"last_assistant_message":"Renamed the CSV headers to snake_case for the finance team."}));
+    workspace.run(&["embeddings", "enable", "--model", "minilm"], None);
+    let mut worker = workspace
+        .command()
+        .arg("serve")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let records: i64 = 5;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let status: Value =
+            serde_json::from_str(&workspace.run(&["embeddings", "status"], None)).unwrap();
+        if status["embedded"].as_i64().unwrap() >= records {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{status}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // Shares no keyword with the stored records.
+    let results: Value = serde_json::from_str(&workspace.run(
+        &[
+            "search",
+            "why do reconnect attempts give up early",
+            "--limit",
+            "3",
+        ],
+        None,
+    ))
+    .unwrap();
+    let recalled = workspace.hook(
+        "codex",
+        "paraphrase",
+        "UserPromptSubmit",
+        json!({"prompt":"The websocket client stops reconnecting too early, why?"}),
+    );
+    let unrelated = workspace.hook(
+        "codex",
+        "unrelated-question",
+        "UserPromptSubmit",
+        json!({"prompt":"Update the Android release notes template for the next sprint"}),
+    );
+    workspace.run(&["stop"], None);
+    worker.wait().unwrap();
+    let top = results[0]["body"].as_str().unwrap();
+    assert!(top.contains("retry"), "{results:#}");
+    assert!(
+        recalled.contains("retry counter resets too soon"),
+        "{recalled}"
+    );
+    assert!(unrelated.is_empty(), "{unrelated}");
 }

@@ -122,6 +122,49 @@ QuietMem uses WAL on local disks and rollback journaling on detected NFS and
 SMB mounts. The worker switches a legacy database to the appropriate mode at
 startup. A local disk is the preferred location for active memory.
 
+## Semantic search
+
+Keyword search finds records that share words with your query. Semantic search
+also finds records that say the same thing in different words, such as
+"reconnect attempts give up early" for a record about a retry counter.
+
+```sh
+quietmem embeddings enable
+quietmem embeddings status
+```
+
+`enable` downloads Snowflake arctic-embed-m v1.5 (436 MB) from Hugging Face once, verifies every file
+against a pinned SHA-256 digest, and restarts the worker. The model runs locally on
+the CPU. No memory text leaves your machine. The worker embeds existing records in
+the background, and new records as they arrive. Until it finishes, and whenever the
+worker is stopped, search uses keywords only.
+
+Search, the MCP `search` tool, and the viewer combine keyword and semantic matches.
+Automatic recall is stricter, because it adds context you did not ask for. A
+semantic match is recalled when its similarity clears a floor calibrated on
+unrelated queries, or a slightly lower floor when it also shares a keyword with
+your prompt. Unrelated prompts still get no context.
+
+Choose another model with `--model`. `quietmem embeddings disable` returns to
+keyword search and keeps downloaded models on disk.
+
+`--model` accepts the models below. The scores come from `quietmem eval` on 2,577
+real Claude Mem observations. Each query is an observation's title or first fact,
+with those fields removed from the stored text. MRR@10 is the mean reciprocal rank
+of the right record (1.0 means always first).
+
+| Model | Download | Hybrid MRR (titles) | Hybrid MRR (facts) | Query time |
+| --- | --- | --- | --- | --- |
+| Keywords only | none | 0.753 | 0.452 | 5 ms |
+| `minilm` | 91 MB | 0.727 | 0.447 | 27 ms |
+| `bge-small` | 134 MB | 0.765 | 0.465 | 53 ms |
+| `bge-base` | 439 MB | 0.775 | 0.483 | 104 ms |
+| `arctic-m` (default) | 436 MB | 0.783 | 0.484 | 104 ms |
+
+These queries share many words with their answers, so keywords already score well.
+Semantic search matters most when you describe a problem in different words than
+the record used.
+
 ## Move existing history
 
 ```sh

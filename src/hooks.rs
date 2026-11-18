@@ -50,7 +50,16 @@ struct Input {
     error: Option<String>,
 }
 
-pub fn handle(store: &Store, host: Host, input: impl Read) -> Result<Option<Value>> {
+/// Semantic matches for a prompt within a project, ranked. `true` marks a
+/// match strong enough on its own; `false` needs a shared keyword as well.
+pub type Semantic<'a> = &'a dyn Fn(&str, &str) -> Option<Vec<(i64, bool)>>;
+
+pub fn handle(
+    store: &Store,
+    host: Host,
+    input: impl Read,
+    semantic: Option<Semantic<'_>>,
+) -> Result<Option<Value>> {
     let event: Input = serde_json::from_reader(input)?;
     if event.hook_event_name == "SessionStart" {
         if !matches!(event.source.as_deref(), None | Some("startup" | "clear"))
@@ -110,8 +119,8 @@ pub fn handle(store: &Store, host: Host, input: impl Read) -> Result<Option<Valu
                 return Ok(None);
             }
             let prompt = clean(&event.prompt, 1600);
-            let context =
-                recall(store, &workspace, source, session, &prompt).context("selecting context")?;
+            let context = recall(store, &workspace, source, session, &prompt, semantic)
+                .context("selecting context")?;
             let key = turn_id.map(|turn| format!("prompt:{turn}"));
             write("prompt", &prompt, key.as_deref()).context("storing prompt")?;
             Ok(context.map(|additional_context| {
@@ -427,6 +436,7 @@ fn recall(
     source: &str,
     session: &str,
     prompt: &str,
+    semantic: Option<Semantic<'_>>,
 ) -> Result<Option<String>> {
     let lower = prompt.trim().to_ascii_lowercase();
     let directive = ["please ", "can you ", "could you "]
@@ -494,23 +504,47 @@ fn recall(
     if words.len() < 2 {
         return Ok(None);
     }
-    let candidates = store.recall(
-        &fts_query(&words, " OR "),
-        &workspace.project,
-        &workspace.root,
-        source,
-        session,
-    )?;
-    let mut evidence: Vec<Record> = Vec::new();
-    let mut matched = Vec::new();
-    for record in candidates.iter().filter(|record| {
+    let shared = |record: &Record| {
         let body = phrases(&record.body, true);
         words
             .iter()
             .filter(|word| body.binary_search(word).is_ok())
             .count()
-            >= 2
-    }) {
+    };
+    let lexical: Vec<_> = store
+        .recall(
+            &fts_query(&words, " OR "),
+            &workspace.project,
+            &workspace.root,
+            source,
+            session,
+        )?
+        .into_iter()
+        .filter(|record| shared(record) >= 2)
+        .collect();
+    let semantic = semantic
+        .and_then(|find| find(prompt, &workspace.project))
+        .unwrap_or_default();
+    let candidates = if semantic.is_empty() {
+        lexical
+    } else {
+        let lexical_ids: Vec<_> = lexical.iter().map(|record| record.id).collect();
+        let semantic_ids = semantic.iter().map(|(id, _)| *id).collect();
+        let fused = crate::embed::fuse(&[lexical_ids.clone(), semantic_ids], 12);
+        store
+            .recall_ids(&fused, source, session)?
+            .into_iter()
+            .filter(|record| {
+                lexical_ids.contains(&record.id)
+                    || semantic
+                        .iter()
+                        .any(|(id, strong)| *id == record.id && (*strong || shared(record) >= 1))
+            })
+            .collect()
+    };
+    let mut evidence: Vec<Record> = Vec::new();
+    let mut matched = Vec::new();
+    for record in &candidates {
         if evidence.len() == 3 {
             break;
         }
@@ -608,4 +642,97 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
         ));
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Storage;
+
+    fn send(
+        store: &Store,
+        host: Host,
+        session: &str,
+        event: Value,
+        semantic: Option<Semantic<'_>>,
+    ) -> Option<String> {
+        let mut input = event;
+        input["session_id"] = json!(session);
+        let output = handle(store, host, input.to_string().as_bytes(), semantic).unwrap()?;
+        Some(
+            output["hookSpecificOutput"]["additionalContext"]
+                .as_str()?
+                .to_owned(),
+        )
+    }
+
+    #[test]
+    fn semantic_matches_recall_outcomes_that_share_no_keywords() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::resolve(Some(temp.path().join("data"))).unwrap();
+        let store = Store::open(&storage).unwrap();
+        let cwd = temp.path().to_str().unwrap();
+        let prompt =
+            |text: &str| json!({"cwd": cwd, "hook_event_name": "UserPromptSubmit", "prompt": text});
+        send(
+            &store,
+            Host::Claude,
+            "a",
+            prompt("Fix the websocket retry regression"),
+            None,
+        );
+        send(
+            &store,
+            Host::Claude,
+            "a",
+            json!({"cwd": cwd, "hook_event_name": "Stop",
+                   "last_assistant_message": "The retry counter resets too soon. Next: move the reset after handshake."}),
+            None,
+        );
+        let reply = store
+            .search(None, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.kind == "assistant")
+            .unwrap();
+        let find = |_: &str, _: &str| Some(vec![(reply.id, true)]);
+        let paraphrase = prompt("why do reconnect attempts give up early");
+
+        let own = send(&store, Host::Claude, "a", paraphrase.clone(), Some(&find));
+        assert_eq!(own, None, "the current session's own work is not recalled");
+
+        let recalled = send(&store, Host::Codex, "b", paraphrase.clone(), Some(&find)).unwrap();
+        assert!(
+            recalled.contains("Request: Fix the websocket retry regression"),
+            "{recalled}"
+        );
+        assert!(
+            recalled.contains("Outcome: The retry counter resets too soon"),
+            "{recalled}"
+        );
+
+        let repeat = send(&store, Host::Codex, "b", paraphrase.clone(), Some(&find));
+        assert_eq!(repeat, None, "delivered evidence is not repeated");
+
+        let without = send(&store, Host::Codex, "c", paraphrase.clone(), None);
+        assert_eq!(
+            without, None,
+            "keywords alone cannot connect the paraphrase"
+        );
+
+        let weak = |_: &str, _: &str| Some(vec![(reply.id, false)]);
+        let unassisted = send(&store, Host::Codex, "d", paraphrase, Some(&weak));
+        assert_eq!(unassisted, None, "a weak match needs a shared keyword");
+        let assisted = send(
+            &store,
+            Host::Codex,
+            "e",
+            prompt("handshake ordering keeps failing on reconnect"),
+            Some(&weak),
+        );
+        assert!(
+            assisted.is_some(),
+            "a weak match with a shared keyword is recalled"
+        );
+    }
 }

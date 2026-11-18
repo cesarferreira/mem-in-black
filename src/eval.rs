@@ -116,7 +116,7 @@ pub fn lexical_methods<'a>() -> Vec<Method<'a>> {
         (
             "search",
             Box::new(|store: &Store, query: &Query| {
-                crate::mcp::search(store, Some(&query.text), Some(&query.workspace), 10)
+                crate::mcp::search(store, Some(&query.text), Some(&query.workspace), 10, None)
             }),
         ),
         (
@@ -130,4 +130,121 @@ pub fn lexical_methods<'a>() -> Vec<Method<'a>> {
             }),
         ),
     ]
+}
+
+/// Embed every stored record with `embedder` and return vector and hybrid methods.
+pub fn embed_all(
+    store: &Store,
+    embedder: &crate::embed::Embedder,
+    index: &mut crate::embed::Index,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut after = 0;
+    loop {
+        let batch = store.texts_after(after, 64)?;
+        let Some(last) = batch.last() else { break };
+        after = last.0;
+        let texts: Vec<_> = batch.iter().map(|(_, _, body)| body.as_str()).collect();
+        for ((id, workspace, _), vector) in batch.iter().zip(embedder.embed_documents(&texts)?) {
+            index.insert(*id, workspace.clone(), workspace.clone(), vector);
+        }
+    }
+    eprintln!(
+        "{}: embedded {} records in {:.1}s",
+        embedder.spec.name,
+        index.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+pub fn embedding_methods<'a>(
+    embedder: &'a crate::embed::Embedder,
+    index: &'a crate::embed::Index,
+) -> Vec<Method<'a>> {
+    let vector = move |store: &Store, query: &Query, limit: usize| -> Result<Vec<i64>> {
+        let _ = store;
+        let embedded = embedder.embed_query(&query.text)?;
+        Ok(index
+            .search(
+                &embedded,
+                &crate::embed::Scope::Workspace(&query.workspace),
+                limit,
+            )
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    };
+    vec![
+        (
+            "vector",
+            Box::new(move |store: &Store, query: &Query| store.details(&vector(store, query, 10)?)),
+        ),
+        (
+            "hybrid",
+            Box::new(move |store: &Store, query: &Query| {
+                let find = |text: &str, limit: usize| {
+                    let probe = Query {
+                        kind: query.kind,
+                        text: text.to_owned(),
+                        target: query.target,
+                        workspace: query.workspace.clone(),
+                    };
+                    vector(store, &probe, limit).ok()
+                };
+                crate::mcp::search(
+                    store,
+                    Some(&query.text),
+                    Some(&query.workspace),
+                    10,
+                    Some(&find),
+                )
+            }),
+        ),
+    ]
+}
+
+/// Top-1 similarity when the answer is in scope versus when a query is searched
+/// in another project, where nothing should match. Recall thresholds come from this.
+pub fn calibrate(
+    queries: &[Query],
+    embedder: &crate::embed::Embedder,
+    index: &crate::embed::Index,
+) -> Result<Value> {
+    use crate::embed::Scope;
+    let mut hits = Vec::new();
+    let mut noise = Vec::new();
+    for (position, query) in queries.iter().enumerate() {
+        let vector = embedder.embed_query(&query.text)?;
+        if let Some((id, score)) = index
+            .search(&vector, &Scope::Workspace(&query.workspace), 1)
+            .first()
+            && *id == query.target
+        {
+            hits.push(*score);
+        }
+        let other = queries
+            .iter()
+            .cycle()
+            .skip(position + 1)
+            .take(queries.len())
+            .find(|candidate| candidate.workspace != query.workspace);
+        if let Some(other) = other
+            && let Some((_, score)) = index
+                .search(&vector, &Scope::Workspace(&other.workspace), 1)
+                .first()
+        {
+            noise.push(*score);
+        }
+    }
+    let percentiles = |mut values: Vec<f32>| {
+        values.sort_by(f32::total_cmp);
+        let at = |p: f64| {
+            values
+                .get(((values.len().max(1) - 1) as f64 * p).round() as usize)
+                .map(|value| (f64::from(*value) * 1000.0).round() / 1000.0)
+        };
+        json!({"n": values.len(), "p05": at(0.05), "p10": at(0.10), "p50": at(0.5), "p90": at(0.9), "p95": at(0.95), "p99": at(0.99)})
+    };
+    Ok(json!({"correct_top1": percentiles(hits), "unrelated_top1": percentiles(noise)}))
 }

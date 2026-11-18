@@ -91,11 +91,17 @@ impl MemoryServer {
             let root = input
                 .workspace
                 .map(|path| Workspace::read(Path::new(&path)).root);
+            let semantic = worker_semantic(
+                &self.data,
+                root.as_deref(),
+                std::time::Duration::from_secs(5),
+            );
             let rows = search(
                 store,
                 input.query.as_deref(),
                 root.as_deref(),
                 input.limit.unwrap_or(10),
+                Some(&semantic),
             )?;
             Ok(rows.into_iter().map(IndexEntry::from).collect::<Vec<_>>())
         })
@@ -186,21 +192,60 @@ impl MemoryServer {
 )]
 impl ServerHandler for MemoryServer {}
 
+/// Ranked semantic matches for a query, or `None` when unavailable.
+pub type Semantic<'a> = &'a dyn Fn(&str, usize) -> Option<Vec<i64>>;
+
+/// Keyword search, fused with semantic matches when a model is available.
 pub fn search(
     store: &Store,
     query: Option<&str>,
     workspace: Option<&str>,
     limit: usize,
+    semantic: Option<Semantic<'_>>,
 ) -> Result<Vec<Record>> {
     let query = query.filter(|text| !text.trim().is_empty());
     let terms = query.map(|text| phrases(text, false));
-    if terms.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(vec![]);
-    }
     // Natural-language queries rarely share every word with the record, so
     // match any word and let BM25 rank records that share more of them first.
-    let fts = terms.map(|terms| fts_query(&terms, " OR "));
-    store.search(fts.as_deref(), workspace, limit)
+    let fts = terms
+        .filter(|terms| !terms.is_empty())
+        .map(|terms| fts_query(&terms, " OR "));
+    let semantic_ids = query.zip(semantic).and_then(|(text, find)| find(text, 50));
+    let Some(semantic_ids) = semantic_ids else {
+        if query.is_some() && fts.is_none() {
+            return Ok(vec![]);
+        }
+        return store.search(fts.as_deref(), workspace, limit);
+    };
+    let lexical = match &fts {
+        Some(fts) => store
+            .search(Some(fts), workspace, 50)?
+            .into_iter()
+            .map(|record| record.id)
+            .collect(),
+        None => vec![],
+    };
+    // Over-fetch so dropping superseded records still fills the page.
+    let fused = crate::embed::fuse(&[lexical, semantic_ids], limit.clamp(1, 100) * 2);
+    let mut records = store.live(&fused)?;
+    records.truncate(limit.clamp(1, 100));
+    Ok(records)
+}
+
+/// Semantic search through the running worker, for processes outside it.
+pub fn worker_semantic<'a>(
+    data: &'a Storage,
+    workspace: Option<&'a str>,
+    timeout: std::time::Duration,
+) -> impl Fn(&str, usize) -> Option<Vec<i64>> + 'a {
+    move |query, limit| {
+        let scope = match workspace {
+            Some(root) => crate::embed::Scope::Workspace(root),
+            None => crate::embed::Scope::All,
+        };
+        crate::daemon::semantic_search(data, query, &scope, limit, timeout)
+            .map(|hits| hits.into_iter().map(|(id, _)| id).collect())
+    }
 }
 
 pub fn run_stdio(data: Storage) -> Result<()> {

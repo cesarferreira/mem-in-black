@@ -31,6 +31,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml_edit = "0.25"
 ureq = { version = "3", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+sha2 = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 lto = "thin"

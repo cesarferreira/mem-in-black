@@ -11,7 +11,12 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 5;
+const SCHEMA: i64 = 6;
+
+/// (record id, workspace, project, little-endian f32 vector)
+pub type VectorRow = (i64, String, String, Vec<u8>);
+/// (record id, workspace, project, body)
+pub type PendingText = (i64, String, String, String);
 
 const RECORD_COLUMNS: &str =
     "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id";
@@ -210,15 +215,28 @@ impl Store {
                  END;",
                 )?;
             }
-            // Porter stemming lets `retries` match `retry`. The triggers keep
-            // working because they address the table by name.
+            if version < 5 {
+                // Porter stemming lets `retries` match `retry`. The triggers keep
+                // working because they address the table by name.
+                migration.execute_batch(
+                    "DROP TABLE event_search;
+                     CREATE VIRTUAL TABLE event_search USING fts5(
+                       body, content='events', content_rowid='id', tokenize='porter unicode61'
+                     );
+                     INSERT INTO event_search(event_search) VALUES ('rebuild');",
+                )?;
+            }
             migration.execute_batch(
-                "DROP TABLE event_search;
-                 CREATE VIRTUAL TABLE event_search USING fts5(
-                   body, content='events', content_rowid='id', tokenize='porter unicode61'
+                "CREATE TABLE vectors (
+                   event_id INTEGER PRIMARY KEY, model TEXT NOT NULL, vector BLOB NOT NULL
                  );
-                 INSERT INTO event_search(event_search) VALUES ('rebuild');
-                 PRAGMA user_version=5;",
+                 CREATE TRIGGER event_vector_delete AFTER DELETE ON events BEGIN
+                   DELETE FROM vectors WHERE event_id = old.id;
+                 END;
+                 CREATE TRIGGER event_vector_update AFTER UPDATE OF body ON events BEGIN
+                   DELETE FROM vectors WHERE event_id = old.id;
+                 END;
+                 PRAGMA user_version=6;",
             )?;
             migration.commit()?;
         }
@@ -417,6 +435,27 @@ impl Store {
         ), params![fts, project, root, source, session])
     }
 
+    /// Apply the recall filters to semantic matches, keeping their order.
+    pub fn recall_ids(&self, ids: &[i64], source: &str, session: &str) -> Result<Vec<Record>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM events e
+             WHERE e.id = ?1 AND (e.source != ?2 OR e.session != ?3)
+               AND e.superseded_by IS NULL AND e.created_at > unixepoch() - 15552000
+               AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.source = ?2 AND d.session = ?3 AND d.event_id = e.id)"
+        ))?;
+        let mut records = Vec::new();
+        for id in ids.iter().take(50) {
+            if let Some(record) = statement
+                .query_row(params![id, source, session], row_record)
+                .optional()?
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     pub fn has_work(&self, source: &str, session: &str) -> Result<bool> {
         let _guard = self.read_guard()?;
         Ok(self.db.query_row(
@@ -559,6 +598,74 @@ impl Store {
         }
         transaction.commit()?;
         Ok(id)
+    }
+
+    /// Records after `after`, oldest first, for embedding.
+    pub fn texts_after(&self, after: i64, limit: usize) -> Result<Vec<(i64, String, String)>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self
+            .db
+            .prepare("SELECT id, workspace, body FROM events WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(params![after, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records without a vector from `model`, oldest first.
+    pub fn unembedded(&self, model: &str, limit: usize) -> Result<Vec<PendingText>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(
+            "SELECT e.id, e.workspace, e.project, e.body FROM events e
+             WHERE NOT EXISTS (SELECT 1 FROM vectors v WHERE v.event_id = e.id AND v.model = ?1)
+             ORDER BY e.id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![model, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn save_vectors(&self, model: &str, vectors: &[(i64, Vec<u8>)]) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        for (id, vector) in vectors {
+            transaction.execute(
+                "INSERT INTO vectors VALUES (?1, ?2, ?3)
+                 ON CONFLICT(event_id) DO UPDATE SET model = excluded.model, vector = excluded.vector",
+                params![id, model, vector],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every stored vector for `model` with its record's workspace and project.
+    pub fn vectors(&self, model: &str) -> Result<Vec<VectorRow>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(
+            "SELECT e.id, e.workspace, e.project, v.vector FROM vectors v
+             JOIN events e ON e.id = v.event_id WHERE v.model = ?1 ORDER BY e.id",
+        )?;
+        let rows = statement.query_map([model], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The records for `ids` that still exist and are not superseded, in the given order.
+    pub fn live(&self, ids: &[i64]) -> Result<Vec<Record>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM events e WHERE e.id = ?1 AND e.superseded_by IS NULL"
+        ))?;
+        let mut records = Vec::new();
+        for id in ids.iter().take(100) {
+            if let Some(record) = statement.query_row([id], row_record).optional()? {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn id_for_key(&self, key: &str) -> Result<Option<i64>> {

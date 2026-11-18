@@ -1,5 +1,6 @@
 use crate::{
     config::Storage,
+    embed::{self, Embedder, Index, Scope},
     install::atomic_write,
     mcp, observer,
     store::{Store, prepare_dir},
@@ -9,10 +10,14 @@ use fs2::FileExt;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Write},
+    io::{self, ErrorKind, Read, Write},
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -140,8 +145,22 @@ pub fn run(data: &Storage) -> Result<()> {
         }
     });
 
+    let semantic = Arc::new(Semantic::default());
+    if let Some(spec) = embed::configured(&data.directory).unwrap_or_else(|error| {
+        eprintln!("QuietMem embeddings configuration: {error:#}");
+        None
+    }) {
+        let semantic = semantic.clone();
+        let worker_data = data.clone();
+        thread::spawn(move || {
+            if let Err(error) = semantic.run(&worker_data, spec) {
+                eprintln!("QuietMem embeddings: {error:#}");
+            }
+        });
+    }
+
     for request in server.incoming_requests() {
-        if handle(request, &store, &address.to_string(), &token) {
+        if handle(request, &store, &semantic, &address.to_string(), &token) {
             break;
         }
     }
@@ -150,8 +169,169 @@ pub fn run(data: &Storage) -> Result<()> {
     Ok(())
 }
 
-fn handle(request: Request, store: &Store, address: &str, token: &str) -> bool {
-    let (path, query) = request.url().split_once('?').unwrap_or((request.url(), ""));
+/// The embedding model and vector index the worker keeps in memory.
+#[derive(Default)]
+pub struct Semantic {
+    embedder: Mutex<Option<Embedder>>,
+    index: RwLock<Index>,
+    ready: AtomicBool,
+    waiting_queries: AtomicUsize,
+}
+
+impl Semantic {
+    fn run(&self, data: &Storage, spec: &'static embed::Spec) -> Result<()> {
+        let store = Store::open(data)?;
+        let embedder = Embedder::load(&data.directory, spec)?;
+        *self.embedder.lock().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
+        let mut rebuilt = Instant::now() - Duration::from_secs(3600);
+        loop {
+            // Reload from storage now and then so forgotten records leave the index.
+            if rebuilt.elapsed() > Duration::from_secs(600) {
+                let mut index = Index::default();
+                for (id, workspace, project, vector) in store.vectors(spec.name)? {
+                    index.insert(id, workspace, project, embed::from_bytes(&vector));
+                }
+                *self.index.write().unwrap_or_else(|e| e.into_inner()) = index;
+                self.ready.store(true, Ordering::Release);
+                rebuilt = Instant::now();
+            }
+            // Queries go first; small batches bound how long one can wait.
+            while self.waiting_queries.load(Ordering::Acquire) > 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let batch = store.unembedded(spec.name, 4)?;
+            if batch.is_empty() {
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+            let texts: Vec<_> = batch
+                .iter()
+                .map(|(_, _, _, body)| crate::hooks::cut(body, 4000))
+                .collect();
+            let vectors = {
+                let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .context("model unloaded")?
+                    .embed_documents(&texts)?
+            };
+            store.save_vectors(
+                spec.name,
+                &batch
+                    .iter()
+                    .zip(&vectors)
+                    .map(|((id, ..), vector)| (*id, embed::to_bytes(vector)))
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+            for ((id, workspace, project, _), vector) in batch.into_iter().zip(vectors) {
+                index.insert(id, workspace, project, vector);
+            }
+        }
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        scope: &Scope<'_>,
+        limit: usize,
+    ) -> Result<Option<Vec<(i64, f32)>>> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.waiting_queries.fetch_add(1, Ordering::AcqRel);
+        let vector = {
+            let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+            self.waiting_queries.fetch_sub(1, Ordering::AcqRel);
+            let Some(embedder) = guard.as_ref() else {
+                return Ok(None);
+            };
+            embedder.embed_query(query)?
+        };
+        Ok(Some(
+            self.index
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search(&vector, scope, limit),
+        ))
+    }
+}
+
+/// Ask the running worker for semantic matches. `None` when the worker or the
+/// model is unavailable, so callers fall back to keyword search.
+pub fn semantic_search(
+    data: &Storage,
+    query: &str,
+    scope: &Scope<'_>,
+    limit: usize,
+    timeout: Duration,
+) -> Option<Vec<(i64, f32)>> {
+    let base = fs::read_to_string(data.directory.join(URL)).ok()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .proxy(None)
+        .max_redirects(0)
+        .build()
+        .into();
+    let (workspace, project) = match scope {
+        Scope::All => (None, None),
+        Scope::Workspace(root) => (Some(*root), None),
+        Scope::Project(project) => (None, Some(*project)),
+    };
+    let mut response = agent
+        .post(format!("{}/semantic", base.trim()))
+        .send_json(
+            json!({"query": query, "workspace": workspace, "project": project, "limit": limit}),
+        )
+        .ok()?;
+    let value: Value = response
+        .body_mut()
+        .with_config()
+        .limit(1 << 20)
+        .read_json()
+        .ok()?;
+    let hits = value["hits"].as_array()?;
+    Some(
+        hits.iter()
+            .filter_map(|hit| Some((hit[0].as_i64()?, hit[1].as_f64()? as f32)))
+            .collect(),
+    )
+}
+
+fn semantic_response(semantic: &Semantic, request: &mut Request) -> Response<io::Cursor<Vec<u8>>> {
+    let mut body = String::new();
+    let parsed = request
+        .as_reader()
+        .take(64 * 1024)
+        .read_to_string(&mut body)
+        .ok()
+        .and_then(|_| serde_json::from_str::<Value>(&body).ok());
+    let Some(input) = parsed else {
+        return Response::from_string("Bad request").with_status_code(400);
+    };
+    let query = input["query"].as_str().unwrap_or_default();
+    let scope = match (input["workspace"].as_str(), input["project"].as_str()) {
+        (Some(root), _) => Scope::Workspace(root),
+        (None, Some(project)) => Scope::Project(project),
+        _ => Scope::All,
+    };
+    let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    match semantic.search(query, &scope, limit) {
+        Ok(Some(hits)) => Response::from_string(json!({"hits": hits}).to_string()),
+        Ok(None) => Response::from_string("Not ready").with_status_code(503),
+        Err(_) => Response::from_string("Embedding failed").with_status_code(500),
+    }
+}
+
+fn handle(
+    mut request: Request,
+    store: &Store,
+    semantic: &Semantic,
+    address: &str,
+    token: &str,
+) -> bool {
+    let url = request.url().to_owned();
+    let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     let host = request
         .headers()
         .iter()
@@ -165,6 +345,11 @@ fn handle(request: Request, store: &Store, address: &str, token: &str) -> bool {
         let _ = request.respond(Response::from_string("Stopped"));
         return true;
     }
+    if request.method() == &Method::Post && path == format!("{token}/semantic") {
+        let response = semantic_response(semantic, &mut request);
+        let _ = request.respond(response);
+        return false;
+    }
     if request.method() != &Method::Get || path != token {
         let _ = request.respond(Response::from_string("Not found").with_status_code(404));
         return false;
@@ -173,7 +358,7 @@ fn handle(request: Request, store: &Store, address: &str, token: &str) -> bool {
         .find(|(key, _)| key == "q")
         .map(|(_, value)| value.into_owned())
         .unwrap_or_default();
-    let page = viewer(store, token, &query);
+    let page = viewer(store, semantic, token, &query);
     let mut response = match page {
         Ok(html) => Response::from_string(html),
         Err(_) => Response::from_string("Unable to load memory").with_status_code(500),
@@ -195,8 +380,15 @@ fn handle(request: Request, store: &Store, address: &str, token: &str) -> bool {
     false
 }
 
-fn viewer(store: &Store, token: &str, query: &str) -> Result<String> {
-    let rows = mcp::search(store, Some(query), None, 40)?;
+fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Result<String> {
+    let find = |text: &str, limit: usize| {
+        semantic
+            .search(text, &Scope::All, limit)
+            .ok()
+            .flatten()
+            .map(|hits| hits.into_iter().map(|(id, _)| id).collect())
+    };
+    let rows = mcp::search(store, Some(query), None, 40, Some(&find))?;
     let mut html = format!(
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QuietMem</title>
 <style>
