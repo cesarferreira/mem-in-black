@@ -55,3 +55,7 @@ The configured endpoint receives a bounded selection of captured evidence. Loopb
 ## Parity
 
 This is the first working implementation. The [parity matrix](docs/superpowers/specs/2026-11-18-quietmem.md) records progress against Claude Mem. The remaining upstream scope includes its wider harness integrations, semantic search, observer providers and modes, My Work workflows, media and code-navigation tools, plus cloud sync and team sharing.
+
+## License
+
+[MIT](LICENSE)
