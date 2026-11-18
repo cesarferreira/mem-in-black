@@ -1,3 +1,4 @@
+mod config;
 mod daemon;
 mod hooks;
 mod import;
@@ -77,11 +78,15 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let data = store::data_dir(cli.data_dir)?;
+    let data = config::Storage::resolve(cli.data_dir)?;
     match cli.command {
         Command::Install { home, host } => {
-            store::prepare_dir(&data)?;
-            install::install(&data.canonicalize()?, home.as_deref(), host)?;
+            store::prepare_dir(&data.directory)?;
+            let directory = data
+                .directory_override()
+                .map(|path| path.canonicalize())
+                .transpose()?;
+            install::install(directory.as_deref(), home.as_deref(), host)?;
             println!(
                 "Registered QuietMem. Restart the configured harnesses and review the QuietMem hooks if Codex asks."
             );

@@ -1,4 +1,5 @@
 use crate::{
+    config::Storage,
     hooks::{clean, cut, fts_query, phrases},
     store::{Observation, Record, Store},
     workspace::Workspace,
@@ -12,10 +13,10 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 struct MemoryServer {
-    data: PathBuf,
+    data: Storage,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -177,7 +178,7 @@ pub fn search(
     store.search(fts.as_deref(), workspace, limit)
 }
 
-pub fn run_stdio(data: PathBuf) -> Result<()> {
+pub fn run_stdio(data: Storage) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

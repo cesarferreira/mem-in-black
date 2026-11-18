@@ -952,3 +952,87 @@ fn pi_install_registers_a_local_startup_extension_idempotently() {
     workspace.run(&install, None);
     assert_eq!(std::fs::read_to_string(path).unwrap(), extension);
 }
+
+#[test]
+fn new_local_memory_databases_use_wal_journaling() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let db = rusqlite::Connection::open(workspace.temp.path().join("data/memory.sqlite3")).unwrap();
+    let mode: String = db
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn config_places_the_database_at_a_custom_absolute_path() {
+    let workspace = Workspace::new();
+    let config_root = workspace.temp.path().join("config");
+    let config = config_root.join("quietmem");
+    let data_home = workspace.temp.path().join("xdg-data");
+    let database = workspace.temp.path().join("local disk/history.db");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!("database_path = {:?}\n", database.to_str().unwrap()),
+    )
+    .unwrap();
+    let output = workspace
+        .command()
+        .env_remove("QUIETMEM_DATA_DIR")
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("XDG_DATA_HOME", &data_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["database_path"], database.to_str().unwrap());
+    assert!(database.is_file());
+    assert!(!data_home.join("quietmem/memory.sqlite3").exists());
+    workspace.run_with_env(
+        &["status"],
+        None,
+        &[("XDG_CONFIG_HOME", config_root.to_str().unwrap())],
+    );
+    assert!(workspace.temp.path().join("data/memory.sqlite3").is_file());
+}
+
+#[test]
+fn default_installer_lets_hooks_use_database_settings() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("agent-home");
+    let output = workspace
+        .command()
+        .env_remove("QUIETMEM_DATA_DIR")
+        .env("XDG_CONFIG_HOME", workspace.temp.path().join("config"))
+        .env("XDG_DATA_HOME", workspace.temp.path().join("xdg-data"))
+        .args([
+            "install",
+            "--host",
+            "claude",
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    let command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(!command.contains("--data-dir"));
+    let mcp: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(mcp["mcpServers"]["quietmem"]["args"], json!(["mcp"]));
+}

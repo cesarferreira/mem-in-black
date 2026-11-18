@@ -1,4 +1,5 @@
 use crate::{
+    config::Storage,
     install::atomic_write,
     mcp, observer,
     store::{Store, prepare_dir},
@@ -9,7 +10,6 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Write},
-    path::Path,
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -19,14 +19,14 @@ use tiny_http::{Header, Method, Request, Response, Server};
 const LOCK: &str = "daemon.lock";
 const URL: &str = "viewer-url";
 
-fn lock_file(data: &Path) -> Result<File> {
-    prepare_dir(data)?;
+fn lock_file(data: &Storage) -> Result<File> {
+    prepare_dir(&data.directory)?;
     Ok(OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(data.join(LOCK))?)
+        .open(data.directory.join(LOCK))?)
 }
 
 fn try_lock(file: &File) -> Result<bool> {
@@ -37,16 +37,18 @@ fn try_lock(file: &File) -> Result<bool> {
     }
 }
 
-pub fn start_background(data: &Path) -> Result<()> {
+pub fn start_background(data: &Storage) -> Result<()> {
     if std::env::var_os("QUIETMEM_NO_AUTOSTART").is_some() {
         return Ok(());
     }
     let lock = lock_file(data)?;
     if try_lock(&lock)? {
         drop(lock);
-        Command::new(std::env::current_exe()?)
-            .arg("--data-dir")
-            .arg(data)
+        let mut command = Command::new(std::env::current_exe()?);
+        if let Some(dir) = data.directory_override() {
+            command.arg("--data-dir").arg(dir);
+        }
+        command
             .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -56,29 +58,32 @@ pub fn start_background(data: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn status(data: &Path) -> Result<Value> {
+pub fn status(data: &Storage) -> Result<Value> {
     let lock = lock_file(data)?;
     let running = !try_lock(&lock)?;
+    drop(lock);
     let url = running
-        .then(|| fs::read_to_string(data.join(URL)).ok())
+        .then(|| fs::read_to_string(data.directory.join(URL)).ok())
         .flatten();
-    let store = Store::open(data)?;
+    let store = Store::open(data).context("opening the QuietMem database")?;
     Ok(json!({
-        "data_dir": data, "running": running, "viewer_url": url.as_deref().map(str::trim),
-        "records": store.counts()?,
+        "data_dir": data.directory, "database_path": data.database, "running": running, "viewer_url": url.as_deref().map(str::trim),
+        "journal_mode": store.journal_mode()?,
+        "records": store.counts().context("reading QuietMem records")?,
         "observer_tokens": store.metric("observer_tokens")?,
-        "observer_config_error": observer::settings(data).err().map(|error| error.to_string()),
+        "observer_config_error": observer::settings(&data.directory).err().map(|error| error.to_string()),
         "context_injections": store.metric("context_injections")?,
         "context_bytes": store.metric("context_bytes")?
     }))
 }
 
-pub fn stop(data: &Path) -> Result<()> {
+pub fn stop(data: &Storage) -> Result<()> {
     let lock = lock_file(data)?;
     if try_lock(&lock)? {
         return Ok(());
     }
-    let base = fs::read_to_string(data.join(URL)).context("worker viewer address is not ready")?;
+    let base = fs::read_to_string(data.directory.join(URL))
+        .context("worker viewer address is not ready")?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(2)))
         .proxy(None)
@@ -88,25 +93,25 @@ pub fn stop(data: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn observe_once(data: &Path) -> Result<()> {
+pub fn observe_once(data: &Storage) -> Result<()> {
     let lock = lock_file(data)?;
     anyhow::ensure!(
         try_lock(&lock)?,
         "background worker is already processing observations"
     );
-    let store = Store::open(data)?;
-    let config = observer::settings(data)?;
+    let store = Store::open_worker(data)?;
+    let config = observer::settings(&data.directory)?;
     while observer::process_one(&store, config.as_ref())? {}
     Ok(())
 }
 
-pub fn run(data: &Path) -> Result<()> {
+pub fn run(data: &Storage) -> Result<()> {
     let lock = lock_file(data)?;
     if !try_lock(&lock)? {
         return Ok(());
     }
-    let store = Store::open(data)?;
-    let config = observer::settings(data).unwrap_or_else(|error| {
+    let store = Store::open_worker(data)?;
+    let config = observer::settings(&data.directory).unwrap_or_else(|error| {
         eprintln!("QuietMem observer configuration: {error:#}");
         None
     });
@@ -117,11 +122,11 @@ pub fn run(data: &Path) -> Result<()> {
         .context("expected a local socket")?;
     let token = format!("/{}", uuid::Uuid::new_v4().simple());
     let url = format!("http://{address}{token}");
-    atomic_write(&data.join(URL), url.as_bytes())?;
+    atomic_write(&data.directory.join(URL), url.as_bytes())?;
     println!("{url}");
     io::stdout().flush()?;
 
-    let worker_data = data.to_owned();
+    let worker_data = data.clone();
     thread::spawn(move || {
         let Ok(store) = Store::open(&worker_data) else {
             return;
@@ -140,7 +145,7 @@ pub fn run(data: &Path) -> Result<()> {
             break;
         }
     }
-    let _ = fs::remove_file(data.join(URL));
+    let _ = fs::remove_file(data.directory.join(URL));
     drop(lock);
     Ok(())
 }

@@ -12,7 +12,7 @@ export default function (pi) {
       : "never";
     try {
       const result = await pi.exec(quietmem.binary, [
-        "--data-dir", quietmem.dataDirectory,
+        ...(quietmem.dataDirectory ? ["--data-dir", quietmem.dataDirectory] : []),
         "preview", "--workspace", ctx.cwd, "--color", color,
       ], { timeout: 2000 });
       if (result.code === 0 && result.stdout.trim()) {

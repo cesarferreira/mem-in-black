@@ -18,7 +18,11 @@ pub enum Target {
     Pi,
 }
 
-pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Target>) -> Result<()> {
+pub fn install(
+    data: Option<&Path>,
+    home_override: Option<&Path>,
+    selected: Option<Target>,
+) -> Result<()> {
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -35,7 +39,9 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Targe
     let codex_config = config_dir("CODEX_HOME", ".codex");
     let exe = std::env::current_exe()?;
     let exe = exe.to_str().context("binary path is not UTF-8")?;
-    let data = data.to_str().context("data path is not UTF-8")?;
+    let data = data
+        .map(|path| path.to_str().context("data path is not UTF-8"))
+        .transpose()?;
     if matches!(selected, Some(Target::Pi)) {
         let pi = config_dir("PI_CODING_AGENT_DIR", ".pi/agent");
         return install_pi(&pi, exe, data);
@@ -59,7 +65,7 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Targe
             .context("mcpServers must be an object")?;
         servers.insert(
             "quietmem".into(),
-            json!({"type":"stdio","command":exe,"args":["--data-dir",data,"mcp"]}),
+            json!({"type":"stdio","command":exe,"args":mcp_args(data)}),
         );
         changes.push((path, serde_json::to_string_pretty(&doc)? + "\n"));
     }
@@ -77,7 +83,7 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Targe
         }
         doc["mcp_servers"]["quietmem"]["command"] = value(exe);
         let mut args = Array::new();
-        for part in ["--data-dir", data, "mcp"] {
+        for part in mcp_args(data) {
             args.push(part);
         }
         doc["mcp_servers"]["quietmem"]["args"] = value(args);
@@ -91,7 +97,14 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Targe
     Ok(())
 }
 
-fn install_pi(config_dir: &Path, binary: &str, data: &str) -> Result<()> {
+fn mcp_args(data: Option<&str>) -> Vec<&str> {
+    match data {
+        Some(dir) => vec!["--data-dir", dir, "mcp"],
+        None => vec!["mcp"],
+    }
+}
+
+fn install_pi(config_dir: &Path, binary: &str, data: Option<&str>) -> Result<()> {
     const MARKER: &str = "// Installed by QuietMem\n";
     let path = config_dir.join("extensions/quietmem-startup.js");
     let config = json!({"binary": binary, "dataDirectory": data});
@@ -112,7 +125,12 @@ fn install_pi(config_dir: &Path, binary: &str, data: &str) -> Result<()> {
     atomic_write(&path, extension.as_bytes())
 }
 
-fn hooks_file(path: PathBuf, exe: &str, data: &str, host: Host) -> Result<(PathBuf, String)> {
+fn hooks_file(
+    path: PathBuf,
+    exe: &str,
+    data: Option<&str>,
+    host: Host,
+) -> Result<(PathBuf, String)> {
     let mut doc = read_json(&path)?;
     let hooks = doc
         .as_object_mut()
@@ -122,9 +140,10 @@ fn hooks_file(path: PathBuf, exe: &str, data: &str, host: Host) -> Result<(PathB
         .as_object_mut()
         .context("hooks must be an object")?;
     let command = format!(
-        "{} --data-dir {} hook {} # quietmem-managed",
+        "{}{} hook {} # quietmem-managed",
         quote(exe),
-        quote(data),
+        data.map(|dir| format!(" --data-dir {}", quote(dir)))
+            .unwrap_or_default(),
         host.name()
     );
     let mut events = vec![

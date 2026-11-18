@@ -82,6 +82,31 @@ The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quie
 
 Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, and `save_memory`. Automatic capture and recall require that harness's hooks or adapter.
 
+
+## Database location
+
+Set `database_path` in `~/.config/quietmem/config.toml` to store the SQLite file
+on a particular filesystem. QuietMem uses `$XDG_CONFIG_HOME/quietmem/config.toml`
+when `XDG_CONFIG_HOME` is set.
+
+```toml
+database_path = "/path/on/local-disk/quietmem/memory.sqlite3"
+```
+
+QuietMem creates the parent directory as needed. `--data-dir` and
+`QUIETMEM_DATA_DIR` take precedence and use `memory.sqlite3` inside that directory.
+Run `quietmem status` to see the effective database path and journal mode.
+
+Before changing the path, run `quietmem stop`. To carry past observations into the
+new path, create a SQLite backup at the destination. Existing hook registrations
+that pin the data directory can be refreshed with `quietmem install` before
+opening fresh agent sessions. Run `quietmem install --host pi` to refresh the
+Pi preview if you use it.
+
+QuietMem uses WAL on local disks and rollback journaling on detected NFS and
+SMB mounts. The worker switches a legacy database to the appropriate mode at
+startup. A local disk is the preferred location for active memory.
+
 ## Move existing history
 
 ```sh

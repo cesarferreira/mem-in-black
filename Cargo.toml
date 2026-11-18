@@ -17,9 +17,10 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
+libc = "0.2"
 form_urlencoded = "1"
 rmcp = { version = "3.4", features = ["transport-io"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

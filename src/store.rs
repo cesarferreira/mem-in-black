@@ -1,4 +1,4 @@
-use crate::workspace::Workspace;
+use crate::{config::Storage, workspace::Workspace};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -7,7 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::ErrorKind,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
@@ -46,25 +46,18 @@ pub struct Observation<'a> {
     pub workspace: &'a Workspace,
 }
 
-pub struct Store(Connection, File);
+pub struct Store {
+    db: Connection,
+    lock: File,
+    rollback: bool,
+}
 
-struct WriteGuard<'a>(&'a File);
+struct DatabaseGuard<'a>(&'a File);
 
-impl Drop for WriteGuard<'_> {
+impl Drop for DatabaseGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.0);
     }
-}
-
-pub fn data_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
-    override_dir
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME").map(|path| PathBuf::from(path).join("quietmem"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".local/share/quietmem"))
-        })
-        .context("no data directory configured")
 }
 
 pub fn prepare_dir(dir: &Path) -> Result<()> {
@@ -76,9 +69,20 @@ pub fn prepare_dir(dir: &Path) -> Result<()> {
 }
 
 impl Store {
-    pub fn open(dir: &Path) -> Result<Self> {
+    pub fn open(storage: &Storage) -> Result<Self> {
+        let store = Self::open_database(storage)?;
+        if store.rollback {
+            store.configure_journal(storage)
+        } else {
+            Ok(store)
+        }
+    }
+
+    fn open_database(storage: &Storage) -> Result<Self> {
+        let db_path = &storage.database;
+        let dir = db_path.parent().context("database path has no parent")?;
         prepare_dir(dir)?;
-        let db_path = dir.join("memory.sqlite3");
+        let rollback = network_filesystem(dir);
         ensure!(
             fs::metadata(dir)?.permissions().mode() & 0o022 == 0,
             "memory directory is writable by other users"
@@ -92,28 +96,27 @@ impl Store {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&db_path)
+                .open(db_path)
             {
                 Ok(_) => {}
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        let metadata = fs::metadata(&db_path)?;
+        let metadata = fs::metadata(db_path)?;
         ensure!(metadata.is_file(), "memory database must be a regular file");
         if metadata.permissions().mode() & 0o077 != 0 {
-            fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(db_path, fs::Permissions::from_mode(0o600))?;
         }
-        let schema_lock = open_lock(dir, "schema.lock")?;
-        let write_lock = open_lock(dir, "write.lock")?;
+        let schema_lock = open_lock(&storage.database_lock("schema.lock"))?;
+        let write_lock = open_lock(&storage.database_lock("write.lock"))?;
         FileExt::lock_shared(&schema_lock)?;
-        let connect = || -> Result<Connection> {
-            let db = Connection::open(&db_path)?;
-            db.busy_timeout(Duration::from_millis(900))?;
-            Ok(db)
-        };
-        let mut db = connect()?;
+        let mut db = connect(db_path)?;
+        let existing = rollback
+            .then(|| lock_database(&write_lock, false))
+            .transpose()?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        drop(existing);
         ensure!(
             version <= 3,
             "memory database is from a newer QuietMem version"
@@ -122,16 +125,24 @@ impl Store {
             drop(db);
             FileExt::unlock(&schema_lock)?;
             FileExt::lock_exclusive(&schema_lock)?;
-            db = connect()?;
+            let _write = lock_database(&write_lock, true)?;
+            db = connect(db_path)?;
             let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
             ensure!(
                 version <= 3,
                 "memory database is from a newer QuietMem version"
             );
             if version == 3 {
-                return Ok(Self(db, write_lock));
+                drop(_write);
+                return Ok(Self {
+                    db,
+                    lock: write_lock,
+                    rollback,
+                });
             }
-            db.pragma_update(None, "journal_mode", "WAL")?;
+            if !rollback {
+                db.pragma_update(None, "journal_mode", "WAL")?;
+            }
             let migration = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if version == 0 {
                 migration.execute_batch(
@@ -186,12 +197,61 @@ impl Store {
             )?;
             migration.commit()?;
         }
-        Ok(Self(db, write_lock))
+        Ok(Self {
+            db,
+            lock: write_lock,
+            rollback,
+        })
     }
 
-    fn write_guard(&self) -> Result<WriteGuard<'_>> {
-        FileExt::lock_exclusive(&self.1)?;
-        Ok(WriteGuard(&self.1))
+    pub fn open_worker(storage: &Storage) -> Result<Self> {
+        Self::open_database(storage)?.configure_journal(storage)
+    }
+
+    fn configure_journal(self, storage: &Storage) -> Result<Self> {
+        let preferred = if self.rollback { "delete" } else { "wal" };
+        if self.journal_mode()? == preferred {
+            return Ok(self);
+        }
+        let Self { db, lock, rollback } = self;
+        // An idle connection can block a WAL checkpoint. Close the probe
+        // before waiting for exclusive access to make the change.
+        drop(db);
+        let schema_lock = open_lock(&storage.database_lock("schema.lock"))?;
+        FileExt::lock_exclusive(&schema_lock)?;
+        let guard = lock_database(&lock, true)?;
+        let db = connect(&storage.database)?;
+        let statement = if rollback {
+            "PRAGMA journal_mode=DELETE"
+        } else {
+            "PRAGMA journal_mode=WAL"
+        };
+        let mode: String = db
+            .query_row(statement, [], |row| row.get(0))
+            .with_context(|| format!("switching the memory database to {preferred} journaling"))?;
+        ensure!(
+            mode == preferred,
+            "SQLite did not switch to {preferred} journaling"
+        );
+        drop(guard);
+        Ok(Self { db, lock, rollback })
+    }
+
+    pub fn journal_mode(&self) -> Result<String> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))?)
+    }
+
+    fn read_guard(&self) -> Result<Option<DatabaseGuard<'_>>> {
+        self.rollback
+            .then(|| lock_database(&self.lock, false))
+            .transpose()
+    }
+
+    fn write_guard(&self) -> Result<DatabaseGuard<'_>> {
+        lock_database(&self.lock, true)
     }
 
     pub fn record(&self, event: Observation<'_>) -> Result<()> {
@@ -205,7 +265,7 @@ impl Store {
     }
 
     fn insert(&self, event: Observation<'_>, created_at: Option<i64>) -> Result<bool> {
-        let changes = self.0.execute(
+        let changes = self.db.execute(
             "INSERT INTO events(source, session, event_key, kind, body, workspace, project, head, created_at, turn_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, coalesce(?9, unixepoch()), ?10)
              ON CONFLICT(source, session, event_key) DO NOTHING",
@@ -223,7 +283,7 @@ impl Store {
         private: bool,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
-        let transaction = self.0.unchecked_transaction()?;
+        let transaction = self.db.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO sessions VALUES (?1, ?2, ?3)
              ON CONFLICT(source, session) DO UPDATE SET private = excluded.private",
@@ -241,7 +301,8 @@ impl Store {
     }
 
     pub fn is_private(&self, source: &str, session: &str, turn: Option<&str>) -> Result<bool> {
-        Ok(self.0.query_row(
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
             "SELECT coalesce(
                 (SELECT private FROM turn_privacy WHERE source = ?1 AND session = ?2 AND turn_id = ?3),
                 (SELECT private FROM sessions WHERE source = ?1 AND session = ?2),
@@ -253,7 +314,7 @@ impl Store {
 
     pub fn mark_private_tool(&self, source: &str, session: &str, id: &str) -> Result<()> {
         let _guard = self.write_guard()?;
-        self.0.execute(
+        self.db.execute(
             "INSERT OR IGNORE INTO private_tools VALUES (?1, ?2, ?3)",
             params![source, session, id],
         )?;
@@ -264,7 +325,8 @@ impl Store {
         let Some(id) = id else {
             return Ok(false);
         };
-        Ok(self.0.query_row(
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
             "SELECT EXISTS (SELECT 1 FROM private_tools WHERE source = ?1 AND session = ?2 AND tool_id = ?3)",
             params![source, session, id], |row| row.get(0),
         )?)
@@ -290,7 +352,8 @@ impl Store {
     }
 
     pub fn recent_activity(&self, workspace: &str, limit: u8) -> Result<Vec<RecentActivity>> {
-        let mut statement = self.0.prepare(
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(
             "SELECT id, source, kind, body,
                     strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime'),
                     strftime('%H:%M', created_at, 'unixepoch', 'localtime')
@@ -329,7 +392,8 @@ impl Store {
     }
 
     pub fn has_work(&self, source: &str, session: &str) -> Result<bool> {
-        Ok(self.0.query_row(
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
             "SELECT EXISTS (SELECT 1 FROM events WHERE source = ?1 AND session = ?2 AND kind IN ('assistant', 'tool'))",
             params![source, session], |row| row.get(0),
         )?)
@@ -341,7 +405,8 @@ impl Store {
         source: &str,
         wanted: Option<&str>,
     ) -> Result<Option<Record>> {
-        Ok(self.0.query_row(&format!(
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e
              WHERE e.workspace = ?1 AND e.source != ?2 AND (?3 IS NULL OR e.source = ?3)
                AND e.kind IN ('assistant', 'tool', 'prompt') AND e.created_at > unixepoch() - 1209600
@@ -378,7 +443,8 @@ impl Store {
     }
 
     pub fn details(&self, ids: &[i64]) -> Result<Vec<Record>> {
-        let mut statement = self.0.prepare(&format!(
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e WHERE e.id = ?1"
         ))?;
         let mut records = Vec::new();
@@ -398,7 +464,7 @@ impl Store {
         bytes: usize,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
-        let transaction = self.0.unchecked_transaction()?;
+        let transaction = self.db.unchecked_transaction()?;
         for record in records {
             transaction.execute(
                 "INSERT OR IGNORE INTO deliveries VALUES (?1, ?2, ?3)",
@@ -412,7 +478,7 @@ impl Store {
     }
 
     fn add_metric(&self, key: &str, amount: i64) -> Result<()> {
-        self.0.execute(
+        self.db.execute(
             "INSERT INTO memory_meta VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = value + excluded.value",
             params![key, amount],
@@ -421,8 +487,9 @@ impl Store {
     }
 
     pub fn metric(&self, key: &str) -> Result<i64> {
+        let _guard = self.read_guard()?;
         Ok(self
-            .0
+            .db
             .query_row(
                 "SELECT value FROM memory_meta WHERE key = ?1",
                 [key],
@@ -433,16 +500,18 @@ impl Store {
     }
 
     pub fn project_of(&self, id: i64) -> Result<String> {
+        let _guard = self.read_guard()?;
         Ok(self
-            .0
+            .db
             .query_row("SELECT project FROM events WHERE id = ?1", [id], |row| {
                 row.get(0)
             })?)
     }
 
     pub fn observe_next(&self) -> Result<Option<Record>> {
+        let _guard = self.read_guard()?;
         Ok(self
-            .0
+            .db
             .query_row(
                 &format!(
                     "SELECT {RECORD_COLUMNS} FROM events e WHERE e.kind = 'assistant'
@@ -462,7 +531,7 @@ impl Store {
         reported_tokens: i64,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
-        let transaction = self.0.unchecked_transaction()?;
+        let transaction = self.db.unchecked_transaction()?;
         if self.insert(summary, Some(anchor.created_at))? {
             self.add_metric("observer_tokens", reported_tokens)?;
         }
@@ -476,7 +545,8 @@ impl Store {
     }
 
     pub fn export(&self, mut output: impl std::io::Write) -> Result<()> {
-        let mut statement = self.0.prepare(&format!(
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e ORDER BY e.id"
         ))?;
         let rows = statement.query_map([], row_record)?;
@@ -488,8 +558,9 @@ impl Store {
     }
 
     pub fn counts(&self) -> Result<std::collections::BTreeMap<String, i64>> {
+        let _guard = self.read_guard()?;
         let mut statement = self
-            .0
+            .db
             .prepare("SELECT kind, count(*) FROM events GROUP BY kind ORDER BY kind")?;
         Ok(statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -497,22 +568,67 @@ impl Store {
     }
 
     fn query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Record>> {
+        let _guard = self.read_guard()?;
         Ok(self
-            .0
+            .db
             .prepare(sql)?
             .query_map(params, row_record)?
             .collect::<rusqlite::Result<_>>()?)
     }
 }
 
-fn open_lock(dir: &Path, name: &str) -> Result<File> {
+fn connect(path: &Path) -> Result<Connection> {
+    let db = Connection::open(path)?;
+    db.busy_timeout(Duration::from_millis(900))?;
+    Ok(db)
+}
+
+fn open_lock(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(dir.join(name))?)
+        .open(path)?)
+}
+
+fn lock_database(file: &File, exclusive: bool) -> Result<DatabaseGuard<'_>> {
+    if exclusive {
+        FileExt::lock_exclusive(file)?;
+    } else {
+        FileExt::lock_shared(file)?;
+    }
+    Ok(DatabaseGuard(file))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn network_filesystem(dir: &Path) -> bool {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stats = MaybeUninit::<libc::statfs>::uninit();
+    // The C string lives through the call. statfs writes a complete output on success.
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stats = unsafe { stats.assume_init() };
+    #[cfg(target_os = "linux")]
+    return stats.f_type == libc::NFS_SUPER_MAGIC
+        || matches!(stats.f_type as u32, 0xff534d42 | 0xfe534d42);
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin's statfs supplies the filesystem name as a NUL-terminated C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+        matches!(name.to_bytes(), b"nfs" | b"smbfs")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn network_filesystem(_dir: &Path) -> bool {
+    false
 }
 
 fn row_record(row: &Row<'_>) -> rusqlite::Result<Record> {
@@ -527,4 +643,41 @@ fn row_record(row: &Row<'_>) -> rusqlite::Result<Record> {
         created_at: row.get(7)?,
         turn_id: row.get(8)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpointing_a_legacy_wal_preserves_memory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage::resolve(Some(temp.path().join("data")))?;
+        let mut store = Store::open(&storage)?;
+        let current: String = store
+            .db
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        assert_eq!(current, "wal");
+        let workspace = Workspace::read(temp.path());
+        store.record(Observation {
+            source: "manual",
+            session: "fixture",
+            key: None,
+            turn_id: None,
+            kind: "note",
+            body: "Preserve the existing observation",
+            workspace: &workspace,
+        })?;
+
+        store.rollback = true;
+        let store = store.configure_journal(&storage)?;
+        assert_eq!(store.journal_mode()?, "delete");
+        let history = store.search(None, Some(&workspace.root), 2)?;
+        assert_eq!(history[0].body, "Preserve the existing observation");
+        let integrity: String = store
+            .db
+            .pragma_query_value(None, "quick_check", |row| row.get(0))?;
+        assert_eq!(integrity, "ok");
+        Ok(())
+    }
 }
