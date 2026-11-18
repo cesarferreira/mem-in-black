@@ -156,7 +156,7 @@ impl Store {
         drop(existing);
         ensure!(
             version <= SCHEMA,
-            "memory database is from a newer QuietMem version"
+            "memory database is from a newer Mem in Black version"
         );
         if version < SCHEMA {
             drop(db);
@@ -167,7 +167,7 @@ impl Store {
             let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
             ensure!(
                 version <= SCHEMA,
-                "memory database is from a newer QuietMem version"
+                "memory database is from a newer Mem in Black version"
             );
             if version == SCHEMA {
                 drop(_write);

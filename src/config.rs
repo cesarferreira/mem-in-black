@@ -3,8 +3,14 @@ use std::{
     env, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use toml_edit::DocumentMut;
+
+/// Directory name for data and configuration.
+pub const NAME: &str = "meminblack";
+/// The name used before the rename. Its directories move on first use.
+const LEGACY_NAME: &str = "quietmem";
 
 #[derive(Clone)]
 pub struct Storage {
@@ -17,11 +23,14 @@ impl Storage {
     pub fn resolve(override_dir: Option<PathBuf>) -> Result<Self> {
         let explicit_directory = override_dir.is_some();
         let directory = override_dir
-            .or_else(|| {
-                env::var_os("XDG_DATA_HOME").map(|path| PathBuf::from(path).join("quietmem"))
-            })
-            .or_else(|| home().map(|path| path.join(".local/share/quietmem")))
+            .or_else(|| env::var_os("XDG_DATA_HOME").map(|path| PathBuf::from(path).join(NAME)))
+            .or_else(|| home().map(|path| path.join(".local/share").join(NAME)))
             .context("no data directory configured")?;
+        let directory = if explicit_directory {
+            directory
+        } else {
+            adopt_legacy_data(directory)
+        };
         let database = if explicit_directory {
             None
         } else {
@@ -54,6 +63,33 @@ impl Storage {
     }
 }
 
+/// Moves the data directory of the old name to `directory` on first use.
+/// The old worker is stopped first so that no process writes to the moved
+/// files. If the move cannot happen now, the old directory stays in use and
+/// a later run retries.
+fn adopt_legacy_data(directory: PathBuf) -> PathBuf {
+    let Some(legacy) = directory.parent().map(|parent| parent.join(LEGACY_NAME)) else {
+        return directory;
+    };
+    if directory.exists() || !legacy.is_dir() {
+        return directory;
+    }
+    let old = Storage {
+        database: legacy.join("memory.sqlite3"),
+        directory: legacy.clone(),
+        explicit_directory: true,
+    };
+    if crate::daemon::stop_and_wait(&old, Duration::from_millis(1500)) {
+        let _ = fs::rename(&legacy, &directory);
+    }
+    // Another process may have completed the move in the meantime.
+    if directory.exists() {
+        directory
+    } else {
+        legacy
+    }
+}
+
 fn home() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
@@ -65,7 +101,13 @@ fn database_setting() -> Result<Option<PathBuf>> {
     else {
         return Ok(None);
     };
-    let file = base.join("quietmem/config.toml");
+    let directory = base.join(NAME);
+    let legacy = base.join(LEGACY_NAME);
+    if !directory.exists() && legacy.is_dir() {
+        // A failed move leaves the old settings in place; the next run retries.
+        let _ = fs::rename(&legacy, &directory);
+    }
+    let file = directory.join("config.toml");
     let source = match fs::read_to_string(&file) {
         Ok(source) => source,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),

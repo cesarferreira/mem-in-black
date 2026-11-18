@@ -26,7 +26,7 @@ use workspace::Workspace;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    #[arg(long, global = true, env = "QUIETMEM_DATA_DIR")]
+    #[arg(long, global = true, env = "MIB_DATA_DIR")]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -80,7 +80,7 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         models: Vec<String>,
     },
-    /// Show how QuietMem has been used and an estimate of the tokens it saved.
+    /// Show how Mem in Black has been used and an estimate of the tokens it saved.
     Stats {
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -132,7 +132,7 @@ fn main() -> Result<()> {
                 .transpose()?;
             install::install(directory.as_deref(), home.as_deref(), host)?;
             println!(
-                "Registered QuietMem. Restart the configured harnesses and review the QuietMem hooks if Codex asks."
+                "Registered Mem in Black. Restart the configured harnesses and review the Mem in Black hooks if Codex asks."
             );
         }
         Command::Hook { host } => {
@@ -165,8 +165,8 @@ fn main() -> Result<()> {
                     )
                 }) {
                 Ok(Some(response)) => println!("{response}"),
-                Err(error) if std::env::var_os("QUIETMEM_DEBUG").is_some() => {
-                    eprintln!("QuietMem hook: {error:#}")
+                Err(error) if std::env::var_os("MIB_DEBUG").is_some() => {
+                    eprintln!("Mem in Black hook: {error:#}")
                 }
                 _ => {}
             }
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
                 embed::configure(&data.directory, Some(spec))?;
                 let _ = daemon::stop(&data);
                 println!(
-                    "Enabled {}. The worker embeds existing memory in the background; check progress with `quietmem embeddings status`.",
+                    "Enabled {}. The worker embeds existing memory in the background; check progress with `mib embeddings status`.",
                     spec.name
                 );
             }

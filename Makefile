@@ -52,8 +52,8 @@ run:
 
 # Quick demo
 demo: install
-	@echo "=== quietmem demo ==="
-	quietmem --help
+	@echo "=== meminblack demo ==="
+	mib --help
 
 # Bump version, regenerate CHANGELOG.md, tag, and push (requires cargo-release + git-cliff)
 release:

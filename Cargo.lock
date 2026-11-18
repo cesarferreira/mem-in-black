@@ -1383,6 +1383,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "meminblack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "clap",
+ "form_urlencoded",
+ "fs2",
+ "jsonc-parser",
+ "libc",
+ "rmcp",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tiny_http",
+ "tokenizers",
+ "tokio",
+ "toml_edit",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
 name = "memmap2"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1619,34 +1647,6 @@ name = "pulp-wasm-simd-flag"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d8f70e07b9c3962945a74e59ca1c511bba65b6419468acc217c457d93f3c740"
-
-[[package]]
-name = "quietmem"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "clap",
- "form_urlencoded",
- "fs2",
- "jsonc-parser",
- "libc",
- "rmcp",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tiny_http",
- "tokenizers",
- "tokio",
- "toml_edit",
- "ureq",
- "uuid",
-]
 
 [[package]]
 name = "quote"

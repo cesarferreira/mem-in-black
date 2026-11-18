@@ -68,7 +68,7 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
 
 pub fn text(stats: &Stats) -> String {
     let scope = stats.workspace.as_deref().unwrap_or("all workspaces");
-    let mut out = format!("QuietMem stats · {scope}\n");
+    let mut out = format!("Mem in Black stats · {scope}\n");
     for line in lines(stats) {
         let value = format!("{} {}", line.value, line.unit);
         out.push_str(&format!("{:<13} {value:<22} {}\n", line.label, line.detail));

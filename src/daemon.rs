@@ -43,7 +43,7 @@ fn try_lock(file: &File) -> Result<bool> {
 }
 
 pub fn start_background(data: &Storage) -> Result<()> {
-    if std::env::var_os("QUIETMEM_NO_AUTOSTART").is_some() {
+    if std::env::var_os("MIB_NO_AUTOSTART").is_some() {
         return Ok(());
     }
     let lock = lock_file(data)?;
@@ -70,11 +70,11 @@ pub fn status(data: &Storage) -> Result<Value> {
     let url = running
         .then(|| fs::read_to_string(data.directory.join(URL)).ok())
         .flatten();
-    let store = Store::open(data).context("opening the QuietMem database")?;
+    let store = Store::open(data).context("opening the Mem in Black database")?;
     Ok(json!({
         "data_dir": data.directory, "database_path": data.database, "running": running, "viewer_url": url.as_deref().map(str::trim),
         "journal_mode": store.journal_mode()?,
-        "records": store.counts().context("reading QuietMem records")?,
+        "records": store.counts().context("reading Mem in Black records")?,
         "observer_tokens": store.metric("observer_tokens")?,
         "observer_config_error": observer::settings(&data.directory).err().map(|error| error.to_string()),
         "context_injections": store.metric("context_injections")?,
@@ -96,6 +96,20 @@ pub fn stop(data: &Storage) -> Result<()> {
         .into();
     agent.post(format!("{}/stop", base.trim())).send_empty()?;
     Ok(())
+}
+
+/// Stops the worker and waits until it releases the data directory.
+/// Returns false if the worker is still running after `timeout`.
+pub fn stop_and_wait(data: &Storage, timeout: Duration) -> bool {
+    let _ = stop(data);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match lock_file(data).and_then(|lock| try_lock(&lock)) {
+            Ok(true) => return true,
+            Ok(false) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => return false,
+        }
+    }
 }
 
 pub fn observe_once(data: &Storage) -> Result<()> {
@@ -139,7 +153,7 @@ pub fn run(data: &Storage) -> Result<()> {
     run_in_background();
     let store = Store::open_worker(data)?;
     let config = observer::settings(&data.directory).unwrap_or_else(|error| {
-        eprintln!("QuietMem observer configuration: {error:#}");
+        eprintln!("Mem in Black observer configuration: {error:#}");
         None
     });
     let server = Server::http("127.0.0.1:0").map_err(|error| anyhow!(error))?;
@@ -169,14 +183,14 @@ pub fn run(data: &Storage) -> Result<()> {
 
     let semantic = Arc::new(Semantic::default());
     if let Some(spec) = embed::configured(&data.directory).unwrap_or_else(|error| {
-        eprintln!("QuietMem embeddings configuration: {error:#}");
+        eprintln!("Mem in Black embeddings configuration: {error:#}");
         None
     }) {
         let semantic = semantic.clone();
         let worker_data = data.clone();
         thread::spawn(move || {
             if let Err(error) = semantic.run(&worker_data, spec) {
-                eprintln!("QuietMem embeddings: {error:#}");
+                eprintln!("Mem in Black embeddings: {error:#}");
             }
         });
     }
@@ -210,10 +224,10 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// How long the model stays loaded without queries. `QUIETMEM_MODEL_IDLE_SECS`
+/// How long the model stays loaded without queries. `MIB_MODEL_IDLE_SECS`
 /// overrides the 30-minute default.
 fn idle_limit() -> Duration {
-    std::env::var("QUIETMEM_MODEL_IDLE_SECS")
+    std::env::var("MIB_MODEL_IDLE_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
         .map_or(Duration::from_secs(30 * 60), Duration::from_secs)
@@ -471,11 +485,11 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
     };
     let rows = mcp::search(store, Some(query), None, 40, Some(&find))?;
     let mut html = format!(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QuietMem</title>
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mem in Black</title>
 <style>
 :root{{color-scheme:dark;--bg:#15171a;--panel:#1c2024;--line:#343b42;--ink:#f0f1f2;--muted:#afb9c3;--accent:#a4dac2}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}}main{{max-width:940px;margin:0 auto;padding:48px 22px}}h1{{margin:0 0 24px;letter-spacing:-.035em;font-size:36px}}form{{display:flex;gap:10px;margin-bottom:30px}}input,button{{border:1px solid var(--line);border-radius:8px;font:inherit;padding:12px;background:var(--panel);color:var(--ink)}}input{{flex:1;min-width:0}}button{{color:var(--accent);cursor:pointer}}details{{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;padding:16px}}summary{{cursor:pointer;overflow-wrap:anywhere}}small{{display:block;color:var(--muted);margin:8px 0 0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,monospace;margin:16px 0 0}}p{{color:var(--muted)}}:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}
 .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:0 0 28px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}.note{{font-size:13px;margin:-16px 0 28px}}
-</style><main><h1>QuietMem</h1>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>"#,
+</style><main><h1>Mem in Black</h1>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>"#,
         escape(query),
         stats = stat_cards(store)?,
     );

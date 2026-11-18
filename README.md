@@ -1,11 +1,11 @@
 <div align="center">
-  <h1>quietmem</h1>
+  <h1>Mem in Black</h1>
 
-  <p><strong>Local Rust memory service for coding agents</strong></p>
+  <p><strong>We remember so your agents don't have to.</strong></p>
 
   <p>
-    <a href="https://github.com/cesarferreira/quietmem/actions/workflows/rust-tests.yml">
-      <img alt="Tests" src="https://github.com/cesarferreira/quietmem/actions/workflows/rust-tests.yml/badge.svg?branch=main">
+    <a href="https://github.com/cesarferreira/meminblack/actions/workflows/rust-tests.yml">
+      <img alt="Tests" src="https://github.com/cesarferreira/meminblack/actions/workflows/rust-tests.yml/badge.svg?branch=main">
     </a>
     <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
   </p>
@@ -21,9 +21,9 @@
 
 ---
 
-QuietMem remembers what your coding agents did and hands the relevant parts to the
-next session. Everything runs on your machine: no account, no hosted service, no
-telemetry.
+Mem in Black (`mib`) is a local memory service for coding agents. It remembers
+what your agents did and hands the relevant parts to the next session.
+Everything runs on your machine: no account, no hosted service, no telemetry.
 
 ## At a glance
 
@@ -35,7 +35,7 @@ telemetry.
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
 | Your data stays local | Nothing leaves your machine unless you configure a remote summary model |
 | Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
-| See what it saved | `quietmem stats` and the viewer |
+| See what it saved | `mib stats` and the viewer |
 
 | What it costs | |
 | --- | --- |
@@ -49,17 +49,17 @@ telemetry.
 Linux or macOS with [Rust](https://rustup.rs) 1.99 or newer:
 
 ```bash
-git clone https://github.com/cesarferreira/quietmem.git
-cd quietmem
+git clone https://github.com/cesarferreira/meminblack.git
+cd meminblack
 cargo install --path . --locked
-quietmem install
+mib install
 ```
 
-`quietmem install` configures every supported agent it finds and keeps your
+`mib install` configures every supported agent it finds and keeps your
 existing hooks and MCP servers. Restart your agents afterwards. Codex asks you to
 trust the new hooks once.
 
-| Agent | Automatic capture and recall | Memory search (MCP) | Configured by `quietmem install` |
+| Agent | Automatic capture and recall | Memory search (MCP) | Configured by `mib install` |
 | --- | --- | --- | --- |
 | Claude Code | ✓ | ✓ | Always |
 | Codex | ✓ | ✓ | Always |
@@ -67,19 +67,24 @@ trust the new hooks once.
 | OpenCode | | ✓ | When installed, or `--host opencode` |
 | Pi | | ✓ | When installed. `--host pi` adds a startup preview |
 | Oh My Pi | | ✓ | When installed, or `--host omp` (`OMP_PROFILE=work` for a profile) |
-| Any MCP client | | ✓ | Register the stdio command `quietmem mcp` |
+| Any MCP client | | ✓ | Register the stdio command `mib mcp` |
 
 T3 Code support configures the home of each enabled provider in
 `~/.t3/userdata/settings.json`, including custom `homePath`s. Set `T3CODE_HOME`
 for a custom T3 location.
 
+**Upgrading from QuietMem:** install `mib`, run `mib install`, then
+`cargo uninstall quietmem`. The first `mib` run moves your memory and settings
+to the new directories. `mib install` replaces the old hooks and MCP entries.
+Rename any `QUIETMEM_*` environment variables to `MIB_*`.
+
 ## Use it
 
-Work as usual. QuietMem stays quiet until it has something relevant:
+Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** A prompt that matches earlier work gets that work's outcome: the request, files, test results, decision and next step. A prompt with no match gets nothing.
 - **Handoff.** In the same worktree, ask one agent to *continue the work I started in Claude* or *resume the latest Codex task*. Evidence from a different Git commit is flagged.
-- **Startup preview.** A new session shows recent activity for the worktree. `QUIETMEM_STARTUP_PREVIEW=0` hides it.
+- **Startup preview.** A new session shows recent activity for the worktree. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
 
 Agents can also call the MCP tools `search`, `timeline`, `get_observations`,
@@ -91,8 +96,8 @@ Keyword search needs shared words. Semantic search also finds *"reconnect
 attempts give up early"* in a record about a retry counter.
 
 ```sh
-quietmem embeddings enable     # one-time 436 MB download, verified by SHA-256
-quietmem embeddings status
+mib embeddings enable     # one-time 436 MB download, verified by SHA-256
+mib embeddings status
 ```
 
 The model runs locally on the CPU. Existing records are embedded in the
@@ -101,7 +106,7 @@ viewer combine both kinds of match. Automatic recall only uses a semantic match
 when its similarity clears a floor calibrated on unrelated queries.
 
 The model unloads after 30 idle minutes and reloads in about 2 seconds on the
-next query. `quietmem embeddings disable` returns to keywords only.
+next query. `mib embeddings disable` returns to keywords only.
 
 | Model (`--model`) | Download | MRR, titles | MRR, facts |
 | --- | --- | --- | --- |
@@ -111,7 +116,7 @@ next query. `quietmem embeddings disable` returns to keywords only.
 | `bge-base` | 439 MB | 0.775 | 0.483 |
 | **`arctic-m` (default)** | 436 MB | **0.779** | **0.485** |
 
-Scores come from `quietmem eval` on 2,577 real coding-session observations. Each
+Scores come from `mib eval` on 2,577 real coding-session observations. Each
 query is an observation's title or first fact, removed from the stored text. MRR
 of 1.0 means the right record always ranks first. Hybrid search gains most when
 you describe a problem in different words than the record used.
@@ -120,13 +125,13 @@ you describe a problem in different words than the record used.
 
 | Command | What it does |
 | --- | --- |
-| `quietmem stats` | Usage and an estimate of tokens saved (`--json`, `--workspace .`) |
-| `quietmem status` | Worker state, database path and the private viewer URL |
-| `quietmem search "query"` | Search memory (`--workspace .` for one worktree) |
-| `quietmem preview` | Recent activity for this worktree |
-| `quietmem forget <id>…` | Delete records and the summaries built from them |
-| `quietmem export` | All records as JSON lines |
-| `quietmem stop` / `serve` | Stop the background worker, or run it in the foreground |
+| `mib stats` | Usage and an estimate of tokens saved (`--json`, `--workspace .`) |
+| `mib status` | Worker state, database path and the private viewer URL |
+| `mib search "query"` | Search memory (`--workspace .` for one worktree) |
+| `mib preview` | Recent activity for this worktree |
+| `mib forget <id>…` | Delete records and the summaries built from them |
+| `mib export` | All records as JSON lines |
+| `mib stop` / `serve` | Stop the background worker, or run it in the foreground |
 
 The tokens-saved figure is an upper bound: it assumes each delivered record
 replaced re-reading its full original output.
@@ -140,17 +145,17 @@ that look like credentials are not stored.
 
 | Setting | Effect |
 | --- | --- |
-| `QUIETMEM_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/quietmem` |
-| `database_path` in `~/.config/quietmem/config.toml` | Put the database on a specific disk. Run `quietmem stop` first |
+| `MIB_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/meminblack` |
+| `database_path` in `~/.config/meminblack/config.toml` | Put the database on a specific disk. Run `mib stop` first |
 | `observer.json` in the data directory | Use an OpenAI-compatible model for summaries ([example](#model-summaries)) |
-| `QUIETMEM_MODEL_IDLE_SECS` | Seconds before an idle model unloads. Default 1800 |
+| `MIB_MODEL_IDLE_SECS` | Seconds before an idle model unloads. Default 1800 |
 | `RAYON_NUM_THREADS` | Threads for semantic search. Default 2 |
-| `QUIETMEM_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
-| `QUIETMEM_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
-| `QUIETMEM_DEBUG=1` | Print hook errors and why each record was or was not recalled |
+| `MIB_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
+| `MIB_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
+| `MIB_DEBUG=1` | Print hook errors and why each record was or was not recalled |
 
-QuietMem uses WAL journaling on local disks and switches to rollback journaling on
-NFS and SMB mounts.
+Mem in Black uses WAL journaling on local disks and switches to rollback
+journaling on NFS and SMB mounts.
 
 <a id="model-summaries"></a>
 Summaries are built locally from each turn. To use a model instead, create
@@ -161,7 +166,7 @@ of each turn, and the local summary is used if it fails.
 {
   "endpoint": "https://provider.example/v1/chat/completions",
   "model": "your-model",
-  "api_key_env": "QUIETMEM_OBSERVER_KEY"
+  "api_key_env": "MIB_OBSERVER_KEY"
 }
 ```
 

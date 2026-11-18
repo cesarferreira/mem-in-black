@@ -1,16 +1,16 @@
 [package]
-name = "quietmem"
+name = "meminblack"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Local Rust memory service for coding agents"
+description = "We remember so your agents don't have to. Local memory for coding agents."
 license = "MIT"
 publish = false
 authors = ["Cesar Ferreira"]
-repository = "https://github.com/cesarferreira/quietmem"
+repository = "https://github.com/cesarferreira/meminblack"
 
 [[bin]]
-name = "quietmem"
+name = "mib"
 path = "src/main.rs"
 
 [dependencies]

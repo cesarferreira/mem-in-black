@@ -109,7 +109,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Retrieve the full local records for observation IDs returned by QuietMem search or timeline."
+        description = "Retrieve the full local records for observation IDs returned by Mem in Black search or timeline."
     )]
     async fn get_observations(
         &self,
@@ -175,7 +175,7 @@ impl MemoryServer {
     }
 
     #[tool(
-        description = "Permanently delete QuietMem records by ID, with the summaries built from them. Use for wrong or sensitive records; prefer save_memory with `replaces` to correct outdated facts."
+        description = "Permanently delete Mem in Black records by ID, with the summaries built from them. Use for wrong or sensitive records; prefer save_memory with `replaces` to correct outdated facts."
     )]
     async fn forget(
         &self,
@@ -199,8 +199,8 @@ impl MemoryServer {
 }
 
 #[tool_handler(
-    name = "quietmem",
-    instructions = "Use QuietMem for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Start with a narrow search and fetch full observations only as needed."
+    name = "meminblack",
+    instructions = "Use Mem in Black for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Start with a narrow search and fetch full observations only as needed."
 )]
 impl ServerHandler for MemoryServer {}
 

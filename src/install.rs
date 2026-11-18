@@ -1,9 +1,9 @@
-use crate::{hooks::Host, store::prepare_dir};
+use crate::{config::NAME, hooks::Host, store::prepare_dir};
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
 use jsonc_parser::{
     ParseOptions,
-    cst::{CstInputValue, CstRootNode},
+    cst::{CstInputValue, CstRootNode, ObjectPropName},
 };
 use serde_json::{Value, json};
 use std::{
@@ -14,6 +14,12 @@ use std::{
 };
 use tempfile::NamedTempFile;
 use toml_edit::{Array, DocumentMut, value};
+
+/// MCP server name and hook marker from before the rename. Install moves
+/// those entries to the current name and keeps their other settings.
+const LEGACY_NAME: &str = "quietmem";
+const HOOK_MARKER: &str = " # meminblack-managed";
+const LEGACY_HOOK_MARKER: &str = " # quietmem-managed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Target {
@@ -53,6 +59,7 @@ pub fn install(
         .map(|path| path.to_str().context("data path is not UTF-8"))
         .transpose()?;
     let mut changes = Vec::new();
+    let mut removals = Vec::new();
     let selected_or_detected =
         |target, detected| selected == Some(target) || (selected.is_none() && detected);
 
@@ -118,9 +125,11 @@ pub fn install(
     };
     if selected_or_detected(Target::Pi, pi.is_dir()) {
         changes.push(stdio_mcp_file(pi.join("mcp.json"), exe, data)?);
-        if selected == Some(Target::Pi) {
+        let legacy = legacy_pi_extension(&pi)?;
+        if selected == Some(Target::Pi) || legacy.is_some() {
             changes.push(pi_extension_file(&pi, exe, data)?);
         }
+        removals.extend(legacy);
     }
 
     if selected_or_detected(Target::Omp, true) {
@@ -135,6 +144,9 @@ pub fn install(
             atomic_write(&path, contents.as_bytes())?;
         }
     }
+    for path in removals {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -143,12 +155,20 @@ fn codex_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(PathB
     if let Some(existing) = doc.get("mcp_servers") {
         ensure!(existing.is_table_like(), "mcp_servers must be a TOML table");
     }
-    doc["mcp_servers"]["quietmem"]["command"] = value(exe);
+    if let Some(servers) = doc
+        .get_mut("mcp_servers")
+        .and_then(|item| item.as_table_like_mut())
+        && let Some(legacy) = servers.remove(LEGACY_NAME)
+        && servers.get(NAME).is_none()
+    {
+        servers.insert(NAME, legacy);
+    }
+    doc["mcp_servers"][NAME]["command"] = value(exe);
     let mut args = Array::new();
     for part in mcp_args(data) {
         args.push(part);
     }
-    doc["mcp_servers"]["quietmem"]["args"] = value(args);
+    doc["mcp_servers"][NAME]["args"] = value(args);
     Ok((path, doc.to_string()))
 }
 
@@ -245,14 +265,22 @@ fn stdio_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(PathB
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("mcpServers must be an object")?;
+    if let Some(legacy) = servers.remove(LEGACY_NAME) {
+        servers.entry(NAME).or_insert(legacy);
+    }
     let server = servers
-        .entry("quietmem")
+        .entry(NAME)
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .with_context(|| format!("QuietMem MCP entry must be an object in {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "Mem in Black MCP entry must be an object in {}",
+                path.display()
+            )
+        })?;
     ensure!(
         !server.contains_key("url"),
-        "QuietMem MCP entry already points to a URL in {}",
+        "Mem in Black MCP entry already points to a URL in {}",
         path.display()
     );
     server.insert("type".into(), json!("stdio"));
@@ -336,12 +364,26 @@ fn opencode_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(Pa
         mcp.object_value_or_create("servers")
             .context("OpenCode mcp.servers must be an object")?
     };
-    let server = servers
-        .object_value_or_create("quietmem")
-        .with_context(|| format!("QuietMem MCP entry must be an object in {}", path.display()))?;
+    if let Some(legacy) = servers.get(LEGACY_NAME) {
+        if servers.get(NAME).is_some() {
+            legacy.remove();
+        } else {
+            match legacy.name() {
+                Some(ObjectPropName::String(name)) => name.set_raw_value(format!("\"{NAME}\"")),
+                Some(ObjectPropName::Word(name)) => name.set_raw_value(NAME.into()),
+                None => {}
+            }
+        }
+    }
+    let server = servers.object_value_or_create(NAME).with_context(|| {
+        format!(
+            "Mem in Black MCP entry must be an object in {}",
+            path.display()
+        )
+    })?;
     ensure!(
         server.get("url").is_none(),
-        "QuietMem MCP entry already points to a URL in {}",
+        "Mem in Black MCP entry already points to a URL in {}",
         path.display()
     );
     let command: Vec<_> = std::iter::once(exe).chain(mcp_args(data)).collect();
@@ -363,11 +405,11 @@ fn pi_extension_file(
     binary: &str,
     data: Option<&str>,
 ) -> Result<(PathBuf, String)> {
-    const MARKER: &str = "// Installed by QuietMem\n";
-    let path = config_dir.join("extensions/quietmem-startup.js");
+    const MARKER: &str = "// Installed by Mem in Black\n";
+    let path = config_dir.join(format!("extensions/{NAME}-startup.js"));
     let config = json!({"binary": binary, "dataDirectory": data});
     let extension = format!(
-        "{MARKER}const quietmem = {config};\n{}",
+        "{MARKER}const meminblack = {config};\n{}",
         include_str!("pi-preview.js")
     );
     if let Some(existing) = read(&path)? {
@@ -378,6 +420,14 @@ fn pi_extension_file(
         );
     }
     Ok((path, extension))
+}
+
+/// The startup extension written before the rename, if Mem in Black wrote it.
+fn legacy_pi_extension(config_dir: &Path) -> Result<Option<PathBuf>> {
+    let path = config_dir.join(format!("extensions/{LEGACY_NAME}-startup.js"));
+    Ok(read(&path)?
+        .is_some_and(|existing| existing.starts_with("// Installed by QuietMem\n"))
+        .then_some(path))
 }
 
 fn hooks_file(
@@ -395,7 +445,7 @@ fn hooks_file(
         .as_object_mut()
         .context("hooks must be an object")?;
     let command = format!(
-        "{}{} hook {} # quietmem-managed",
+        "{}{} hook {}{HOOK_MARKER}",
         quote(exe),
         data.map(|dir| format!(" --data-dir {}", quote(dir)))
             .unwrap_or_default(),
@@ -417,18 +467,34 @@ fn hooks_file(
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .with_context(|| format!("invalid {event} hook groups"))?;
-        let existing = groups
-            .iter_mut()
-            .filter_map(|group| group.get_mut("hooks")?.as_array_mut())
-            .flatten()
-            .find(|hook| {
-                hook["command"]
-                    .as_str()
-                    .is_some_and(|command| command.ends_with(" # quietmem-managed"))
+        // Update the first managed hook in place and drop any others, such as
+        // one left by the old name.
+        let mut found = false;
+        for group in groups.iter_mut() {
+            let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let before = list.len();
+            list.retain_mut(|hook| {
+                let managed = hook["command"].as_str().is_some_and(|command| {
+                    command.ends_with(HOOK_MARKER) || command.ends_with(LEGACY_HOOK_MARKER)
+                });
+                if !managed {
+                    return true;
+                }
+                if found {
+                    return false;
+                }
+                found = true;
+                hook["command"] = json!(command);
+                true
             });
-        if let Some(existing) = existing {
-            existing["command"] = json!(command);
-        } else {
+            if list.is_empty() && before > 0 {
+                *group = Value::Null;
+            }
+        }
+        groups.retain(|group| !group.is_null());
+        if !found {
             groups.push(json!({"hooks":[{"type":"command","command":command,"timeout":2}]}));
         }
     }

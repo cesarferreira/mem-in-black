@@ -34,7 +34,7 @@ pub struct Spec {
     pub query_prefix: &'static str,
     pub dimensions: usize,
     /// Similarity that justifies unprompted recall on its own: the 99th
-    /// percentile of top-1 scores for unrelated queries in `quietmem eval`.
+    /// percentile of top-1 scores for unrelated queries in `mib eval`.
     pub recall_floor: f32,
     /// Lower similarity (95th percentile of unrelated) accepted when the record
     /// also shares a keyword with the prompt.
@@ -43,7 +43,7 @@ pub struct Spec {
 
 const RETRIEVAL_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
-/// Best hybrid retrieval in `quietmem eval` on real Claude Mem history.
+/// Best hybrid retrieval in `mib eval` on real Claude Mem history.
 pub const DEFAULT_MODEL: &str = "arctic-m";
 
 pub const MODELS: &[Spec] = &[
@@ -165,7 +165,7 @@ pub fn spec(name: &str) -> Result<&'static Spec> {
 }
 
 /// Weights are held as bfloat16: half the memory of f32 with the same
-/// retrieval quality and calibration in `quietmem eval`. Inference is about
+/// retrieval quality and calibration in `mib eval`. Inference is about
 /// 1.5× slower on CPU.
 const WEIGHTS: DType = DType::BF16;
 
@@ -384,7 +384,7 @@ impl Embedder {
     pub fn load(data: &Path, spec: &'static Spec) -> Result<Self> {
         ensure!(
             installed(data, spec),
-            "model {} is not installed; run `quietmem embeddings enable --model {}`",
+            "model {} is not installed; run `mib embeddings enable --model {}`",
             spec.name,
             spec.name
         );

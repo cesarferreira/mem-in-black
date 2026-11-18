@@ -21,7 +21,7 @@ impl Workspace {
             &repo,
             &[
                 "-c",
-                "user.name=QuietMem",
+                "user.name=Mem in Black",
                 "-c",
                 "user.email=test@example.com",
                 "commit",
@@ -34,13 +34,13 @@ impl Workspace {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_quietmem"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mib"));
         command
-            .env("QUIETMEM_DATA_DIR", self.temp.path().join("data"))
-            .env("QUIETMEM_NO_AUTOSTART", "1")
+            .env("MIB_DATA_DIR", self.temp.path().join("data"))
+            .env("MIB_NO_AUTOSTART", "1")
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
-            .env_remove("QUIETMEM_STARTUP_PREVIEW")
+            .env_remove("MIB_STARTUP_PREVIEW")
             .current_dir(&self.repo);
         command
     }
@@ -156,7 +156,7 @@ fn changed_revision_is_flagged_and_other_worktrees_cannot_take_over_resume() {
         &workspace.repo,
         &[
             "-c",
-            "user.name=QuietMem",
+            "user.name=Mem in Black",
             "-c",
             "user.email=test@example.com",
             "commit",
@@ -221,9 +221,9 @@ fn installer_preserves_existing_config_and_is_idempotent() {
     assert!(codex_settings.contains("model = 'custom'"));
     assert!(codex_settings.contains("[mcp_servers.other]"));
     let parsed = codex_settings.parse::<toml_edit::DocumentMut>().unwrap();
-    let quietmem = &parsed["mcp_servers"]["quietmem"];
+    let meminblack = &parsed["mcp_servers"]["meminblack"];
     assert_eq!(
-        quietmem["args"]
+        meminblack["args"]
             .as_array()
             .unwrap()
             .get(2)
@@ -234,7 +234,7 @@ fn installer_preserves_existing_config_and_is_idempotent() {
     let claude_mcp: Value =
         serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
     assert_eq!(
-        claude_mcp["mcpServers"]["quietmem"]["args"]
+        claude_mcp["mcpServers"]["meminblack"]["args"]
             .as_array()
             .unwrap()
             .last()
@@ -276,7 +276,7 @@ fn mcp_can_search_and_fetch_source_evidence() {
         &mut output,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
     );
-    assert_eq!(initialized["result"]["serverInfo"]["name"], "quietmem");
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "meminblack");
     writeln!(
         input,
         r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
@@ -863,7 +863,7 @@ fn first_hook_starts_the_worker_and_the_stop_command_shuts_it_down() {
     let workspace = Workspace::new();
     let mut child = workspace
         .command()
-        .env_remove("QUIETMEM_NO_AUTOSTART")
+        .env_remove("MIB_NO_AUTOSTART")
         .args(["hook", "claude"])
         .stdin(Stdio::piped())
         .spawn()
@@ -905,7 +905,7 @@ fn new_claude_session_shows_colored_worktree_history_to_the_user() {
     );
     let output: Value = serde_json::from_str(&result).unwrap();
     let message = output["systemMessage"].as_str().unwrap();
-    assert!(message.contains("QuietMem"));
+    assert!(message.contains("Mem in Black"));
     assert!(message.contains("Fix the websocket retry regression"));
     assert!(message.contains("cargo test websocket_retry"));
     assert!(message.contains("\x1b["));
@@ -1008,7 +1008,7 @@ fn startup_preview_respects_color_and_visibility_preferences() {
             .run_with_env(
                 &["hook", "claude"],
                 Some(event),
-                &[("QUIETMEM_STARTUP_PREVIEW", "0")]
+                &[("MIB_STARTUP_PREVIEW", "0")]
             )
             .is_empty()
     );
@@ -1020,12 +1020,12 @@ fn pi_install_registers_a_local_startup_extension_idempotently() {
     let home = workspace.temp.path().join("Pi home's fixture");
     let install = ["install", "--host", "pi", "--home", home.to_str().unwrap()];
     workspace.run(&install, None);
-    let path = home.join(".pi/agent/extensions/quietmem-startup.js");
+    let path = home.join(".pi/agent/extensions/meminblack-startup.js");
     let extension = std::fs::read_to_string(&path).unwrap();
     assert!(extension.contains("session_start"));
     assert!(extension.contains("preview"));
     assert!(extension.contains("before_agent_start"));
-    assert!(extension.contains("QUIETMEM_STARTUP_PREVIEW"));
+    assert!(extension.contains("MIB_STARTUP_PREVIEW"));
     assert!(!home.join(".claude").exists());
     assert!(!home.join(".codex").exists());
     workspace.run(&install, None);
@@ -1047,7 +1047,7 @@ fn new_local_memory_databases_use_wal_journaling() {
 fn config_places_the_database_at_a_custom_absolute_path() {
     let workspace = Workspace::new();
     let config_root = workspace.temp.path().join("config");
-    let config = config_root.join("quietmem");
+    let config = config_root.join("meminblack");
     let data_home = workspace.temp.path().join("xdg-data");
     let database = workspace.temp.path().join("local disk/history.db");
     std::fs::create_dir_all(&config).unwrap();
@@ -1058,7 +1058,7 @@ fn config_places_the_database_at_a_custom_absolute_path() {
     .unwrap();
     let output = workspace
         .command()
-        .env_remove("QUIETMEM_DATA_DIR")
+        .env_remove("MIB_DATA_DIR")
         .env("XDG_CONFIG_HOME", &config_root)
         .env("XDG_DATA_HOME", &data_home)
         .arg("status")
@@ -1072,7 +1072,7 @@ fn config_places_the_database_at_a_custom_absolute_path() {
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["database_path"], database.to_str().unwrap());
     assert!(database.is_file());
-    assert!(!data_home.join("quietmem/memory.sqlite3").exists());
+    assert!(!data_home.join("meminblack/memory.sqlite3").exists());
     workspace.run_with_env(
         &["status"],
         None,
@@ -1087,7 +1087,7 @@ fn default_installer_lets_hooks_use_database_settings() {
     let home = workspace.temp.path().join("agent-home");
     let output = workspace
         .command()
-        .env_remove("QUIETMEM_DATA_DIR")
+        .env_remove("MIB_DATA_DIR")
         .env("XDG_CONFIG_HOME", workspace.temp.path().join("config"))
         .env("XDG_DATA_HOME", workspace.temp.path().join("xdg-data"))
         .args([
@@ -1113,11 +1113,11 @@ fn default_installer_lets_hooks_use_database_settings() {
     assert!(!command.contains("--data-dir"));
     let mcp: Value =
         serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
-    assert_eq!(mcp["mcpServers"]["quietmem"]["args"], json!(["mcp"]));
+    assert_eq!(mcp["mcpServers"]["meminblack"]["args"], json!(["mcp"]));
 }
 
 #[test]
-fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
+fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
     let workspace = Workspace::new();
     let home = workspace.temp.path().join("mcp-profiles");
     let open = home.join(".config/opencode/opencode.json");
@@ -1129,7 +1129,7 @@ fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
     }
     std::fs::write(
         &open,
-        r#"{"mcp":{"codegraph":{"type":"local","command":["codegraph"]},"quietmem":{"type":"local","command":["old"],"enabled":false}}}"#,
+        r#"{"mcp":{"codegraph":{"type":"local","command":["codegraph"]},"meminblack":{"type":"local","command":["old"],"enabled":false}}}"#,
     )
     .unwrap();
     for file in [&pi, &omp] {
@@ -1137,7 +1137,7 @@ fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
             file,
             json!({"mcpServers":{
                 "existing": another_server,
-                "quietmem": {"type":"stdio","command":"old","enabled":false}
+                "meminblack": {"type":"stdio","command":"old","enabled":false}
             }})
             .to_string(),
         )
@@ -1151,10 +1151,10 @@ fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
     let open_config = read_json(&open);
     let servers = &open_config["mcp"];
     assert_eq!(servers["codegraph"]["command"], json!(["codegraph"]));
-    assert_eq!(servers["quietmem"]["type"], "local");
-    assert_eq!(servers["quietmem"]["enabled"], false);
+    assert_eq!(servers["meminblack"]["type"], "local");
+    assert_eq!(servers["meminblack"]["enabled"], false);
     assert_eq!(
-        servers["quietmem"]["command"]
+        servers["meminblack"]["command"]
             .as_array()
             .unwrap()
             .last()
@@ -1164,10 +1164,10 @@ fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
     for file in [&pi, &omp] {
         let config = read_json(file);
         assert_eq!(config["mcpServers"]["existing"], another_server);
-        assert_eq!(config["mcpServers"]["quietmem"]["type"], "stdio");
-        assert_eq!(config["mcpServers"]["quietmem"]["enabled"], false);
+        assert_eq!(config["mcpServers"]["meminblack"]["type"], "stdio");
+        assert_eq!(config["mcpServers"]["meminblack"]["enabled"], false);
         assert_eq!(
-            config["mcpServers"]["quietmem"]["args"]
+            config["mcpServers"]["meminblack"]["args"]
                 .as_array()
                 .unwrap()
                 .last()
@@ -1207,7 +1207,7 @@ fn opencode_v2_install_keeps_jsonc_comments_and_registers_nested_stdio() {
         parsed["mcp"]["servers"]["other"]["command"],
         json!(["other"])
     );
-    assert_eq!(parsed["mcp"]["servers"]["quietmem"]["type"], "local");
+    assert_eq!(parsed["mcp"]["servers"]["meminblack"]["type"], "local");
     assert!(!home.join(".codex").exists());
 }
 
@@ -1230,7 +1230,7 @@ fn omp_install_targets_the_active_named_profile() {
     let config = home.join(".custom-omp/profiles/work/agent/mcp.json");
     let config: Value = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
     assert_eq!(
-        config["mcpServers"]["quietmem"]["args"]
+        config["mcpServers"]["meminblack"]["args"]
             .as_array()
             .unwrap()
             .last()
@@ -1254,7 +1254,7 @@ fn pi_install_expands_a_home_relative_profile() {
     );
     assert!(home.join("pi-profile/mcp.json").is_file());
     assert!(
-        home.join("pi-profile/extensions/quietmem-startup.js")
+        home.join("pi-profile/extensions/meminblack-startup.js")
             .is_file()
     );
     assert!(!workspace.repo.join("~").exists());
@@ -1430,7 +1430,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
     std::fs::create_dir(&data).unwrap();
     std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     let database = data.join("memory.sqlite3");
-    // The schema exactly as QuietMem version 3 created it.
+    // The schema exactly as Mem in Black version 3 created it.
     let legacy = rusqlite::Connection::open(&database).unwrap();
     legacy
         .execute_batch(
@@ -1658,7 +1658,7 @@ fn idle_model_unloads_and_reloads_on_the_next_query() {
     workspace.run(&["embeddings", "enable", "--model", "minilm"], None);
     let mut worker = workspace
         .command()
-        .env("QUIETMEM_MODEL_IDLE_SECS", "2")
+        .env("MIB_MODEL_IDLE_SECS", "2")
         .arg("serve")
         .stdout(Stdio::piped())
         .spawn()
@@ -1739,7 +1739,7 @@ fn t3code_install_configures_each_enabled_provider_home() {
     let mcp: Value =
         serde_json::from_slice(&std::fs::read(custom_claude.join(".claude.json")).unwrap())
             .unwrap();
-    assert!(mcp["mcpServers"]["quietmem"].is_object());
+    assert!(mcp["mcpServers"]["meminblack"].is_object());
     let codex_hooks = std::fs::read_to_string(home.join(".codex/hooks.json")).unwrap();
     assert!(codex_hooks.contains("hook codex"));
     let codex_config: toml_edit::DocumentMut =
@@ -1747,7 +1747,7 @@ fn t3code_install_configures_each_enabled_provider_home() {
             .unwrap()
             .parse()
             .unwrap();
-    assert!(codex_config["mcp_servers"]["quietmem"]["command"].is_str());
+    assert!(codex_config["mcp_servers"]["meminblack"]["command"].is_str());
     assert!(
         !home.join("unused-codex").exists(),
         "disabled provider is skipped"
@@ -1783,7 +1783,7 @@ fn recall_sees_every_word_of_a_long_record() {
         "UserPromptSubmit",
         json!({"prompt":"Investigate the import"}),
     );
-    workspace.hook("claude", "old", "PostToolUse", json!({"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"quietmem import upstream.db"},"tool_response":format!("{filler}\nError: missing observations.sdk_session_id column")}));
+    workspace.hook("claude", "old", "PostToolUse", json!({"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"mib import upstream.db"},"tool_response":format!("{filler}\nError: missing observations.sdk_session_id column")}));
     workspace.hook(
         "claude",
         "old",
@@ -1829,5 +1829,169 @@ fn chat_turns_and_common_words_do_not_trigger_recall() {
             json!({"prompt": prompt}),
         ));
         assert!(recalled.is_empty(), "{prompt}: {recalled}");
+    }
+}
+
+#[test]
+fn install_moves_hooks_and_servers_from_the_old_name() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("renamed-home");
+    let old_hook = |host: &str| json!({"type":"command","command":format!("'/old/quietmem' hook {host} # quietmem-managed"),"timeout":2});
+    let user_hook = json!({"type":"command","command":"echo mine"});
+    let write = |path: PathBuf, contents: String| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        home.join(".claude/settings.json"),
+        json!({"hooks":{
+            "SessionStart":[{"hooks":[old_hook("claude")]},{"hooks":[user_hook]}],
+            "UserPromptSubmit":[{"hooks":[user_hook, old_hook("claude")]}]
+        }})
+        .to_string(),
+    );
+    write(
+        home.join(".claude.json"),
+        json!({"mcpServers":{"quietmem":{"type":"stdio","command":"old","enabled":false}}})
+            .to_string(),
+    );
+    write(
+        home.join(".codex/hooks.json"),
+        json!({"hooks":{"Stop":[{"hooks":[old_hook("codex")]}]}}).to_string(),
+    );
+    write(
+        home.join(".codex/config.toml"),
+        "[mcp_servers.quietmem]\ncommand = \"old\"\nstartup_timeout_sec = 30\n".into(),
+    );
+    write(
+        home.join(".config/opencode/opencode.json"),
+        r#"{"mcp":{"quietmem":{"type":"local","command":["old"],"enabled":false}}}"#.into(),
+    );
+    write(
+        home.join(".pi/agent/extensions/quietmem-startup.js"),
+        "// Installed by QuietMem\nconst quietmem = {};\n".into(),
+    );
+
+    workspace.run(&["install", "--home", home.to_str().unwrap()], None);
+
+    let read = |path: &str| std::fs::read_to_string(home.join(path)).unwrap();
+    for path in [
+        ".claude/settings.json",
+        ".claude.json",
+        ".codex/hooks.json",
+        ".codex/config.toml",
+        ".config/opencode/opencode.json",
+    ] {
+        assert!(!read(path).contains("quietmem"), "{path}: {}", read(path));
+    }
+    let settings: Value = serde_json::from_str(&read(".claude/settings.json")).unwrap();
+    let managed = |groups: &Value| -> Vec<String> {
+        groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .filter_map(|hook| hook["command"].as_str())
+            .filter(|command| command.ends_with(" # meminblack-managed"))
+            .map(str::to_owned)
+            .collect()
+    };
+    for event in ["SessionStart", "UserPromptSubmit"] {
+        let groups = &settings["hooks"][event];
+        assert_eq!(managed(groups).len(), 1, "{event}: {groups}");
+        assert!(
+            groups.to_string().contains("echo mine"),
+            "{event}: {groups}"
+        );
+    }
+    assert_eq!(
+        settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+        2
+    );
+    let codex_hooks: Value = serde_json::from_str(&read(".codex/hooks.json")).unwrap();
+    assert_eq!(managed(&codex_hooks["hooks"]["Stop"]).len(), 1);
+
+    let claude: Value = serde_json::from_str(&read(".claude.json")).unwrap();
+    assert_eq!(claude["mcpServers"]["meminblack"]["enabled"], false);
+    assert_eq!(
+        claude["mcpServers"]["meminblack"]["args"]
+            .as_array()
+            .unwrap()
+            .last(),
+        Some(&json!("mcp"))
+    );
+    let codex = read(".codex/config.toml")
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        codex["mcp_servers"]["meminblack"]["startup_timeout_sec"].as_integer(),
+        Some(30)
+    );
+    let opencode: Value = serde_json::from_str(&read(".config/opencode/opencode.json")).unwrap();
+    assert_eq!(opencode["mcp"]["meminblack"]["enabled"], false);
+
+    assert!(
+        !home
+            .join(".pi/agent/extensions/quietmem-startup.js")
+            .exists()
+    );
+    assert!(read(".pi/agent/extensions/meminblack-startup.js").contains("const meminblack"));
+}
+
+#[test]
+fn first_run_moves_the_old_data_directory_and_stops_its_worker() {
+    let workspace = Workspace::new();
+    let data_home = workspace.temp.path().join("xdg-data");
+    let config_home = workspace.temp.path().join("xdg-config");
+    let legacy = data_home.join("quietmem");
+    workspace.run_with_env(
+        &["--data-dir", legacy.to_str().unwrap(), "status"],
+        None,
+        &[],
+    );
+    std::fs::write(legacy.join("marker"), "kept").unwrap();
+    std::fs::create_dir_all(config_home.join("quietmem")).unwrap();
+    std::fs::write(config_home.join("quietmem/config.toml"), "# settings\n").unwrap();
+
+    let mut worker = workspace
+        .command()
+        .args(["--data-dir", legacy.to_str().unwrap(), "serve"])
+        .spawn()
+        .unwrap();
+    let ready = std::time::Instant::now();
+    while !legacy.join("viewer-url").exists() {
+        assert!(ready.elapsed().as_secs() < 10, "old worker did not start");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let output = workspace
+        .command()
+        .env_remove("MIB_DATA_DIR")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let moved = data_home.join("meminblack");
+    assert_eq!(status["data_dir"], moved.to_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(moved.join("marker")).unwrap(),
+        "kept"
+    );
+    assert!(moved.join("memory.sqlite3").is_file());
+    assert!(!legacy.exists());
+    assert!(config_home.join("meminblack/config.toml").is_file());
+    assert!(!config_home.join("quietmem").exists());
+
+    let stopped = std::time::Instant::now();
+    while worker.try_wait().unwrap().is_none() {
+        assert!(stopped.elapsed().as_secs() < 5, "old worker kept running");
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }

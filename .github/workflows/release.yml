@@ -48,14 +48,14 @@ jobs:
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../quietmem-${{ matrix.target }}.tar.gz quietmem
+          tar czf ../../../meminblack-${{ matrix.target }}.tar.gz mib
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: quietmem-${{ matrix.target }}
-          path: quietmem-${{ matrix.target }}.*
+          name: meminblack-${{ matrix.target }}
+          path: meminblack-${{ matrix.target }}.*
 
   release:
     name: Release

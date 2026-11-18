@@ -27,7 +27,7 @@ impl Color {
 
 pub fn startup_enabled() -> bool {
     !matches!(
-        env::var("QUIETMEM_STARTUP_PREVIEW").as_deref(),
+        env::var("MIB_STARTUP_PREVIEW").as_deref(),
         Ok("0" | "false" | "off")
     )
 }
@@ -54,7 +54,7 @@ pub fn render(
         .unwrap_or(&workspace.root);
     let mut message = format!(
         "{} · {}\n",
-        paint("QuietMem", "1;96", color),
+        paint("Mem in Black", "1;96", color),
         display_line(name, 48)
     );
     let mut date = "";
@@ -87,7 +87,7 @@ pub fn render(
             display_line(headline(row), 78),
         ));
     }
-    message.push_str(&paint("Viewer · quietmem status", "2", color));
+    message.push_str(&paint("Viewer · mib status", "2", color));
     Ok(Some(message))
 }
 
