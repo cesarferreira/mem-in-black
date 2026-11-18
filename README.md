@@ -13,21 +13,17 @@
   <p>
     <a href="#install">Install</a>
     &nbsp;·&nbsp;
-    <a href="#quickstart">Quickstart</a>
+    <a href="#semantic-search">Semantic search</a>
+    &nbsp;·&nbsp;
+    <a href="#configuration">Configuration</a>
   </p>
 </div>
 
 ---
 
-QuietMem captures useful actions and results in the background. Claude Code and
-Codex get a small set of relevant observations automatically, and any compatible
-stdio MCP client can search the same history.
-
-**Local by default.** QuietMem runs without a hosted memory service, sign-in, or
-telemetry. Capture, SQLite storage, summaries, and stdio MCP run on your machine.
-The viewer listens on `127.0.0.1`. QuietMem sends memory excerpts to a remote
-service only if you configure a remote endpoint in `observer.json`. See
-[Optional model summaries](#optional-model-summaries).
+QuietMem remembers what your coding agents did and hands the relevant parts to the
+next session. Everything runs on your machine: no account, no hosted service, no
+telemetry.
 
 ## At a glance
 
@@ -36,7 +32,7 @@ service only if you configure a remote endpoint in `observer.json`. See
 | New sessions know past work | Each prompt gets the outcome of matching earlier work, not your old questions |
 | Switch agents mid-task | Ask Codex to "continue the work I started in Claude", or the other way round |
 | Model tokens spent on memory | **0**: summaries are built locally |
-| Finds work by meaning | Hybrid search ranks the right record first more often than keywords or claude-mem's default model ([benchmark](#semantic-search)) |
+| Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
 | Your data stays local | Nothing leaves your machine unless you configure a remote summary model |
 | Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
 | See what it saved | `quietmem stats` and the viewer |
@@ -50,171 +46,116 @@ service only if you configure a remote endpoint in `observer.json`. See
 
 ## Install
 
-QuietMem runs on Linux and macOS. Install Rust 1.99 or newer and add
-`~/.cargo/bin` to your `PATH`. [Rust installation](https://rustup.rs)
+Linux or macOS with [Rust](https://rustup.rs) 1.99 or newer:
 
 ```bash
 git clone https://github.com/cesarferreira/quietmem.git
 cd quietmem
 cargo install --path . --locked
-```
-
-Check that the binary is available.
-
-```bash
-quietmem --help
-```
-
-<a id="quickstart"></a>
-## Quickstart
-
-```bash
 quietmem install
 ```
 
-The installer configures Claude Code and Codex and adds QuietMem MCP to existing
-OpenCode 2, Pi, and Oh My Pi profiles. Use `quietmem install --host opencode`,
-`--host pi`, or `--host omp` to configure one of those agents explicitly. The
-installer preserves existing hook groups and other MCP servers. Restart the
-agent after installation. In Codex, review and trust the QuietMem hooks when
-prompted.
+`quietmem install` configures every supported agent it finds and keeps your
+existing hooks and MCP servers. Restart your agents afterwards. Codex asks you to
+trust the new hooks once.
 
-QuietMem automatically captures and recalls context in Claude Code and Codex. Open
-either one in the same worktree and ask it to **continue the work I started in
-Claude** or **resume the latest Codex task**. QuietMem can send the latest
-request, a recent test result or edit, and the last agent update, with references
-to the captured observations. It flags evidence captured at a different Git
-commit. Ordinary prompts get context only when they match prior evidence. A bare
-“keep going” in an active thread stays with that thread.
+| Agent | Automatic capture and recall | Memory search (MCP) | Configured by `quietmem install` |
+| --- | --- | --- | --- |
+| Claude Code | ✓ | ✓ | Always |
+| Codex | ✓ | ✓ | Always |
+| T3 Code (Codex and Claude Code providers) | ✓ | ✓ | When T3 Code is set up, or `--host t3code` |
+| OpenCode | | ✓ | When installed, or `--host opencode` |
+| Pi | | ✓ | When installed. `--host pi` adds a startup preview |
+| Oh My Pi | | ✓ | When installed, or `--host omp` (`OMP_PROFILE=work` for a profile) |
+| Any MCP client | | ✓ | Register the stdio command `quietmem mcp` |
 
-OpenCode, Pi, and Oh My Pi can search and save memories through the local MCP
-tools. To use an Oh My Pi named profile, run
-`OMP_PROFILE=work quietmem install --host omp`.
+T3 Code support configures the home of each enabled provider in
+`~/.t3/userdata/settings.json`, including custom `homePath`s. Set `T3CODE_HOME`
+for a custom T3 location.
 
-A fresh session shows a short preview if the worktree has recent history. Claude
-Code displays colored dates, sources, and activity labels. Codex shows a more
-compact text preview. The preview is for you. The agent receives memory when it
-is relevant to a prompt. Set `QUIETMEM_STARTUP_PREVIEW=0` to hide startup previews
-or `NO_COLOR=1` for plain text.
+## Use it
 
-`quietmem install --host pi` also adds a colored worktree preview above the
-editor. It displays existing QuietMem history and clears when the first turn
-starts.
+Work as usual. QuietMem stays quiet until it has something relevant:
 
-## Inspect memory
+- **Recall.** A prompt that matches earlier work gets that work's outcome: the request, files, test results, decision and next step. A prompt with no match gets nothing.
+- **Handoff.** In the same worktree, ask one agent to *continue the work I started in Claude* or *resume the latest Codex task*. Evidence from a different Git commit is flagged.
+- **Startup preview.** A new session shows recent activity for the worktree. `QUIETMEM_STARTUP_PREVIEW=0` hides it.
+- **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
 
-```sh
-quietmem preview
-quietmem status
-quietmem stats
-quietmem search "retry handshake" --workspace .
-quietmem export > quietmem.jsonl
-```
-
-`quietmem stats` and the viewer report how memory was used: records stored,
-sessions that received recalled evidence, tokens injected, agent lookups, and
-model tokens spent on summaries. They also show an estimate of tokens saved. When
-QuietMem captures a tool result it records the size of the full output. The estimate
-assumes each delivered record replaced re-reading that output, minus the tokens
-used to deliver it. Treat it as an upper bound. Tokens are estimated at 4 bytes
-each. Add `--json` for machine-readable output or `--workspace .` for one worktree.
-
-Open the private `viewer_url` from `quietmem status` for a local search and activity view. The worker starts on the first hook. `quietmem serve` starts it in the foreground, and `quietmem stop` stops it until the next hook. Set `QUIETMEM_NO_AUTOSTART=1` to keep the worker stopped while hooks continue recording. Use `QUIETMEM_DEBUG=1` for hook error output.
-
-The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering. File reads record the path only. Searches record the pattern and matching file names, and edits record paths and line counts, not file contents. Web lookups keep a short excerpt. MCP tool results are not captured.
-
-Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, `save_memory`, and `forget`. Pass `replaces` to `save_memory` to correct outdated records; they stop appearing in search and recall. `quietmem forget <id>…` deletes records and the summaries built from them. Automatic capture and recall require that harness's hooks or adapter.
-
-
-## Database location
-
-Set `database_path` in `~/.config/quietmem/config.toml` to store the SQLite file
-on a particular filesystem. QuietMem uses `$XDG_CONFIG_HOME/quietmem/config.toml`
-when `XDG_CONFIG_HOME` is set.
-
-```toml
-database_path = "/path/on/local-disk/quietmem/memory.sqlite3"
-```
-
-QuietMem creates the parent directory as needed. `--data-dir` and
-`QUIETMEM_DATA_DIR` take precedence and use `memory.sqlite3` inside that directory.
-Run `quietmem status` to see the effective database path and journal mode.
-
-Before changing the path, run `quietmem stop`. To carry past observations into the
-new path, create a SQLite backup at the destination. Existing hook registrations
-that pin the data directory can be refreshed with `quietmem install` before
-opening fresh agent sessions. Run `quietmem install --host pi` to refresh the
-Pi preview if you use it.
-
-QuietMem uses WAL on local disks and rollback journaling on detected NFS and
-SMB mounts. The worker switches a legacy database to the appropriate mode at
-startup. A local disk is the preferred location for active memory.
+Agents can also call the MCP tools `search`, `timeline`, `get_observations`,
+`save_memory` (with `replaces` to correct old records) and `forget`.
 
 ## Semantic search
 
-Keyword search finds records that share words with your query. Semantic search
-also finds records that say the same thing in different words, such as
-"reconnect attempts give up early" for a record about a retry counter.
+Keyword search needs shared words. Semantic search also finds *"reconnect
+attempts give up early"* in a record about a retry counter.
 
 ```sh
-quietmem embeddings enable
+quietmem embeddings enable     # one-time 436 MB download, verified by SHA-256
 quietmem embeddings status
 ```
 
-`enable` downloads Snowflake arctic-embed-m v1.5 (436 MB) from Hugging Face once, verifies every file
-against a pinned SHA-256 digest, and restarts the worker. The model runs locally on
-the CPU. No memory text leaves your machine. The worker embeds existing records in
-the background, and new records as they arrive. Until it finishes, and whenever the
-worker is stopped, search uses keywords only.
+The model runs locally on the CPU. Existing records are embedded in the
+background, and search uses keywords until that finishes. Search, MCP and the
+viewer combine both kinds of match. Automatic recall only uses a semantic match
+when its similarity clears a floor calibrated on unrelated queries.
 
-Search, the MCP `search` tool, and the viewer combine keyword and semantic matches.
-Automatic recall is stricter, because it adds context you did not ask for. A
-semantic match is recalled when its similarity clears a floor calibrated on
-unrelated queries, or a slightly lower floor when it also shares a keyword with
-your prompt. Unrelated prompts still get no context.
+The model unloads after 30 idle minutes and reloads in about 2 seconds on the
+next query. `quietmem embeddings disable` returns to keywords only.
 
-The model holds its weights as bfloat16 and uses about 280 MB of memory while loaded. Model inference runs on 2 threads at low CPU priority, so it stays out of the way of your editor and builds; set `RAYON_NUM_THREADS` to change the thread count. After 30 minutes without a
-search or prompt, the worker unloads it and drops to about 20 MB. The next query
-uses keywords immediately, and the model is back about 2 seconds later. Set
-`QUIETMEM_MODEL_IDLE_SECS` to change the idle time. New records are embedded
-while the model is loaded.
+| Model (`--model`) | Download | MRR, titles | MRR, facts |
+| --- | --- | --- | --- |
+| Keywords only | none | 0.753 | 0.452 |
+| `minilm` | 91 MB | 0.727 | 0.447 |
+| `bge-small` | 134 MB | 0.765 | 0.465 |
+| `bge-base` | 439 MB | 0.775 | 0.483 |
+| **`arctic-m` (default)** | 436 MB | **0.779** | **0.485** |
 
-Choose another model with `--model`. `quietmem embeddings disable` returns to
-keyword search and keeps downloaded models on disk.
+Scores come from `quietmem eval` on 2,577 real coding-session observations. Each
+query is an observation's title or first fact, removed from the stored text. MRR
+of 1.0 means the right record always ranks first. Hybrid search gains most when
+you describe a problem in different words than the record used.
 
-`--model` accepts the models below. The scores come from `quietmem eval` on 2,577
-real Claude Mem observations. Each query is an observation's title or first fact,
-with those fields removed from the stored text. MRR@10 is the mean reciprocal rank
-of the right record (1.0 means always first).
+## Inspect and manage
 
-| Model | Download | Hybrid MRR (titles) | Hybrid MRR (facts) | Query time |
-| --- | --- | --- | --- | --- |
-| Keywords only | none | 0.753 | 0.452 | 5 ms |
-| `minilm` | 91 MB | 0.727 | 0.447 | 27 ms |
-| `bge-small` | 134 MB | 0.765 | 0.465 | 53 ms |
-| `bge-base` | 439 MB | 0.775 | 0.483 | 104 ms |
-| `arctic-m` (default) | 436 MB | 0.783 | 0.484 | 104 ms |
+| Command | What it does |
+| --- | --- |
+| `quietmem stats` | Usage and an estimate of tokens saved (`--json`, `--workspace .`) |
+| `quietmem status` | Worker state, database path and the private viewer URL |
+| `quietmem search "query"` | Search memory (`--workspace .` for one worktree) |
+| `quietmem preview` | Recent activity for this worktree |
+| `quietmem forget <id>…` | Delete records and the summaries built from them |
+| `quietmem export` | All records as JSON lines |
+| `quietmem stop` / `serve` | Stop the background worker, or run it in the foreground |
 
-Query times in the table were measured with f32 weights on all cores. The worker
-holds bfloat16 weights on 2 threads, which scored the same (0.779 and 0.485 for
-`arctic-m`) and answers a semantic query in about 110 ms.
+The tokens-saved figure is an upper bound: it assumes each delivered record
+replaced re-reading its full original output.
 
-These queries share many words with their answers, so keywords already score well.
-Semantic search matters most when you describe a problem in different words than
-the record used.
+**What gets captured:** prompts, agent replies, shell commands with a trimmed
+result, edited paths with line counts, read paths, search patterns with matching
+file names, and short web excerpts. File contents, MCP tool results, and lines
+that look like credentials are not stored.
 
-## Move existing history
+## Configuration
 
-```sh
-quietmem import ~/.claude-mem/claude-mem.db
-quietmem import ~/.claude-mem/claude-mem.db --project my-project --workspace /path/to/worktree
-```
+| Setting | Effect |
+| --- | --- |
+| `QUIETMEM_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/quietmem` |
+| `database_path` in `~/.config/quietmem/config.toml` | Put the database on a specific disk. Run `quietmem stop` first |
+| `observer.json` in the data directory | Use an OpenAI-compatible model for summaries ([example](#model-summaries)) |
+| `QUIETMEM_MODEL_IDLE_SECS` | Seconds before an idle model unloads. Default 1800 |
+| `RAYON_NUM_THREADS` | Threads for semantic search. Default 2 |
+| `QUIETMEM_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
+| `QUIETMEM_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
+| `QUIETMEM_DEBUG=1` | Print hook errors |
 
-Import reads the source database and preserves original timestamps. Use a project and workspace mapping to make the imported observations eligible for automatic recall in that repository. Import into the desired mapping on the first run. A repeat import from the same source database skips records already present.
+QuietMem uses WAL journaling on local disks and switches to rollback journaling on
+NFS and SMB mounts.
 
-## Optional model summaries
-
-The worker builds a structured summary locally from each completed turn. It records the type of work, edited files, checks with their pass or fail result, error signatures, decisions, and the next step. No model is needed. To opt in to an OpenAI-compatible observer for future summaries, create `observer.json` in the data directory and restart the worker.
+<a id="model-summaries"></a>
+Summaries are built locally from each turn. To use a model instead, create
+`observer.json` and restart the worker. The endpoint receives a bounded excerpt
+of each turn, and the local summary is used if it fails.
 
 ```json
 {
@@ -223,12 +164,6 @@ The worker builds a structured summary locally from each completed turn. It reco
   "api_key_env": "QUIETMEM_OBSERVER_KEY"
 }
 ```
-
-The configured endpoint receives a bounded selection of captured evidence. Loopback HTTP also works for a local model. If the provider fails, the worker uses the local summary. `quietmem status` reports injected context bytes and provider-reported tokens for saved model summaries. Measuring overall token savings requires comparing real agent runs with and without QuietMem.
-
-## Parity
-
-This is the first working implementation. The [parity matrix](docs/superpowers/specs/2026-11-18-quietmem.md) records progress against Claude Mem. Semantic search, structured summaries, and corrections are now covered. The remaining upstream scope includes its wider harness integrations, observer providers and modes, My Work workflows, media and code-navigation tools, plus cloud sync and team sharing.
 
 ## License
 
