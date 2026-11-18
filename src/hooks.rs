@@ -29,6 +29,8 @@ struct Input {
     session_id: String,
     hook_event_name: String,
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     turn_id: Option<String>,
     #[serde(default)]
     prompt_id: Option<String>,
@@ -51,7 +53,21 @@ struct Input {
 pub fn handle(store: &Store, host: Host, input: impl Read) -> Result<Option<Value>> {
     let event: Input = serde_json::from_reader(input)?;
     if event.hook_event_name == "SessionStart" {
-        return Ok(None);
+        if !matches!(event.source.as_deref(), None | Some("startup" | "clear"))
+            || !crate::preview::startup_enabled()
+        {
+            return Ok(None);
+        }
+        let workspace = Workspace::read(&event.cwd);
+        let (limit, color) = match host {
+            Host::Claude => (
+                crate::preview::TERMINAL_LIMIT,
+                crate::preview::color_allowed(),
+            ),
+            Host::Codex => (3, false),
+        };
+        return Ok(crate::preview::render(store, &workspace, limit, color)?
+            .map(|message| json!({"systemMessage": message})));
     }
     let turn_id = event.turn_id.as_deref().or(event.prompt_id.as_deref());
     let source = host.name();

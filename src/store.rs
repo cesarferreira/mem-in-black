@@ -27,6 +27,15 @@ pub struct Record {
     pub turn_id: Option<String>,
 }
 
+pub struct RecentActivity {
+    pub id: i64,
+    pub source: String,
+    pub kind: String,
+    pub body: String,
+    pub date: String,
+    pub time: String,
+}
+
 pub struct Observation<'a> {
     pub source: &'a str,
     pub session: &'a str,
@@ -278,6 +287,28 @@ impl Store {
                  ORDER BY e.id DESC LIMIT ?2"
             ), params![workspace, limit.clamp(1, 100) as i64]),
         }
+    }
+
+    pub fn recent_activity(&self, workspace: &str, limit: u8) -> Result<Vec<RecentActivity>> {
+        let mut statement = self.0.prepare(
+            "SELECT id, source, kind, body,
+                    strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime'),
+                    strftime('%H:%M', created_at, 'unixepoch', 'localtime')
+             FROM events
+             WHERE workspace = ?1 AND created_at >= unixepoch() - 2592000
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![workspace, limit], |row| {
+            Ok(RecentActivity {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                kind: row.get(2)?,
+                body: row.get(3)?,
+                date: row.get(4)?,
+                time: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn recall(

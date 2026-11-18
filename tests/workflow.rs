@@ -38,13 +38,26 @@ impl Workspace {
         command
             .env("QUIETMEM_DATA_DIR", self.temp.path().join("data"))
             .env("QUIETMEM_NO_AUTOSTART", "1")
+            .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
+            .env_remove("QUIETMEM_STARTUP_PREVIEW")
             .current_dir(&self.repo);
         command
     }
 
     fn run(&self, arguments: &[&str], input: Option<Value>) -> String {
+        self.run_with_env(arguments, input, &[])
+    }
+
+    fn run_with_env(
+        &self,
+        arguments: &[&str],
+        input: Option<Value>,
+        env: &[(&str, &str)],
+    ) -> String {
         let mut command = self.command();
         let mut child = command
+            .envs(env.iter().copied())
             .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -799,4 +812,125 @@ fn first_hook_starts_the_worker_and_the_stop_command_shuts_it_down() {
     let stopped = wait(&|value| value["running"] == false);
     assert!(started, "the viewer never became ready");
     assert!(stopped, "the worker kept running");
+}
+
+#[test]
+fn new_claude_session_shows_colored_worktree_history_to_the_user() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let result = workspace.hook(
+        "claude",
+        "new-thread",
+        "SessionStart",
+        json!({"source":"startup"}),
+    );
+    let output: Value = serde_json::from_str(&result).unwrap();
+    let message = output["systemMessage"].as_str().unwrap();
+    assert!(message.contains("QuietMem"));
+    assert!(message.contains("Fix the websocket retry regression"));
+    assert!(message.contains("cargo test websocket_retry"));
+    assert!(message.contains("\x1b["));
+    assert!(output.get("hookSpecificOutput").is_none());
+    let status: Value = serde_json::from_str(&workspace.run(&["status"], None)).unwrap();
+    assert_eq!(status["context_injections"], 0);
+}
+
+#[test]
+fn new_codex_session_gets_a_short_plain_preview() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let result = workspace.hook(
+        "codex",
+        "new-thread",
+        "SessionStart",
+        json!({"source":"startup"}),
+    );
+    let output: Value = serde_json::from_str(&result).unwrap();
+    let message = output["systemMessage"].as_str().unwrap();
+    assert!(message.contains("websocket retry regression"));
+    assert!(!message.contains("\x1b"));
+    assert!(message.lines().count() <= 8);
+    assert!(output.get("hookSpecificOutput").is_none());
+}
+
+#[test]
+fn startup_preview_is_quiet_for_empty_worktrees_and_compaction() {
+    let workspace = Workspace::new();
+    assert!(
+        workspace
+            .hook(
+                "claude",
+                "empty",
+                "SessionStart",
+                json!({"source":"startup"})
+            )
+            .is_empty()
+    );
+    workspace.seed();
+    let other = workspace.temp.path().join("worktree-without-history");
+    git(
+        &workspace.repo,
+        &["worktree", "add", "-qb", "other", other.to_str().unwrap()],
+    );
+    assert!(workspace.run(&["hook", "claude"], Some(json!({"cwd":other,"hook_event_name":"SessionStart","session_id":"other","source":"startup"}))).is_empty());
+    assert!(
+        workspace
+            .hook(
+                "claude",
+                "same-thread",
+                "SessionStart",
+                json!({"source":"compact"})
+            )
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_preview_cannot_emit_escape_codes_from_stored_text() {
+    let workspace = Workspace::new();
+    workspace.hook(
+        "claude",
+        "control-test",
+        "UserPromptSubmit",
+        json!({"prompt":"Review terminal output"}),
+    );
+    workspace.hook(
+        "claude",
+        "control-test",
+        "Stop",
+        json!({"last_assistant_message":"Read the logs \u{001b}[31mwithout this control code"}),
+    );
+    let plain = workspace.run(&["preview", "--color", "never"], None);
+    assert!(plain.contains("Read the logs"));
+    assert!(!plain.contains('\x1b'));
+    let colored = workspace.run(&["preview", "--color", "always"], None);
+    assert!(colored.contains("\x1b["));
+    assert!(!colored.contains("\x1b[31m"));
+}
+
+#[test]
+fn startup_preview_respects_color_and_visibility_preferences() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let event = json!({
+        "hook_event_name":"SessionStart", "cwd":workspace.repo, "source":"startup", "session_id":"prefs"
+    });
+    let result = workspace.run_with_env(
+        &["hook", "claude"],
+        Some(event.clone()),
+        &[("NO_COLOR", "1")],
+    );
+    let output: Value = serde_json::from_str(&result).unwrap();
+    let message = output["systemMessage"].as_str().unwrap();
+    assert!(message.contains("websocket retry regression"));
+    assert!(!message.contains('\x1b'));
+    assert!(
+        workspace
+            .run_with_env(
+                &["hook", "claude"],
+                Some(event),
+                &[("QUIETMEM_STARTUP_PREVIEW", "0")]
+            )
+            .is_empty()
+    );
 }

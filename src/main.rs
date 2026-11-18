@@ -4,13 +4,17 @@ mod import;
 mod install;
 mod mcp;
 mod observer;
+mod preview;
 mod store;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hooks::Host;
-use std::{io, path::PathBuf};
+use std::{
+    io::{self, IsTerminal},
+    path::PathBuf,
+};
 use store::Store;
 use workspace::Workspace;
 
@@ -54,6 +58,13 @@ enum Command {
     },
     /// Export stored records as newline-delimited JSON.
     Export,
+    /// Show the recent activity for this worktree.
+    Preview {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = preview::Color::Auto)]
+        color: preview::Color,
+    },
     /// Search local memory or list recent observations.
     Search {
         query: Option<String>,
@@ -107,6 +118,19 @@ fn main() -> Result<()> {
             println!("Imported {count} records.");
         }
         Command::Export => Store::open(&data)?.export(io::stdout().lock())?,
+        Command::Preview { workspace, color } => {
+            let directory = workspace.map(Ok).unwrap_or_else(std::env::current_dir)?;
+            let workspace = Workspace::read(&directory);
+            let color = color.enabled(io::stdout().is_terminal());
+            if let Some(message) = preview::render(
+                &Store::open(&data)?,
+                &workspace,
+                preview::TERMINAL_LIMIT,
+                color,
+            )? {
+                println!("{message}");
+            }
+        }
         Command::Search {
             query,
             workspace,

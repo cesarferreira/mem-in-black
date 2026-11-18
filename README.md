@@ -51,9 +51,16 @@ Restart Claude Code and Codex. Review and trust the QuietMem hooks in Codex when
 
 Work normally in either agent. Open the other agent in the same worktree and ask it to **continue the work I started in Claude** or **resume the latest Codex task**. QuietMem can send the latest request, a recent test result or edit, and the last agent update, with references to the captured observations. It flags evidence captured at a different Git commit. Ordinary prompts get context only when they match prior evidence. A bare “keep going” in an active thread stays with that thread.
 
+A fresh session shows a short preview if the worktree has recent history. Claude
+Code displays colored dates, sources, and activity labels. Codex shows a more
+compact text preview. The preview is for you. The agent receives memory when it
+is relevant to a prompt. Set `QUIETMEM_STARTUP_PREVIEW=0` to hide startup previews
+or `NO_COLOR=1` for plain text.
+
 ## Inspect memory
 
 ```sh
+quietmem preview
 quietmem status
 quietmem search "retry handshake" --workspace .
 quietmem export > quietmem.jsonl
