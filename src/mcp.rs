@@ -197,7 +197,9 @@ pub fn search(
     if terms.as_ref().is_some_and(Vec::is_empty) {
         return Ok(vec![]);
     }
-    let fts = terms.map(|terms| fts_query(&terms, " AND "));
+    // Natural-language queries rarely share every word with the record, so
+    // match any word and let BM25 rank records that share more of them first.
+    let fts = terms.map(|terms| fts_query(&terms, " OR "));
     store.search(fts.as_deref(), workspace, limit)
 }
 

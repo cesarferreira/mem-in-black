@@ -1457,3 +1457,23 @@ fn importer_reads_current_claude_mem_schema_with_memory_session_id() {
         serde_json::from_str(&workspace.run(&["search", "emulator image"], None)).unwrap();
     assert_eq!(found[0]["workspace"], "claude-mem:openDHU");
 }
+
+#[test]
+fn search_answers_natural_language_questions_that_share_only_some_words() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let found: Value = serde_json::from_str(&workspace.run(
+        &[
+            "search",
+            "what happened with the websocket retry problem yesterday",
+        ],
+        None,
+    ))
+    .unwrap();
+    let rows = found.as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows[0]["body"].as_str().unwrap().contains("websocket"));
+    let none: Value =
+        serde_json::from_str(&workspace.run(&["search", "kubernetes ingress"], None)).unwrap();
+    assert_eq!(none, json!([]));
+}
