@@ -90,7 +90,7 @@ pub fn handle(
         return Ok(None);
     }
     let workspace = Workspace::read(&event.cwd);
-    let write = |kind, body: &str, key: Option<&str>| -> Result<()> {
+    let write = |kind, body: &str, key: Option<&str>, raw: usize| -> Result<()> {
         let body = clean(body, 1600);
         if !body.is_empty() {
             store.record(Observation {
@@ -101,6 +101,7 @@ pub fn handle(
                 kind,
                 body: &body,
                 workspace: &workspace,
+                source_bytes: Some(raw.max(body.len())),
             })?;
         }
         Ok(())
@@ -122,7 +123,8 @@ pub fn handle(
             let context = recall(store, &workspace, source, session, &prompt, semantic)
                 .context("selecting context")?;
             let key = turn_id.map(|turn| format!("prompt:{turn}"));
-            write("prompt", &prompt, key.as_deref()).context("storing prompt")?;
+            write("prompt", &prompt, key.as_deref(), event.prompt.len())
+                .context("storing prompt")?;
             Ok(context.map(|additional_context| {
                 json!({
                     "hookSpecificOutput": {
@@ -135,7 +137,7 @@ pub fn handle(
         "Stop" if !store.is_private(source, session, turn_id)? => {
             if let Some(message) = &event.last_assistant_message {
                 let key = turn_id.map(|turn| format!("stop:{turn}"));
-                write("assistant", message, key.as_deref())?;
+                write("assistant", message, key.as_deref(), message.len())?;
             }
             Ok(matches!(host, Host::Codex).then(|| json!({})))
         }
@@ -145,7 +147,12 @@ pub fn handle(
         {
             if let Some(body) = tool_record(&event) {
                 let key = event.tool_use_id.as_ref().map(|id| format!("tool:{id}"));
-                write("tool", &body, key.as_deref())?;
+                let raw = match &event.tool_response {
+                    Value::String(text) => text.len(),
+                    Value::Null => event.error.as_deref().map_or(0, str::len),
+                    value => value.to_string().len(),
+                };
+                write("tool", &body, key.as_deref(), raw)?;
             }
             Ok(None)
         }
@@ -561,8 +568,7 @@ fn recall(
     let shown: Vec<_> = evidence.iter().collect();
     let context = render(workspace, &shown);
     if let Some(text) = &context {
-        let delivered: Vec<_> = shown.iter().copied().chain(matched).collect();
-        store.record_delivery(source, session, &delivered, text.len())?;
+        store.record_delivery(source, session, &shown, &matched, text.len())?;
     }
     Ok(context)
 }
@@ -605,7 +611,7 @@ fn record_context(
 ) -> Result<Option<String>> {
     let context = render(workspace, records);
     if let Some(text) = &context {
-        store.record_delivery(source, session, records, text.len())?;
+        store.record_delivery(source, session, records, &[], text.len())?;
     }
     Ok(context)
 }

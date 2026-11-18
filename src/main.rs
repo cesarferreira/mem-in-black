@@ -9,6 +9,7 @@ mod install;
 mod mcp;
 mod observer;
 mod preview;
+mod stats;
 mod store;
 mod workspace;
 
@@ -78,6 +79,13 @@ enum Command {
         /// Comma-separated embedding models to compare, downloaded on first use.
         #[arg(long, value_delimiter = ',')]
         models: Vec<String>,
+    },
+    /// Show how QuietMem has been used and an estimate of the tokens it saved.
+    Stats {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Manage local semantic search.
     Embeddings {
@@ -208,6 +216,17 @@ fn main() -> Result<()> {
                     eval::calibrate(&queries, &embedder, &index)?;
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Stats { workspace, json } => {
+            let root = workspace.map(|path| Workspace::read(&path).root);
+            let stats = Store::open(&data)?.stats(root.as_deref())?;
+            if json {
+                let mut value = serde_json::to_value(&stats)?;
+                value["estimated_tokens_saved"] = stats.estimated_tokens_saved().into();
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", stats::text(&stats));
+            }
         }
         Command::Embeddings { action } => match action {
             EmbeddingsAction::Enable { model } => {

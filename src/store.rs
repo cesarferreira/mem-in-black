@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 6;
+const SCHEMA: i64 = 7;
 
 /// (record id, workspace, project, little-endian f32 vector)
 pub type VectorRow = (i64, String, String, Vec<u8>);
@@ -34,6 +34,34 @@ pub struct Record {
     pub turn_id: Option<String>,
 }
 
+/// Usage figures. Byte counts are measured; token figures divide by four.
+#[derive(Debug, Serialize)]
+pub struct Stats {
+    pub workspace: Option<String>,
+    pub records: i64,
+    pub sessions: i64,
+    pub workspaces: i64,
+    pub sessions_helped: i64,
+    pub evidence_delivered: i64,
+    pub evidence_source_bytes: i64,
+    pub context_injections: i64,
+    pub context_bytes: i64,
+    pub mcp_searches: i64,
+    pub mcp_records: i64,
+    pub mcp_bytes: i64,
+    pub mcp_source_bytes: i64,
+    pub observer_tokens: i64,
+}
+
+impl Stats {
+    /// Upper-bound estimate: raw evidence delivered minus what was injected to deliver it.
+    pub fn estimated_tokens_saved(&self) -> i64 {
+        ((self.evidence_source_bytes + self.mcp_source_bytes - self.context_bytes - self.mcp_bytes)
+            / 4)
+        .max(0)
+    }
+}
+
 pub struct RecentActivity {
     pub id: i64,
     pub source: String,
@@ -51,6 +79,8 @@ pub struct Observation<'a> {
     pub kind: &'a str,
     pub body: &'a str,
     pub workspace: &'a Workspace,
+    /// Size of the raw material this record condenses, when larger than `body`.
+    pub source_bytes: Option<usize>,
 }
 
 pub struct Store {
@@ -226,17 +256,26 @@ impl Store {
                      INSERT INTO event_search(event_search) VALUES ('rebuild');",
                 )?;
             }
+            if version < 6 {
+                migration.execute_batch(
+                    "CREATE TABLE vectors (
+                       event_id INTEGER PRIMARY KEY, model TEXT NOT NULL, vector BLOB NOT NULL
+                     );
+                     CREATE TRIGGER event_vector_delete AFTER DELETE ON events BEGIN
+                       DELETE FROM vectors WHERE event_id = old.id;
+                     END;
+                     CREATE TRIGGER event_vector_update AFTER UPDATE OF body ON events BEGIN
+                       DELETE FROM vectors WHERE event_id = old.id;
+                     END;",
+                )?;
+            }
+            // `source_bytes` is the raw size of what a record condenses, such as
+            // full tool output. `shown` separates evidence put in front of an
+            // agent from records only marked so they are not matched again.
             migration.execute_batch(
-                "CREATE TABLE vectors (
-                   event_id INTEGER PRIMARY KEY, model TEXT NOT NULL, vector BLOB NOT NULL
-                 );
-                 CREATE TRIGGER event_vector_delete AFTER DELETE ON events BEGIN
-                   DELETE FROM vectors WHERE event_id = old.id;
-                 END;
-                 CREATE TRIGGER event_vector_update AFTER UPDATE OF body ON events BEGIN
-                   DELETE FROM vectors WHERE event_id = old.id;
-                 END;
-                 PRAGMA user_version=6;",
+                "ALTER TABLE events ADD COLUMN source_bytes INTEGER;
+                 ALTER TABLE deliveries ADD COLUMN shown INTEGER NOT NULL DEFAULT 1;
+                 PRAGMA user_version=7;",
             )?;
             migration.commit()?;
         }
@@ -309,11 +348,12 @@ impl Store {
 
     fn insert(&self, event: Observation<'_>, created_at: Option<i64>) -> Result<bool> {
         let changes = self.db.execute(
-            "INSERT INTO events(source, session, event_key, kind, body, workspace, project, head, created_at, turn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, coalesce(?9, unixepoch()), ?10)
+            "INSERT INTO events(source, session, event_key, kind, body, workspace, project, head, created_at, turn_id, source_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, coalesce(?9, unixepoch()), ?10, ?11)
              ON CONFLICT(source, session, event_key) DO NOTHING",
             params![event.source, event.session, event.key, event.kind, event.body,
-                event.workspace.root, event.workspace.project, event.workspace.head, created_at, event.turn_id],
+                event.workspace.root, event.workspace.project, event.workspace.head, created_at, event.turn_id,
+                event.source_bytes.map(|bytes| bytes as i64)],
         )?;
         Ok(changes > 0)
     }
@@ -711,25 +751,108 @@ impl Store {
         )?)
     }
 
+    /// Mark `shown` evidence as delivered to a session, plus `matched` records
+    /// that led to it, so neither is offered to that session again.
     pub fn record_delivery(
         &self,
         source: &str,
         session: &str,
-        records: &[&Record],
+        shown: &[&Record],
+        matched: &[&Record],
         bytes: usize,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
-        for record in records {
-            transaction.execute(
-                "INSERT OR IGNORE INTO deliveries VALUES (?1, ?2, ?3)",
-                params![source, session, record.id],
-            )?;
+        for (records, flag) in [(shown, 1), (matched, 0)] {
+            for record in records {
+                transaction.execute(
+                    "INSERT INTO deliveries(source, session, event_id, shown) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(source, session, event_id) DO UPDATE SET shown = max(shown, excluded.shown)",
+                    params![source, session, record.id, flag],
+                )?;
+            }
         }
         self.add_metric("context_injections", 1)?;
         self.add_metric("context_bytes", bytes as i64)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn bump(&self, metrics: &[(&str, i64)]) -> Result<()> {
+        let _guard = self.write_guard()?;
+        for (key, amount) in metrics {
+            self.add_metric(key, *amount)?;
+        }
+        Ok(())
+    }
+
+    /// Total raw size behind records, falling back to the stored text.
+    pub fn source_size(&self, ids: &[i64]) -> Result<i64> {
+        let _guard = self.read_guard()?;
+        let mut total = 0;
+        for id in ids {
+            total += self
+                .db
+                .query_row(
+                    "SELECT coalesce(source_bytes, length(body)) FROM events WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+        }
+        Ok(total)
+    }
+
+    pub fn stats(&self, workspace: Option<&str>) -> Result<Stats> {
+        let _guard = self.read_guard()?;
+        let scalar = |sql: &str| -> Result<i64> {
+            Ok(self
+                .db
+                .query_row(sql, params![workspace], |row| row.get(0))?)
+        };
+        let metric = |key: &str| -> Result<i64> {
+            Ok(self
+                .db
+                .query_row(
+                    "SELECT value FROM memory_meta WHERE key = ?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0))
+        };
+        Ok(Stats {
+            workspace: workspace.map(str::to_owned),
+            records: scalar("SELECT count(*) FROM events WHERE ?1 IS NULL OR workspace = ?1")?,
+            sessions: scalar(
+                "SELECT count(*) FROM (SELECT DISTINCT source, session FROM events
+                 WHERE (?1 IS NULL OR workspace = ?1) AND source != 'claude-mem')",
+            )?,
+            workspaces: scalar(
+                "SELECT count(DISTINCT workspace) FROM events WHERE ?1 IS NULL OR workspace = ?1",
+            )?,
+            sessions_helped: scalar(
+                "SELECT count(*) FROM (SELECT DISTINCT d.source, d.session FROM deliveries d
+                 JOIN events e ON e.id = d.event_id WHERE d.shown AND (?1 IS NULL OR e.workspace = ?1))",
+            )?,
+            evidence_delivered: scalar(
+                "SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
+                 WHERE d.shown AND e.kind != 'prompt' AND (?1 IS NULL OR e.workspace = ?1)",
+            )?,
+            evidence_source_bytes: scalar(
+                "SELECT coalesce(sum(coalesce(e.source_bytes, length(e.body))), 0)
+                 FROM deliveries d JOIN events e ON e.id = d.event_id
+                 WHERE d.shown AND e.kind != 'prompt' AND (?1 IS NULL OR e.workspace = ?1)",
+            )?,
+            context_injections: metric("context_injections")?,
+            context_bytes: metric("context_bytes")?,
+            mcp_searches: metric("mcp_searches")?,
+            mcp_records: metric("mcp_records")?,
+            mcp_bytes: metric("mcp_bytes")?,
+            mcp_source_bytes: metric("mcp_source_bytes")?,
+            observer_tokens: metric("observer_tokens")?,
+        })
     }
 
     fn add_metric(&self, key: &str, amount: i64) -> Result<()> {
@@ -922,6 +1045,7 @@ mod tests {
             kind: "note",
             body: "Preserve the existing observation",
             workspace: &workspace,
+            source_bytes: None,
         })?;
 
         store.rollback = true;

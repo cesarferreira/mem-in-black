@@ -87,9 +87,18 @@ starts.
 ```sh
 quietmem preview
 quietmem status
+quietmem stats
 quietmem search "retry handshake" --workspace .
 quietmem export > quietmem.jsonl
 ```
+
+`quietmem stats` and the viewer report how memory was used: records stored,
+sessions that received recalled evidence, tokens injected, agent lookups, and
+model tokens spent on summaries. They also show an estimate of tokens saved. When
+QuietMem captures a tool result it records the size of the full output. The estimate
+assumes each delivered record replaced re-reading that output, minus the tokens
+used to deliver it. Treat it as an upper bound. Tokens are estimated at 4 bytes
+each. Add `--json` for machine-readable output or `--workspace .` for one worktree.
 
 Open the private `viewer_url` from `quietmem status` for a local search and activity view. The worker starts on the first hook. `quietmem serve` starts it in the foreground, and `quietmem stop` stops it until the next hook. Set `QUIETMEM_NO_AUTOSTART=1` to keep the worker stopped while hooks continue recording. Use `QUIETMEM_DEBUG=1` for hook error output.
 

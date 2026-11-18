@@ -438,6 +438,11 @@ fn worker_viewer_serves_history_only_at_its_private_url() {
     let (body, status) = response.unwrap();
     assert_eq!(status, 404);
     assert!(body.contains("websocket retry regression"));
+    assert!(
+        body.contains("Saved (est.)"),
+        "the viewer shows usage stats"
+    );
+    assert!(body.contains("Model cost"));
 }
 
 #[test]
@@ -1469,11 +1474,16 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
     let stemmed: Value =
         serde_json::from_str(&workspace.run(&["search", "retries"], None)).unwrap();
     assert_eq!(stemmed[0]["id"], 2, "porter stemming matches `Retrying`");
+    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    assert_eq!(
+        stats["evidence_delivered"], 1,
+        "old deliveries count as shown"
+    );
     let version: i64 = rusqlite::Connection::open(&database)
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -1601,4 +1611,40 @@ fn semantic_search_end_to_end_with_a_real_model() {
         "{recalled}"
     );
     assert!(unrelated.is_empty(), "{unrelated}");
+}
+
+#[test]
+fn stats_measure_recall_and_lookups_and_label_savings_as_an_estimate() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let large_output = format!("FAILED: expected three retries\n{}", "x".repeat(40_000));
+    workspace.hook("claude", "claude-thread", "PostToolUse", json!({"tool_name":"Bash","tool_use_id":"tool-2","tool_input":{"command":"cargo test websocket_retry -- --nocapture"},"tool_response":large_output}));
+    workspace.hook(
+        "codex",
+        "later",
+        "UserPromptSubmit",
+        json!({"prompt":"Revisit the websocket retry regression"}),
+    );
+    let fetched: Value =
+        serde_json::from_str(&workspace.run(&["search", "nocapture"], None)).unwrap();
+    mcp_calls(
+        &workspace,
+        &[json!({"name":"get_observations","arguments":{"ids":[fetched[0]["id"]]}})],
+    );
+    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    assert_eq!(stats["context_injections"], 1, "{stats:#}");
+    assert_eq!(stats["sessions_helped"], 1);
+    assert_eq!(stats["mcp_records"], 1);
+    assert!(
+        stats["mcp_source_bytes"].as_i64().unwrap() > 40_000,
+        "raw output size is kept"
+    );
+    assert!(
+        stats["estimated_tokens_saved"].as_i64().unwrap() > 9_000,
+        "{stats:#}"
+    );
+    assert_eq!(stats["observer_tokens"], 0);
+    let text = workspace.run(&["stats"], None);
+    assert!(text.contains("Saved (est.)"), "{text}");
+    assert!(text.contains("real savings are lower"), "{text}");
 }

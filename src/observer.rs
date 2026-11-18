@@ -95,6 +95,9 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
         Some((summary, tokens)) => (facts.render("Model summary", &summary, &references), tokens),
         None => (facts.render("Outcome", &anchor.body, &references), 0),
     };
+    let source_bytes = store
+        .source_size(&sources.iter().map(|record| record.id).collect::<Vec<_>>())?
+        .max(0);
     let workspace = Workspace {
         root: anchor.workspace.clone(),
         project: store.project_of(anchor.id)?,
@@ -110,6 +113,7 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
             kind: "summary",
             body: &body,
             workspace: &workspace,
+            source_bytes: Some(source_bytes as usize),
         },
         tokens,
     )?;

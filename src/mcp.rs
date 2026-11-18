@@ -103,6 +103,7 @@ impl MemoryServer {
                 input.limit.unwrap_or(10),
                 Some(&semantic),
             )?;
+            store.bump(&[("mcp_searches", 1)])?;
             Ok(rows.into_iter().map(IndexEntry::from).collect::<Vec<_>>())
         })
     }
@@ -114,7 +115,17 @@ impl MemoryServer {
         &self,
         Parameters(input): Parameters<Details>,
     ) -> std::result::Result<CallToolResult, ErrorData> {
-        self.run(|store| store.details(&input.ids))
+        self.run(|store| {
+            let records = store.details(&input.ids)?;
+            let ids: Vec<_> = records.iter().map(|record| record.id).collect();
+            let shown: usize = records.iter().map(|record| record.body.len()).sum();
+            store.bump(&[
+                ("mcp_records", records.len() as i64),
+                ("mcp_bytes", shown as i64),
+                ("mcp_source_bytes", store.source_size(&ids)?),
+            ])?;
+            Ok(records)
+        })
     }
 
     #[tool(description = "Show the earlier events from the session that produced an observation.")]
@@ -155,6 +166,7 @@ impl MemoryServer {
                     kind: "note",
                     body: &body,
                     workspace: &workspace,
+                    source_bytes: None,
                 },
                 input.replaces.as_deref().unwrap_or_default(),
             )?;

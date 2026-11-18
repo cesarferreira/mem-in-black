@@ -154,6 +154,7 @@ pub fn claude_mem(
                     kind,
                     body: &body,
                     workspace: &workspace,
+                    source_bytes: None,
                 },
                 Some(created_at),
             )? {

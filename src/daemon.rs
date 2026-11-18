@@ -393,8 +393,10 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QuietMem</title>
 <style>
 :root{{color-scheme:dark;--bg:#15171a;--panel:#1c2024;--line:#343b42;--ink:#f0f1f2;--muted:#afb9c3;--accent:#a4dac2}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}}main{{max-width:940px;margin:0 auto;padding:48px 22px}}h1{{margin:0 0 24px;letter-spacing:-.035em;font-size:36px}}form{{display:flex;gap:10px;margin-bottom:30px}}input,button{{border:1px solid var(--line);border-radius:8px;font:inherit;padding:12px;background:var(--panel);color:var(--ink)}}input{{flex:1;min-width:0}}button{{color:var(--accent);cursor:pointer}}details{{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;padding:16px}}summary{{cursor:pointer;overflow-wrap:anywhere}}small{{display:block;color:var(--muted);margin:8px 0 0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,monospace;margin:16px 0 0}}p{{color:var(--muted)}}:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}
-</style><main><h1>QuietMem</h1><form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>"#,
-        escape(query)
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:0 0 28px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}.note{{font-size:13px;margin:-16px 0 28px}}
+</style><main><h1>QuietMem</h1>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>"#,
+        escape(query),
+        stats = stat_cards(store)?,
     );
     if rows.is_empty() {
         let message = if query.trim().is_empty() {
@@ -413,6 +415,24 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         ));
     }
     html.push_str("</main></html>");
+    Ok(html)
+}
+
+fn stat_cards(store: &Store) -> Result<String> {
+    let stats = store.stats(None)?;
+    let mut html = String::from(r#"<section class="stats" aria-label="Usage">"#);
+    for line in crate::stats::lines(&stats) {
+        html.push_str(&format!(
+            "<div class=\"stat\"><span>{}</span><b>{} <small>{}</small></b><em>{}</em></div>",
+            escape(line.label),
+            escape(&line.value),
+            escape(line.unit),
+            escape(&line.detail)
+        ));
+    }
+    html.push_str(
+        "</section><p class=\"note\">Tokens are estimated at 4 bytes each. Savings are an upper bound.</p>",
+    );
     Ok(html)
 }
 
