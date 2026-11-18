@@ -54,12 +54,13 @@ pub fn claude_mem(
             continue;
         }
         tables_found += 1;
-        for required in ["id", "sdk_session_id", "project", "created_at_epoch"] {
+        for required in ["id", "project", "created_at_epoch"] {
             ensure!(
                 columns.iter().any(|name| name == required),
                 "missing {table}.{required}"
             );
         }
+        session_column(&columns).with_context(|| format!("missing {table}.memory_session_id"))?;
     }
     ensure!(tables_found > 0, "no supported Claude Mem tables found");
     if mapped.is_some() && project.is_none() {
@@ -100,8 +101,9 @@ pub fn claude_mem(
         if selected.is_empty() {
             continue;
         }
+        let session = session_column(&columns).context("missing session column")?;
         let mut statement = upstream.prepare(&format!(
-            "SELECT id, sdk_session_id, project, created_at_epoch, {} FROM {table}
+            "SELECT id, {session}, project, created_at_epoch, {} FROM {table}
              WHERE ?1 IS NULL OR project = ?1 ORDER BY id",
             selected.join(", ")
         ))?;
@@ -160,4 +162,11 @@ pub fn claude_mem(
         }
     }
     Ok(imported)
+}
+
+/// Claude Mem renamed `sdk_session_id` to `memory_session_id`; accept both.
+fn session_column(columns: &[String]) -> Option<&'static str> {
+    ["memory_session_id", "sdk_session_id"]
+        .into_iter()
+        .find(|name| columns.iter().any(|column| column == name))
 }

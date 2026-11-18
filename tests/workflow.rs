@@ -1439,3 +1439,21 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap();
     assert_eq!(version, 4);
 }
+
+#[test]
+fn importer_reads_current_claude_mem_schema_with_memory_session_id() {
+    let workspace = Workspace::new();
+    let upstream = workspace.temp.path().join("claude-mem.db");
+    let upstream_db = rusqlite::Connection::open(&upstream).unwrap();
+    upstream_db.execute_batch("CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT NOT NULL, project TEXT NOT NULL,
+        title TEXT, narrative TEXT, type TEXT NOT NULL, created_at_epoch INTEGER NOT NULL);
+        INSERT INTO observations VALUES (4, 'mem-1', 'openDHU', 'Pinned emulator image', 'The suite pins the API 35 image', 'decision', 1795000000000);
+        CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL,
+        request TEXT, completed TEXT, created_at_epoch INTEGER NOT NULL);
+        INSERT INTO session_summaries VALUES (2, 'mem-1', 'openDHU', 'Speed up the e2e suite', 'Reused one backend per suite', 1795000001000);").unwrap();
+    let output = workspace.run(&["import", upstream.to_str().unwrap()], None);
+    assert_eq!(output.trim(), "Imported 2 records.");
+    let found: Value =
+        serde_json::from_str(&workspace.run(&["search", "emulator image"], None)).unwrap();
+    assert_eq!(found[0]["workspace"], "claude-mem:openDHU");
+}
