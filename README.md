@@ -53,9 +53,24 @@ quietmem --help
 quietmem install
 ```
 
-Restart Claude Code and Codex. Review and trust the QuietMem hooks in Codex when prompted. Use `quietmem install --host claude` or `--host codex` to configure one harness. The installer preserves existing hook groups and other MCP servers.
+The installer configures Claude Code and Codex and adds QuietMem MCP to existing
+OpenCode 2, Pi, and Oh My Pi profiles. Use `quietmem install --host opencode`,
+`--host pi`, or `--host omp` to configure one of those agents explicitly. The
+installer preserves existing hook groups and other MCP servers. Restart the
+agent after installation. In Codex, review and trust the QuietMem hooks when
+prompted.
 
-Work normally in either agent. Open the other agent in the same worktree and ask it to **continue the work I started in Claude** or **resume the latest Codex task**. QuietMem can send the latest request, a recent test result or edit, and the last agent update, with references to the captured observations. It flags evidence captured at a different Git commit. Ordinary prompts get context only when they match prior evidence. A bare “keep going” in an active thread stays with that thread.
+QuietMem automatically captures and recalls context in Claude Code and Codex. Open
+either one in the same worktree and ask it to **continue the work I started in
+Claude** or **resume the latest Codex task**. QuietMem can send the latest
+request, a recent test result or edit, and the last agent update, with references
+to the captured observations. It flags evidence captured at a different Git
+commit. Ordinary prompts get context only when they match prior evidence. A bare
+“keep going” in an active thread stays with that thread.
+
+OpenCode, Pi, and Oh My Pi can search and save memories through the local MCP
+tools. To use an Oh My Pi named profile, run
+`OMP_PROFILE=work quietmem install --host omp`.
 
 A fresh session shows a short preview if the worktree has recent history. Claude
 Code displays colored dates, sources, and activity labels. Codex shows a more
@@ -63,9 +78,9 @@ compact text preview. The preview is for you. The agent receives memory when it
 is relevant to a prompt. Set `QUIETMEM_STARTUP_PREVIEW=0` to hide startup previews
 or `NO_COLOR=1` for plain text.
 
-Install the Pi startup extension with `quietmem install --host pi`. It shows the
-colored worktree preview above the editor and clears it when the first turn
-starts. This extension displays existing QuietMem history.
+`quietmem install --host pi` also adds a colored worktree preview above the
+editor. It displays existing QuietMem history and clears when the first turn
+starts.
 
 ## Inspect memory
 

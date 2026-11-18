@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register Claude Code and Codex hooks or install the Pi startup preview.
+    /// Register agent hooks and local MCP servers.
     Install {
         #[arg(long)]
         home: Option<PathBuf>,

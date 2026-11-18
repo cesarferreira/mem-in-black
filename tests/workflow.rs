@@ -1036,3 +1036,147 @@ fn default_installer_lets_hooks_use_database_settings() {
         serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
     assert_eq!(mcp["mcpServers"]["quietmem"]["args"], json!(["mcp"]));
 }
+
+#[test]
+fn default_install_adds_quietmem_to_existing_opencode_pi_and_omp_profiles() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("mcp-profiles");
+    let open = home.join(".config/opencode/opencode.json");
+    let pi = home.join(".pi/agent/mcp.json");
+    let omp = home.join(".omp/agent/mcp.json");
+    let another_server = json!({"command":"example-server","args":["--stdio"]});
+    for file in [&open, &pi, &omp] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    }
+    std::fs::write(
+        &open,
+        r#"{"mcp":{"codegraph":{"type":"local","command":["codegraph"]},"quietmem":{"type":"local","command":["old"],"enabled":false}}}"#,
+    )
+    .unwrap();
+    for file in [&pi, &omp] {
+        std::fs::write(
+            file,
+            json!({"mcpServers":{
+                "existing": another_server,
+                "quietmem": {"type":"stdio","command":"old","enabled":false}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    let install = ["install", "--home", home.to_str().unwrap()];
+    workspace.run(&install, None);
+    let read_json =
+        |file: &Path| serde_json::from_slice::<Value>(&std::fs::read(file).unwrap()).unwrap();
+    let open_config = read_json(&open);
+    let servers = &open_config["mcp"];
+    assert_eq!(servers["codegraph"]["command"], json!(["codegraph"]));
+    assert_eq!(servers["quietmem"]["type"], "local");
+    assert_eq!(servers["quietmem"]["enabled"], false);
+    assert_eq!(
+        servers["quietmem"]["command"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "mcp"
+    );
+    for file in [&pi, &omp] {
+        let config = read_json(file);
+        assert_eq!(config["mcpServers"]["existing"], another_server);
+        assert_eq!(config["mcpServers"]["quietmem"]["type"], "stdio");
+        assert_eq!(config["mcpServers"]["quietmem"]["enabled"], false);
+        assert_eq!(
+            config["mcpServers"]["quietmem"]["args"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap(),
+            "mcp"
+        );
+    }
+    let before = [&open, &pi, &omp].map(|f| std::fs::read(f).unwrap());
+    workspace.run(&install, None);
+    assert_eq!(
+        [&open, &pi, &omp].map(|f| std::fs::read(f).unwrap()),
+        before
+    );
+}
+
+#[test]
+fn opencode_v2_install_keeps_jsonc_comments_and_registers_nested_stdio() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("opencode-profile");
+    let path = home.join(".config/opencode/opencode.jsonc");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{\n  // user notes\n  \"mcp\": { \"servers\": { \"other\": {\"type\":\"local\",\"command\":[\"other\"]} } }\n}\n").unwrap();
+    workspace.run(
+        &[
+            "install",
+            "--host",
+            "opencode",
+            "--home",
+            home.to_str().unwrap(),
+        ],
+        None,
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("// user notes"));
+    let parsed: Value = serde_json::from_str(&text.replace("// user notes", "")).unwrap();
+    assert_eq!(
+        parsed["mcp"]["servers"]["other"]["command"],
+        json!(["other"])
+    );
+    assert_eq!(parsed["mcp"]["servers"]["quietmem"]["type"], "local");
+    assert!(!home.join(".codex").exists());
+}
+
+#[test]
+fn omp_install_targets_the_active_named_profile() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path();
+    let override_path = home.join("default-agent");
+    workspace.run_with_env(
+        &["install", "--host", "omp"],
+        None,
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("PI_CONFIG_DIR", ".custom-omp"),
+            ("PI_CODING_AGENT_DIR", override_path.to_str().unwrap()),
+            ("OMP_PROFILE", " work "),
+            ("PI_PROFILE", "legacy"),
+        ],
+    );
+    let config = home.join(".custom-omp/profiles/work/agent/mcp.json");
+    let config: Value = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["quietmem"]["args"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "mcp"
+    );
+    assert!(!override_path.exists());
+}
+
+#[test]
+fn pi_install_expands_a_home_relative_profile() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path();
+    workspace.run_with_env(
+        &["install", "--host", "pi"],
+        None,
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", "~/pi-profile"),
+        ],
+    );
+    assert!(home.join("pi-profile/mcp.json").is_file());
+    assert!(
+        home.join("pi-profile/extensions/quietmem-startup.js")
+            .is_file()
+    );
+    assert!(!workspace.repo.join("~").exists());
+}
