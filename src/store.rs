@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 4;
+const SCHEMA: i64 = 5;
 
 const RECORD_COLUMNS: &str =
     "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id";
@@ -198,7 +198,8 @@ impl Store {
                      );",
                 )?;
             }
-            migration.execute_batch(
+            if version < 4 {
+                migration.execute_batch(
                 "ALTER TABLE events ADD COLUMN superseded_by INTEGER;
                  CREATE TRIGGER event_delete AFTER DELETE ON events BEGIN
                    INSERT INTO event_search(event_search, rowid, body) VALUES ('delete', old.id, old.body);
@@ -206,8 +207,18 @@ impl Store {
                  CREATE TRIGGER event_update AFTER UPDATE OF body ON events BEGIN
                    INSERT INTO event_search(event_search, rowid, body) VALUES ('delete', old.id, old.body);
                    INSERT INTO event_search(rowid, body) VALUES (new.id, new.body);
-                 END;
-                 PRAGMA user_version=4;",
+                 END;",
+                )?;
+            }
+            // Porter stemming lets `retries` match `retry`. The triggers keep
+            // working because they address the table by name.
+            migration.execute_batch(
+                "DROP TABLE event_search;
+                 CREATE VIRTUAL TABLE event_search USING fts5(
+                   body, content='events', content_rowid='id', tokenize='porter unicode61'
+                 );
+                 INSERT INTO event_search(event_search) VALUES ('rebuild');
+                 PRAGMA user_version=5;",
             )?;
             migration.commit()?;
         }

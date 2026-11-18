@@ -1408,7 +1408,12 @@ fn a_correction_hides_the_outdated_record_and_forget_removes_derived_summaries()
     let id = assistant["id"].as_i64().unwrap().to_string();
     let forgot = workspace.run(&["forget", &id], None);
     assert_eq!(forgot.trim(), "Forgot 2 records.");
-    assert!(search("resets too soon").is_empty());
+    assert!(
+        search("resets too soon")
+            .iter()
+            .all(|row| !row["body"].as_str().unwrap().contains("resets too soon")),
+        "the record and the summary built from it are gone"
+    );
     let note = search("successful handshake ack");
     assert_eq!(note.len(), 1, "the correction survives");
 }
@@ -1432,12 +1437,21 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
     workspace.run(&["forget", &id], None);
     let after: Value =
         serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
-    assert_eq!(after, json!([]));
+    assert!(
+        after
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != hits[0]["id"])
+    );
+    let stemmed: Value =
+        serde_json::from_str(&workspace.run(&["search", "retrying"], None)).unwrap();
+    assert!(!stemmed.as_array().unwrap().is_empty(), "porter stemming");
     let version: i64 = rusqlite::Connection::open(&database)
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
