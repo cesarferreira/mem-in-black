@@ -110,11 +110,33 @@ pub fn observe_once(data: &Storage) -> Result<()> {
     Ok(())
 }
 
+/// The worker is a background helper: keep its model inference to a couple
+/// of cores and below interactive work. `RAYON_NUM_THREADS` or
+/// `CANDLE_NUM_THREADS` override the thread count.
+fn run_in_background() {
+    const THREADS: &str = "2";
+    if std::env::var_os("RAYON_NUM_THREADS").is_none()
+        && std::env::var_os("CANDLE_NUM_THREADS").is_none()
+    {
+        // SAFETY: called at worker start, before this process creates any thread.
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", THREADS);
+            std::env::set_var("CANDLE_NUM_THREADS", THREADS);
+        }
+    }
+    // Threads created afterwards inherit the lower priority.
+    unsafe {
+        let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+        libc::setpriority(libc::PRIO_PROCESS, 0, current.max(10));
+    }
+}
+
 pub fn run(data: &Storage) -> Result<()> {
     let lock = lock_file(data)?;
     if !try_lock(&lock)? {
         return Ok(());
     }
+    run_in_background();
     let store = Store::open_worker(data)?;
     let config = observer::settings(&data.directory).unwrap_or_else(|error| {
         eprintln!("QuietMem observer configuration: {error:#}");
@@ -224,7 +246,7 @@ impl Semantic {
             // Reload from storage now and then so forgotten records leave the index.
             if rebuilt.elapsed() > Duration::from_secs(600) {
                 let mut index = Index::default();
-                for (id, workspace, project, vector) in store.vectors(spec.name)? {
+                for (id, workspace, project, vector) in store.vectors(&spec.vector_key())? {
                     index.insert(id, workspace, project, embed::from_bytes(&vector));
                 }
                 *self.index.write().unwrap_or_else(|e| e.into_inner()) = index;
@@ -254,7 +276,7 @@ impl Semantic {
                 release_memory();
                 continue;
             }
-            let batch = store.unembedded(spec.name, 16)?;
+            let batch = store.unembedded(&spec.vector_key(), 16)?;
             if batch.is_empty() {
                 thread::sleep(Duration::from_millis(500));
                 continue;
@@ -277,7 +299,7 @@ impl Semantic {
                         .embed_documents(&[crate::hooks::cut(&body, 4000)])?
                         .remove(0)
                 };
-                store.save_vectors(spec.name, &[(id, embed::to_bytes(&vector))])?;
+                store.save_vectors(&spec.vector_key(), &[(id, embed::to_bytes(&vector))])?;
                 self.index
                     .write()
                     .unwrap_or_else(|e| e.into_inner())

@@ -259,7 +259,7 @@ fn main() -> Result<()> {
                 let spec = embed::configured(&data.directory)?;
                 let records: i64 = store.counts()?.values().sum();
                 let embedded = match spec {
-                    Some(spec) => store.vectors(spec.name)?.len(),
+                    Some(spec) => store.vectors(&spec.vector_key())?.len(),
                     None => 0,
                 };
                 println!(

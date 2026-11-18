@@ -4,9 +4,11 @@
 //! revision and every file is verified against a SHA-256 digest before use.
 
 use anyhow::{Context, Result, anyhow, ensure};
+use candle_core::DType;
 use candle_core::{Device, IndexOp, Tensor};
+use candle_nn::Module;
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use candle_transformers::models::bert::{BertEncoder, Config};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -162,6 +164,19 @@ pub fn spec(name: &str) -> Result<&'static Spec> {
     })
 }
 
+/// Weights are held as bfloat16: half the memory of f32 with the same
+/// retrieval quality and calibration in `quietmem eval`. Inference is about
+/// 1.5× slower on CPU.
+const WEIGHTS: DType = DType::BF16;
+
+impl Spec {
+    /// Identifies vectors from this model and precision, so a change of either
+    /// re-embeds stored records instead of mixing incompatible vectors.
+    pub fn vector_key(&self) -> String {
+        format!("{}:bf16", self.name)
+    }
+}
+
 pub fn model_dir(data: &Path, spec: &Spec) -> PathBuf {
     data.join("models").join(spec.name).join(spec.revision)
 }
@@ -304,9 +319,61 @@ pub fn installed(data: &Path, spec: &Spec) -> bool {
         .all(|(file, _, size)| fs::metadata(dir.join(file)).is_ok_and(|meta| meta.len() == *size))
 }
 
+/// A BERT encoder whose attention mask stays finite in 16-bit formats.
+/// candle's `BertModel` scales the mask by `f32::MIN`, which becomes −∞ in
+/// bf16 and f16, so `0 × −∞` turns every output into NaN. The embedding layer
+/// is rebuilt here; the encoder is candle's.
+struct Bert {
+    word: candle_nn::Embedding,
+    position: candle_nn::Embedding,
+    token_type: candle_nn::Embedding,
+    norm: candle_nn::LayerNorm,
+    encoder: BertEncoder,
+}
+
+impl Bert {
+    fn load(weights: VarBuilder, config: &Config) -> Result<Self> {
+        let weights = if weights.contains_tensor("bert.embeddings.word_embeddings.weight") {
+            weights.pp("bert")
+        } else {
+            weights
+        };
+        let layer = weights.pp("embeddings");
+        let size = config.hidden_size;
+        Ok(Self {
+            word: candle_nn::embedding(config.vocab_size, size, layer.pp("word_embeddings"))?,
+            position: candle_nn::embedding(
+                config.max_position_embeddings,
+                size,
+                layer.pp("position_embeddings"),
+            )?,
+            token_type: candle_nn::embedding(
+                config.type_vocab_size,
+                size,
+                layer.pp("token_type_embeddings"),
+            )?,
+            norm: candle_nn::layer_norm(size, config.layer_norm_eps, layer.pp("LayerNorm"))?,
+            encoder: BertEncoder::load(weights.pp("encoder"), config)?,
+        })
+    }
+
+    fn forward(&self, ids: &Tensor, mask: &Tensor, dtype: DType) -> Result<Tensor> {
+        let (_, length) = ids.dims2()?;
+        let positions = Tensor::arange(0u32, length as u32, ids.device())?;
+        let hidden = (self.word.forward(ids)? + self.token_type.forward(&ids.zeros_like()?)?)?
+            .broadcast_add(&self.position.forward(&positions)?)?;
+        let hidden = self.norm.forward(&hidden)?;
+        // Padding gets −10,000 before softmax, which rounds its weight to zero.
+        let mask = mask.to_dtype(DType::F32)?.unsqueeze(1)?.unsqueeze(1)?;
+        let mask = ((mask.ones_like()? - &mask)? * -10_000.0)?.to_dtype(dtype)?;
+        Ok(self.encoder.forward(&hidden, &mask)?)
+    }
+}
+
 pub struct Embedder {
     pub spec: &'static Spec,
-    model: BertModel,
+    dtype: DType,
+    model: Bert,
     tokenizer: Tokenizer,
     device: Device,
 }
@@ -336,13 +403,15 @@ impl Embedder {
                 ..Default::default()
             }))
             .map_err(anyhow::Error::msg)?;
+        let dtype = WEIGHTS;
         // The weights were verified by SHA-256 at install time and are not modified afterwards.
         let weights = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DTYPE, &device)?
+            VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], dtype, &device)?
         };
-        let model = BertModel::load(weights, &config)?;
+        let model = Bert::load(weights, &config)?;
         Ok(Self {
             spec,
+            dtype,
             model,
             tokenizer,
             device,
@@ -392,12 +461,11 @@ impl Embedder {
             .collect();
         let ids = Tensor::from_vec(ids, (rows, width), &self.device)?;
         let mask = Tensor::from_vec(mask, (rows, width), &self.device)?;
-        let types = ids.zeros_like()?;
-        let output = self.model.forward(&ids, &types, Some(&mask))?;
+        let output = self.model.forward(&ids, &mask, self.dtype)?;
         let pooled = match self.spec.pooling {
             Pooling::Cls => output.i((.., 0))?,
             Pooling::Mean => {
-                let mask = mask.to_dtype(DTYPE)?.unsqueeze(2)?;
+                let mask = mask.to_dtype(self.dtype)?.unsqueeze(2)?;
                 let summed = output.broadcast_mul(&mask)?.sum(1)?;
                 summed.broadcast_div(&mask.sum(1)?)?
             }
@@ -409,6 +477,7 @@ impl Embedder {
             pooled.dim(1)?,
             self.spec.dimensions
         );
+        let pooled = pooled.to_dtype(DType::F32)?;
         let norms = pooled.sqr()?.sum_keepdim(1)?.sqrt()?;
         let normalized = pooled.broadcast_div(&norms)?;
         Ok(normalized.to_vec2::<f32>()?)

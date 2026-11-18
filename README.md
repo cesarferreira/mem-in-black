@@ -154,7 +154,7 @@ semantic match is recalled when its similarity clears a floor calibrated on
 unrelated queries, or a slightly lower floor when it also shares a keyword with
 your prompt. Unrelated prompts still get no context.
 
-The model uses about 450 MB of memory while loaded. After 30 minutes without a
+The model holds its weights as bfloat16 and uses about 280 MB of memory while loaded. Model inference runs on 2 threads at low CPU priority, so it stays out of the way of your editor and builds; set `RAYON_NUM_THREADS` to change the thread count. After 30 minutes without a
 search or prompt, the worker unloads it and drops to about 20 MB. The next query
 uses keywords immediately, and the model is back about 2 seconds later. Set
 `QUIETMEM_MODEL_IDLE_SECS` to change the idle time. New records are embedded
@@ -175,6 +175,10 @@ of the right record (1.0 means always first).
 | `bge-small` | 134 MB | 0.765 | 0.465 | 53 ms |
 | `bge-base` | 439 MB | 0.775 | 0.483 | 104 ms |
 | `arctic-m` (default) | 436 MB | 0.783 | 0.484 | 104 ms |
+
+Query times in the table were measured with f32 weights on all cores. The worker
+holds bfloat16 weights on 2 threads, which scored the same (0.779 and 0.485 for
+`arctic-m`) and answers a semantic query in about 110 ms.
 
 These queries share many words with their answers, so keywords already score well.
 Semantic search matters most when you describe a problem in different words than
