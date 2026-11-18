@@ -95,7 +95,7 @@ Open the private `viewer_url` from `quietmem status` for a local search and acti
 
 The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering. File reads record the path only. Searches record the pattern and matching file names, and edits record paths and line counts, not file contents. Web lookups keep a short excerpt. MCP tool results are not captured.
 
-Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, and `save_memory`. Automatic capture and recall require that harness's hooks or adapter.
+Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, `save_memory`, and `forget`. Pass `replaces` to `save_memory` to correct outdated records; they stop appearing in search and recall. `quietmem forget <id>…` deletes records and the summaries built from them. Automatic capture and recall require that harness's hooks or adapter.
 
 
 ## Database location

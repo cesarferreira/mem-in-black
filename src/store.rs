@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+const SCHEMA: i64 = 4;
+
 const RECORD_COLUMNS: &str =
     "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id";
 
@@ -118,10 +120,10 @@ impl Store {
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         drop(existing);
         ensure!(
-            version <= 3,
+            version <= SCHEMA,
             "memory database is from a newer QuietMem version"
         );
-        if version < 3 {
+        if version < SCHEMA {
             drop(db);
             FileExt::unlock(&schema_lock)?;
             FileExt::lock_exclusive(&schema_lock)?;
@@ -129,10 +131,10 @@ impl Store {
             db = connect(db_path)?;
             let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
             ensure!(
-                version <= 3,
+                version <= SCHEMA,
                 "memory database is from a newer QuietMem version"
             );
-            if version == 3 {
+            if version == SCHEMA {
                 drop(_write);
                 return Ok(Self {
                     db,
@@ -188,12 +190,24 @@ impl Store {
                      "
                 )?;
             }
+            if version < 3 {
+                migration.execute_batch(
+                    "CREATE TABLE private_tools (
+                       source TEXT NOT NULL, session TEXT NOT NULL, tool_id TEXT NOT NULL,
+                       PRIMARY KEY(source, session, tool_id)
+                     );",
+                )?;
+            }
             migration.execute_batch(
-                "CREATE TABLE private_tools (
-                   source TEXT NOT NULL, session TEXT NOT NULL, tool_id TEXT NOT NULL,
-                   PRIMARY KEY(source, session, tool_id)
-                 );
-                 PRAGMA user_version=3;",
+                "ALTER TABLE events ADD COLUMN superseded_by INTEGER;
+                 CREATE TRIGGER event_delete AFTER DELETE ON events BEGIN
+                   INSERT INTO event_search(event_search, rowid, body) VALUES ('delete', old.id, old.body);
+                 END;
+                 CREATE TRIGGER event_update AFTER UPDATE OF body ON events BEGIN
+                   INSERT INTO event_search(event_search, rowid, body) VALUES ('delete', old.id, old.body);
+                   INSERT INTO event_search(rowid, body) VALUES (new.id, new.body);
+                 END;
+                 PRAGMA user_version=4;",
             )?;
             migration.commit()?;
         }
@@ -341,11 +355,11 @@ impl Store {
         match query {
             Some(fts) => self.query(&format!(
                 "SELECT {RECORD_COLUMNS} FROM event_search JOIN events e ON e.id = event_search.rowid
-                 WHERE event_search MATCH ?1 AND (?2 IS NULL OR e.workspace = ?2)
+                 WHERE event_search MATCH ?1 AND (?2 IS NULL OR e.workspace = ?2) AND e.superseded_by IS NULL
                  ORDER BY bm25(event_search), e.id DESC LIMIT ?3"
             ), params![fts, workspace, limit.clamp(1, 100) as i64]),
             None => self.query(&format!(
-                "SELECT {RECORD_COLUMNS} FROM events e WHERE (?1 IS NULL OR e.workspace = ?1)
+                "SELECT {RECORD_COLUMNS} FROM events e WHERE (?1 IS NULL OR e.workspace = ?1) AND e.superseded_by IS NULL
                  ORDER BY e.id DESC LIMIT ?2"
             ), params![workspace, limit.clamp(1, 100) as i64]),
         }
@@ -385,6 +399,7 @@ impl Store {
         self.query(&format!(
             "SELECT {RECORD_COLUMNS} FROM event_search JOIN events e ON e.id = event_search.rowid
              WHERE event_search MATCH ?1 AND e.project = ?2 AND (e.source != ?4 OR e.session != ?5)
+               AND e.superseded_by IS NULL
                AND e.created_at > unixepoch() - 15552000
                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.source = ?4 AND d.session = ?5 AND d.event_id = e.id)
              ORDER BY e.workspace = ?3 DESC, bm25(event_search), e.id DESC LIMIT 12"
@@ -409,6 +424,7 @@ impl Store {
         Ok(self.db.query_row(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e
              WHERE e.workspace = ?1 AND e.source != ?2 AND (?3 IS NULL OR e.source = ?3)
+               AND e.superseded_by IS NULL
                AND e.kind IN ('assistant', 'tool', 'prompt') AND e.created_at > unixepoch() - 1209600
                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source = e.source AND s.session = e.session AND s.private)
              ORDER BY e.id DESC LIMIT 1"
@@ -491,6 +507,47 @@ impl Store {
             }
         }
         Ok(records)
+    }
+
+    /// Delete records, the summaries built from them and their delivery history.
+    pub fn forget(&self, ids: &[i64]) -> Result<usize> {
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        let mut removed = 0;
+        for id in ids.iter().take(100) {
+            transaction.execute(
+                "DELETE FROM deliveries WHERE event_id = ?1
+                    OR event_id IN (SELECT id FROM events WHERE event_key = 'summary:' || ?1)",
+                [id],
+            )?;
+            removed += transaction.execute(
+                "DELETE FROM events WHERE id = ?1 OR event_key = 'summary:' || ?1",
+                [id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE events SET superseded_by = NULL
+             WHERE superseded_by IS NOT NULL AND superseded_by NOT IN (SELECT id FROM events)",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    /// Record a note and hide the records it corrects from search and recall.
+    pub fn supersede(&self, note: Observation<'_>, replaces: &[i64]) -> Result<i64> {
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        self.insert(note, None)?;
+        let id = transaction.last_insert_rowid();
+        for old in replaces.iter().take(100).filter(|old| **old != id) {
+            transaction.execute(
+                "UPDATE events SET superseded_by = ?1 WHERE id = ?2",
+                params![id, old],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(id)
     }
 
     pub fn was_delivered(&self, source: &str, session: &str, id: i64) -> Result<bool> {

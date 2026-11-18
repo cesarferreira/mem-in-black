@@ -47,6 +47,14 @@ struct Save {
     workspace: String,
     /// A durable decision, discovery, or constraint.
     text: String,
+    /// IDs of records this note corrects. They stop appearing in search and recall.
+    replaces: Option<Vec<i64>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Forget {
+    /// IDs of records to delete permanently, for example wrong or sensitive evidence.
+    ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -121,7 +129,9 @@ impl MemoryServer {
         })
     }
 
-    #[tool(description = "Save an explicit project note in the local QuietMem database.")]
+    #[tool(
+        description = "Save a durable project note. Pass `replaces` with the IDs of outdated or wrong records that this note corrects."
+    )]
     async fn save_memory(
         &self,
         Parameters(input): Parameters<Save>,
@@ -130,17 +140,30 @@ impl MemoryServer {
             let workspace = Workspace::read(Path::new(&input.workspace));
             let body = clean(&input.text, 1600);
             anyhow::ensure!(!body.is_empty(), "note is empty");
-            store.record(Observation {
-                source: "manual",
-                session: &uuid::Uuid::new_v4().to_string(),
-                key: None,
-                turn_id: None,
-                kind: "note",
-                body: &body,
-                workspace: &workspace,
-            })?;
-            Ok("Saved")
+            let id = store.supersede(
+                Observation {
+                    source: "manual",
+                    session: &uuid::Uuid::new_v4().to_string(),
+                    key: None,
+                    turn_id: None,
+                    kind: "note",
+                    body: &body,
+                    workspace: &workspace,
+                },
+                input.replaces.as_deref().unwrap_or_default(),
+            )?;
+            Ok(format!("Saved #{id}"))
         })
+    }
+
+    #[tool(
+        description = "Permanently delete QuietMem records by ID, with the summaries built from them. Use for wrong or sensitive records; prefer save_memory with `replaces` to correct outdated facts."
+    )]
+    async fn forget(
+        &self,
+        Parameters(input): Parameters<Forget>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.run(|store| Ok(format!("Forgot {} records", store.forget(&input.ids)?)))
     }
 
     fn run<T: Serialize>(

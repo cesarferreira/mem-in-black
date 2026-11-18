@@ -1329,3 +1329,113 @@ fn reads_searches_and_web_lookups_are_captured_without_file_contents() {
         "{body}"
     );
 }
+
+fn mcp_calls(workspace: &Workspace, calls: &[Value]) -> Vec<String> {
+    let mut child = workspace
+        .command()
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |value: Value, reply: bool| {
+        writeln!(input, "{value}").unwrap();
+        let mut line = String::new();
+        if reply {
+            output.read_line(&mut line).unwrap();
+        }
+        line
+    };
+    send(
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
+        true,
+    );
+    send(
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        false,
+    );
+    let results = calls
+        .iter()
+        .enumerate()
+        .map(|(id, call)| {
+            let reply: Value = serde_json::from_str(&send(
+                json!({"jsonrpc":"2.0","id":id + 1,"method":"tools/call","params":call}),
+                true,
+            ))
+            .unwrap();
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"))
+                .to_owned()
+        })
+        .collect();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    results
+}
+
+#[test]
+fn a_correction_hides_the_outdated_record_and_forget_removes_derived_summaries() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    let search = |query: &str| -> Vec<Value> {
+        serde_json::from_str::<Value>(&workspace.run(&["search", query], None))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let assistant = search("handshake")
+        .into_iter()
+        .find(|row| row["kind"] == "assistant")
+        .unwrap();
+    let results = mcp_calls(
+        &workspace,
+        &[json!({"name":"save_memory","arguments":{
+            "workspace": workspace.repo,
+            "text": "The retry counter must reset only after a successful handshake ack",
+            "replaces": [assistant["id"]]
+        }})],
+    );
+    assert!(results[0].contains("Saved #"), "{}", results[0]);
+    let hits = search("handshake");
+    assert!(hits.iter().all(|row| row["id"] != assistant["id"]));
+    assert!(hits.iter().any(|row| row["kind"] == "note"));
+
+    let id = assistant["id"].as_i64().unwrap().to_string();
+    let forgot = workspace.run(&["forget", &id], None);
+    assert_eq!(forgot.trim(), "Forgot 2 records.");
+    assert!(search("resets too soon").is_empty());
+    let note = search("successful handshake ack");
+    assert_eq!(note.len(), 1, "the correction survives");
+}
+
+#[test]
+fn a_version_three_database_upgrades_and_keeps_its_records() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let database = workspace.temp.path().join("data/memory.sqlite3");
+    let legacy = rusqlite::Connection::open(&database).unwrap();
+    legacy
+        .execute_batch(
+            "DROP TRIGGER event_delete; DROP TRIGGER event_update;
+             ALTER TABLE events DROP COLUMN superseded_by; PRAGMA user_version=3;",
+        )
+        .unwrap();
+    drop(legacy);
+    let hits: Value =
+        serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
+    let id = hits[0]["id"].as_i64().unwrap().to_string();
+    workspace.run(&["forget", &id], None);
+    let after: Value =
+        serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
+    assert_eq!(after, json!([]));
+    let version: i64 = rusqlite::Connection::open(&database)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+}

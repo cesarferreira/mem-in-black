@@ -67,6 +67,11 @@ enum Command {
         #[arg(long, value_enum, default_value_t = preview::Color::Auto)]
         color: preview::Color,
     },
+    /// Delete records by ID, with the summaries built from them.
+    Forget {
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
     /// Search local memory or list recent observations.
     Search {
         query: Option<String>,
@@ -124,6 +129,10 @@ fn main() -> Result<()> {
             println!("Imported {count} records.");
         }
         Command::Export => Store::open(&data)?.export(io::stdout().lock())?,
+        Command::Forget { ids } => {
+            let removed = Store::open(&data)?.forget(&ids)?;
+            println!("Forgot {removed} records.");
+        }
         Command::Preview { workspace, color } => {
             let directory = workspace.map(Ok).unwrap_or_else(std::env::current_dir)?;
             let workspace = Workspace::read(&directory);
