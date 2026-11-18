@@ -195,37 +195,30 @@ impl Semantic {
                 self.ready.store(true, Ordering::Release);
                 rebuilt = Instant::now();
             }
-            // Queries go first; small batches bound how long one can wait.
-            while self.waiting_queries.load(Ordering::Acquire) > 0 {
-                thread::sleep(Duration::from_millis(10));
-            }
-            let batch = store.unembedded(spec.name, 4)?;
+            let batch = store.unembedded(spec.name, 16)?;
             if batch.is_empty() {
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
-            let texts: Vec<_> = batch
-                .iter()
-                .map(|(_, _, _, body)| crate::hooks::cut(body, 4000))
-                .collect();
-            let vectors = {
-                let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .as_ref()
-                    .context("model unloaded")?
-                    .embed_documents(&texts)?
-            };
-            store.save_vectors(
-                spec.name,
-                &batch
-                    .iter()
-                    .zip(&vectors)
-                    .map(|((id, ..), vector)| (*id, embed::to_bytes(vector)))
-                    .collect::<Vec<_>>(),
-            )?;
-            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
-            for ((id, workspace, project, _), vector) in batch.into_iter().zip(vectors) {
-                index.insert(id, workspace, project, vector);
+            // One record per lock, and queries go first: a waiting query is
+            // delayed by at most one record, never by a whole batch.
+            for (id, workspace, project, body) in batch {
+                while self.waiting_queries.load(Ordering::Acquire) > 0 {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let vector = {
+                    let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+                    guard
+                        .as_ref()
+                        .context("model unloaded")?
+                        .embed_documents(&[crate::hooks::cut(&body, 4000)])?
+                        .remove(0)
+                };
+                store.save_vectors(spec.name, &[(id, embed::to_bytes(&vector))])?;
+                self.index
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, workspace, project, vector);
             }
         }
     }
