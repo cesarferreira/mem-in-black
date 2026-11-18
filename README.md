@@ -29,6 +29,25 @@ The viewer listens on `127.0.0.1`. QuietMem sends memory excerpts to a remote
 service only if you configure a remote endpoint in `observer.json`. See
 [Optional model summaries](#optional-model-summaries).
 
+## At a glance
+
+| What you get | |
+| --- | --- |
+| New sessions know past work | Each prompt gets the outcome of matching earlier work, not your old questions |
+| Switch agents mid-task | Ask Codex to "continue the work I started in Claude", or the other way round |
+| Model tokens spent on memory | **0**: summaries are built locally |
+| Finds work by meaning | Hybrid search ranks the right record first more often than keywords or claude-mem's default model ([benchmark](#semantic-search)) |
+| Your data stays local | Nothing leaves your machine unless you configure a remote summary model |
+| Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
+| See what it saved | `quietmem stats` and the viewer |
+
+| What it costs | |
+| --- | --- |
+| Time per prompt | ~30 ms keyword-only, ~130 ms with semantic search |
+| Memory | ~7 MB keyword-only. With semantic search: 277 MB while in use, 17 MB after 30 idle minutes |
+| CPU | 0% at rest. At most 2 cores, at low priority, while embedding new records |
+| Disk | 13 MB binary, 436 MB optional model, ~3 KB per record for vectors |
+
 ## Install
 
 QuietMem runs on Linux and macOS. Install Rust 1.99 or newer and add
