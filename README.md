@@ -57,6 +57,10 @@ compact text preview. The preview is for you. The agent receives memory when it
 is relevant to a prompt. Set `QUIETMEM_STARTUP_PREVIEW=0` to hide startup previews
 or `NO_COLOR=1` for plain text.
 
+Install the Pi startup extension with `quietmem install --host pi`. It shows the
+colored worktree preview above the editor and clears it when the first turn
+starts. This extension displays existing QuietMem history.
+
 ## Inspect memory
 
 ```sh
@@ -68,7 +72,7 @@ quietmem export > quietmem.jsonl
 
 Open the private `viewer_url` from `quietmem status` for a local search and activity view. The worker starts on the first hook. `quietmem serve` starts it in the foreground, and `quietmem stop` stops it until the next hook. Set `QUIETMEM_NO_AUTOSTART=1` to keep the worker stopped while hooks continue recording. Use `QUIETMEM_DEBUG=1` for hook error output.
 
-The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering. The SQLite database and viewer run on the local machine.
+The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering. The SQLite database and stdio MCP work locally. The viewer listens on `127.0.0.1`, and the default worker summarizes turns locally.
 
 Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, and `save_memory`. Automatic capture and recall require that harness's hooks or adapter.
 

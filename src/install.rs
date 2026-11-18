@@ -1,5 +1,6 @@
 use crate::{hooks::Host, store::prepare_dir};
 use anyhow::{Context, Result, ensure};
+use clap::ValueEnum;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -10,7 +11,14 @@ use std::{
 use tempfile::NamedTempFile;
 use toml_edit::{Array, DocumentMut, value};
 
-pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Host>) -> Result<()> {
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Target {
+    Claude,
+    Codex,
+    Pi,
+}
+
+pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Target>) -> Result<()> {
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -28,8 +36,12 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Host>
     let exe = std::env::current_exe()?;
     let exe = exe.to_str().context("binary path is not UTF-8")?;
     let data = data.to_str().context("data path is not UTF-8")?;
+    if matches!(selected, Some(Target::Pi)) {
+        let pi = config_dir("PI_CODING_AGENT_DIR", ".pi/agent");
+        return install_pi(&pi, exe, data);
+    }
     let mut changes = Vec::new();
-    if !matches!(selected, Some(Host::Codex)) {
+    if !matches!(selected, Some(Target::Codex)) {
         let path = claude_config.join("settings.json");
         changes.push(hooks_file(path, exe, data, Host::Claude)?);
         let path = if claude_config == home.join(".claude") {
@@ -51,7 +63,7 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Host>
         );
         changes.push((path, serde_json::to_string_pretty(&doc)? + "\n"));
     }
-    if !matches!(selected, Some(Host::Claude)) {
+    if !matches!(selected, Some(Target::Claude)) {
         changes.push(hooks_file(
             codex_config.join("hooks.json"),
             exe,
@@ -77,6 +89,27 @@ pub fn install(data: &Path, home_override: Option<&Path>, selected: Option<Host>
         }
     }
     Ok(())
+}
+
+fn install_pi(config_dir: &Path, binary: &str, data: &str) -> Result<()> {
+    const MARKER: &str = "// Installed by QuietMem\n";
+    let path = config_dir.join("extensions/quietmem-startup.js");
+    let config = json!({"binary": binary, "dataDirectory": data});
+    let extension = format!(
+        "{MARKER}const quietmem = {config};\n{}",
+        include_str!("pi-preview.js")
+    );
+    if let Some(existing) = read(&path)? {
+        if existing == extension {
+            return Ok(());
+        }
+        ensure!(
+            existing.starts_with(MARKER),
+            "another Pi extension exists at {}",
+            path.display()
+        );
+    }
+    atomic_write(&path, extension.as_bytes())
 }
 
 fn hooks_file(path: PathBuf, exe: &str, data: &str, host: Host) -> Result<(PathBuf, String)> {

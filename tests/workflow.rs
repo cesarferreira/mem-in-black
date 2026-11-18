@@ -934,3 +934,21 @@ fn startup_preview_respects_color_and_visibility_preferences() {
             .is_empty()
     );
 }
+
+#[test]
+fn pi_install_registers_a_local_startup_extension_idempotently() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("Pi home's fixture");
+    let install = ["install", "--host", "pi", "--home", home.to_str().unwrap()];
+    workspace.run(&install, None);
+    let path = home.join(".pi/agent/extensions/quietmem-startup.js");
+    let extension = std::fs::read_to_string(&path).unwrap();
+    assert!(extension.contains("session_start"));
+    assert!(extension.contains("preview"));
+    assert!(extension.contains("before_agent_start"));
+    assert!(extension.contains("QUIETMEM_STARTUP_PREVIEW"));
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
+    workspace.run(&install, None);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), extension);
+}

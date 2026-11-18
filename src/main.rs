@@ -29,12 +29,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register QuietMem with Claude Code and Codex.
+    /// Register Claude Code and Codex hooks or install the Pi startup preview.
     Install {
         #[arg(long)]
         home: Option<PathBuf>,
         #[arg(long, value_enum)]
-        host: Option<Host>,
+        host: Option<install::Target>,
     },
     /// Consume a host hook's JSON.
     Hook { host: Host },
