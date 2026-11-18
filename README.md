@@ -1,13 +1,49 @@
-# QuietMem
+<div align="center">
+  <h1>quietmem</h1>
 
-QuietMem is a local memory service for coding agents. It captures useful actions and results in the background. Claude Code and Codex get a small set of relevant observations automatically, and any compatible stdio MCP client can search the same history.
+  <p><strong>Local Rust memory service for coding agents</strong></p>
 
-## Get started
+  <p>
+    <a href="https://github.com/cesarferreira/quietmem/actions/workflows/rust-tests.yml">
+      <img alt="Tests" src="https://github.com/cesarferreira/quietmem/actions/workflows/rust-tests.yml/badge.svg?branch=main">
+    </a>
+    <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
+  </p>
 
-Run these commands from this directory on Linux or macOS.
+  <p>
+    <a href="#install">Install</a>
+    &nbsp;·&nbsp;
+    <a href="#quickstart">Quickstart</a>
+  </p>
+</div>
 
-```sh
-cargo install --locked --path .
+---
+
+QuietMem captures useful actions and results in the background. Claude Code and
+Codex get a small set of relevant observations automatically, and any compatible
+stdio MCP client can search the same history.
+
+## Install
+
+QuietMem runs on Linux and macOS. Install Rust 1.99 or newer and add
+`~/.cargo/bin` to your `PATH`. [Rust installation](https://rustup.rs)
+
+```bash
+git clone https://github.com/cesarferreira/quietmem.git
+cd quietmem
+cargo install --path . --locked
+```
+
+Check that the binary is available.
+
+```bash
+quietmem --help
+```
+
+<a id="quickstart"></a>
+## Quickstart
+
+```bash
 quietmem install
 ```
 
