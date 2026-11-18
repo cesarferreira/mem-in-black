@@ -1491,3 +1491,27 @@ fn search_answers_natural_language_questions_that_share_only_some_words() {
         serde_json::from_str(&workspace.run(&["search", "kubernetes ingress"], None)).unwrap();
     assert_eq!(none, json!([]));
 }
+
+#[test]
+fn harness_notifications_neither_recall_nor_become_requests() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let notification = "<task-notification>\n<status>completed</status>\n<summary>Background command \"cargo test websocket_retry regression\" completed</summary>\n</task-notification>";
+    let result = workspace.hook(
+        "claude",
+        "other-thread",
+        "UserPromptSubmit",
+        json!({"prompt": notification}),
+    );
+    assert!(result.is_empty(), "{result}");
+    let found: Value =
+        serde_json::from_str(&workspace.run(&["search", "Background command completed"], None))
+            .unwrap();
+    assert!(
+        found
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["kind"] != "prompt")
+    );
+}

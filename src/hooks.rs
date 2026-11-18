@@ -106,7 +106,7 @@ pub fn handle(store: &Store, host: Host, input: impl Read) -> Result<Option<Valu
             store
                 .set_private(source, session, turn_id, private)
                 .context("saving turn privacy")?;
-            if private {
+            if private || machine_prompt(&event.prompt) {
                 return Ok(None);
             }
             let prompt = clean(&event.prompt, 1600);
@@ -142,6 +142,22 @@ pub fn handle(store: &Store, host: Host, input: impl Read) -> Result<Option<Valu
         }
         _ => Ok(None),
     }
+}
+
+/// Harness-generated turns, such as background task notifications and local
+/// command output, are not requests from the user.
+fn machine_prompt(prompt: &str) -> bool {
+    let start = prompt.trim_start().to_ascii_lowercase();
+    [
+        "<task-notification>",
+        "<local-command-",
+        "<command-name>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+    ]
+    .iter()
+    .any(|tag| start.starts_with(tag))
 }
 
 fn tool_record(event: &Input) -> Option<String> {
