@@ -14,7 +14,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -176,13 +176,49 @@ pub struct Semantic {
     index: RwLock<Index>,
     ready: AtomicBool,
     waiting_queries: AtomicUsize,
+    /// Milliseconds since the Unix epoch of the last query.
+    last_query: AtomicU64,
+    /// A query found the model unloaded; load it again.
+    wanted: AtomicBool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// How long the model stays loaded without queries. `QUIETMEM_MODEL_IDLE_SECS`
+/// overrides the 30-minute default.
+fn idle_limit() -> Duration {
+    std::env::var("QUIETMEM_MODEL_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(Duration::from_secs(30 * 60), Duration::from_secs)
+}
+
+/// Return freed heap pages to the operating system after unloading the model.
+fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // malloc_trim only releases free memory held by the allocator.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 impl Semantic {
     fn run(&self, data: &Storage, spec: &'static embed::Spec) -> Result<()> {
         let store = Store::open(data)?;
-        let embedder = Embedder::load(&data.directory, spec)?;
-        *self.embedder.lock().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
+        let idle = idle_limit();
+        let load = || -> Result<()> {
+            let embedder = Embedder::load(&data.directory, spec)?;
+            *self.embedder.lock().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
+            self.last_query.store(now_ms(), Ordering::Release);
+            // Requests that arrived during the load are served now.
+            self.wanted.store(false, Ordering::Release);
+            Ok(())
+        };
+        load()?;
         let mut rebuilt = Instant::now() - Duration::from_secs(3600);
         loop {
             // Reload from storage now and then so forgotten records leave the index.
@@ -195,22 +231,49 @@ impl Semantic {
                 self.ready.store(true, Ordering::Release);
                 rebuilt = Instant::now();
             }
+            let loaded = self
+                .embedder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if !loaded {
+                // New records wait until a query brings the model back.
+                if self.wanted.swap(false, Ordering::AcqRel) {
+                    load()?;
+                } else {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                continue;
+            }
+            let idle_now = || {
+                let quiet = now_ms().saturating_sub(self.last_query.load(Ordering::Acquire));
+                Duration::from_millis(quiet) >= idle
+            };
+            if idle_now() {
+                *self.embedder.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                release_memory();
+                continue;
+            }
             let batch = store.unembedded(spec.name, 16)?;
             if batch.is_empty() {
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(Duration::from_millis(500));
                 continue;
             }
             // One record per lock, and queries go first: a waiting query is
             // delayed by at most one record, never by a whole batch.
             for (id, workspace, project, body) in batch {
+                if idle_now() {
+                    break;
+                }
                 while self.waiting_queries.load(Ordering::Acquire) > 0 {
                     thread::sleep(Duration::from_millis(5));
                 }
                 let vector = {
                     let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .as_ref()
-                        .context("model unloaded")?
+                    let Some(embedder) = guard.as_ref() else {
+                        break;
+                    };
+                    embedder
                         .embed_documents(&[crate::hooks::cut(&body, 4000)])?
                         .remove(0)
                 };
@@ -232,11 +295,14 @@ impl Semantic {
         if !self.ready.load(Ordering::Acquire) {
             return Ok(None);
         }
+        self.last_query.store(now_ms(), Ordering::Release);
         self.waiting_queries.fetch_add(1, Ordering::AcqRel);
         let vector = {
             let guard = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
             self.waiting_queries.fetch_sub(1, Ordering::AcqRel);
             let Some(embedder) = guard.as_ref() else {
+                // Answer now with keywords only; the model loads for the next query.
+                self.wanted.store(true, Ordering::Release);
                 return Ok(None);
             };
             embedder.embed_query(query)?

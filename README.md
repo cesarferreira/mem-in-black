@@ -154,6 +154,12 @@ semantic match is recalled when its similarity clears a floor calibrated on
 unrelated queries, or a slightly lower floor when it also shares a keyword with
 your prompt. Unrelated prompts still get no context.
 
+The model uses about 450 MB of memory while loaded. After 30 minutes without a
+search or prompt, the worker unloads it and drops to about 20 MB. The next query
+uses keywords immediately, and the model is back about 2 seconds later. Set
+`QUIETMEM_MODEL_IDLE_SECS` to change the idle time. New records are embedded
+while the model is loaded.
+
 Choose another model with `--model`. `quietmem embeddings disable` returns to
 keyword search and keeps downloaded models on disk.
 

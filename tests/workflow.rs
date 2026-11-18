@@ -1648,3 +1648,52 @@ fn stats_measure_recall_and_lookups_and_label_savings_as_an_estimate() {
     assert!(text.contains("Saved (est.)"), "{text}");
     assert!(text.contains("real savings are lower"), "{text}");
 }
+
+/// Downloads a 90 MB model. Run with `cargo test -- --ignored idle_model`.
+#[test]
+#[ignore]
+fn idle_model_unloads_and_reloads_on_the_next_query() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["embeddings", "enable", "--model", "minilm"], None);
+    let mut worker = workspace
+        .command()
+        .env("QUIETMEM_MODEL_IDLE_SECS", "2")
+        .arg("serve")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(worker.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = format!("{}/semantic", line.trim());
+    let query = |text: &str| -> u16 {
+        match ureq::post(&url).send_json(json!({"query": text, "limit": 3})) {
+            Ok(response) => response.status().as_u16(),
+            Err(ureq::Error::StatusCode(status)) => status,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let wait_for = |status: u16| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while query("reconnect attempts") != status {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never returned {status}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    wait_for(200);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let started = std::time::Instant::now();
+    assert_eq!(query("reconnect attempts"), 503, "unloaded after idling");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "no wait while unloaded"
+    );
+    wait_for(200);
+    workspace.run(&["stop"], None);
+    worker.wait().unwrap();
+}
