@@ -478,6 +478,67 @@ fn handoff_keeps_latest_request_and_prior_origin_without_using_an_old_answer_as_
 }
 
 #[test]
+fn recall_returns_outcomes_and_skips_past_prompts_without_one() {
+    let workspace = Workspace::new();
+    for session in ["asked-1", "asked-2"] {
+        workspace.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"prompt":"Fix the sqlite journal mode on nfs mounts"}),
+        );
+    }
+    let repeat = workspace.hook(
+        "claude",
+        "asked-3",
+        "UserPromptSubmit",
+        json!({"prompt":"Fix the sqlite journal mode on nfs mounts"}),
+    );
+    assert!(
+        repeat.is_empty(),
+        "unanswered prompts are not evidence: {repeat}"
+    );
+
+    workspace.seed();
+    let result = workspace.hook(
+        "codex",
+        "later",
+        "UserPromptSubmit",
+        json!({"prompt":"Revisit the websocket retry regression"}),
+    );
+    let context: Value = serde_json::from_str(&result).unwrap();
+    let text = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("Request: Fix the websocket retry regression"));
+    assert!(text.contains("Outcome: The retry counter resets too soon"));
+    assert!(!text.contains("• prompt]"), "{text}");
+}
+
+#[test]
+fn recall_prefers_the_worker_summary_of_a_matched_turn() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    let result = workspace.hook(
+        "codex",
+        "later",
+        "UserPromptSubmit",
+        json!({"prompt":"Revisit the websocket retry regression"}),
+    );
+    let context: Value = serde_json::from_str(&result).unwrap();
+    let text = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("• summary]"), "{text}");
+    assert_eq!(
+        text.matches("The retry counter resets").count(),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
 fn ordinary_recall_is_relevant_and_does_not_repeat_the_same_evidence() {
     let workspace = Workspace::new();
     workspace.seed();

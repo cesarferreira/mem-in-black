@@ -398,19 +398,65 @@ fn recall(
         source,
         session,
     )?;
-    let selected: Vec<_> = candidates
-        .iter()
-        .filter(|record| {
-            let body = phrases(&record.body, true);
-            words
-                .iter()
-                .filter(|word| body.binary_search(word).is_ok())
-                .count()
-                >= 2
-        })
-        .take(3)
-        .collect();
-    record_context(store, workspace, source, session, &selected)
+    let mut evidence: Vec<Record> = Vec::new();
+    let mut matched = Vec::new();
+    for record in candidates.iter().filter(|record| {
+        let body = phrases(&record.body, true);
+        words
+            .iter()
+            .filter(|word| body.binary_search(word).is_ok())
+            .count()
+            >= 2
+    }) {
+        if evidence.len() == 3 {
+            break;
+        }
+        let Some(outcome) = outcome(store, record)? else {
+            continue;
+        };
+        matched.push(record);
+        if evidence.iter().all(|seen| seen.id != outcome.id)
+            && !store.was_delivered(source, session, outcome.id)?
+        {
+            evidence.push(outcome);
+        }
+    }
+    let shown: Vec<_> = evidence.iter().collect();
+    let context = render(workspace, &shown);
+    if let Some(text) = &context {
+        let delivered: Vec<_> = shown.iter().copied().chain(matched).collect();
+        store.record_delivery(source, session, &delivered, text.len())?;
+    }
+    Ok(context)
+}
+
+/// Replace a search hit with the evidence of what came of it. A past prompt is
+/// only useful with its outcome, so a prompt without a reply is dropped.
+fn outcome(store: &Store, record: &Record) -> Result<Option<Record>> {
+    let (reply, request) = match record.kind.as_str() {
+        "prompt" => match store.turn_reply(record)? {
+            Some(reply) => (reply, Some(record.body.clone())),
+            None => return Ok(None),
+        },
+        "assistant" => {
+            let request = store
+                .related(record, Some("prompt"), true, 1)?
+                .pop()
+                .map(|prompt| prompt.body);
+            (record.clone(), request)
+        }
+        _ => return Ok(Some(record.clone())),
+    };
+    if let Some(summary) = store.summary_of(&reply)? {
+        return Ok(Some(summary));
+    }
+    Ok(Some(match request {
+        Some(request) => Record {
+            body: format!("Request: {}\nOutcome: {}", cut(&request, 160), reply.body),
+            ..reply
+        },
+        None => reply,
+    }))
 }
 
 fn record_context(
@@ -451,8 +497,8 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
             record.id,
             record.kind,
             state,
-            if record.kind == "tool" {
-                excerpt(&record.body, 420)
+            if matches!(record.kind.as_str(), "tool" | "assistant") {
+                excerpt(&record.body, 520)
             } else {
                 cut(&record.body, 420).to_owned()
             }

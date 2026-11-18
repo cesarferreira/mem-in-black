@@ -14,7 +14,7 @@ use std::{
 const RECORD_COLUMNS: &str =
     "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id";
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Record {
     pub id: i64,
     pub source: String,
@@ -442,6 +442,43 @@ impl Store {
         )
     }
 
+    /// The latest assistant reply that answered `prompt`, before the session's next prompt.
+    pub fn turn_reply(&self, prompt: &Record) -> Result<Option<Record>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM events e
+                     WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3
+                       AND e.kind = 'assistant' AND e.id > ?4
+                       AND e.id < coalesce((SELECT min(n.id) FROM events n
+                           WHERE n.source = ?1 AND n.session = ?2 AND n.workspace = ?3
+                             AND n.kind = 'prompt' AND n.id > ?4), 9223372036854775807)
+                     ORDER BY e.id DESC LIMIT 1"
+                ),
+                params![prompt.source, prompt.session, prompt.workspace, prompt.id],
+                row_record,
+            )
+            .optional()?)
+    }
+
+    /// The worker summary built from an assistant reply, if the worker has processed it.
+    pub fn summary_of(&self, reply: &Record) -> Result<Option<Record>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM events e
+                     WHERE e.source = ?1 AND e.session = ?2 AND e.event_key = ?3"
+                ),
+                params![reply.source, reply.session, format!("summary:{}", reply.id)],
+                row_record,
+            )
+            .optional()?)
+    }
+
     pub fn details(&self, ids: &[i64]) -> Result<Vec<Record>> {
         let _guard = self.read_guard()?;
         let mut statement = self.db.prepare(&format!(
@@ -454,6 +491,14 @@ impl Store {
             }
         }
         Ok(records)
+    }
+
+    pub fn was_delivered(&self, source: &str, session: &str, id: i64) -> Result<bool> {
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM deliveries WHERE source = ?1 AND session = ?2 AND event_id = ?3)",
+            params![source, session, id], |row| row.get(0),
+        )?)
     }
 
     pub fn record_delivery(
