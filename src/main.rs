@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod distill;
+mod eval;
 mod hooks;
 mod import;
 mod install;
@@ -67,6 +68,13 @@ enum Command {
         #[arg(long, value_enum, default_value_t = preview::Color::Auto)]
         color: preview::Color,
     },
+    /// Benchmark retrieval against a Claude Mem database (development tool).
+    #[command(hide = true)]
+    Eval {
+        database: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        sample: usize,
+    },
     /// Delete records by ID, with the summaries built from them.
     Forget {
         #[arg(required = true)]
@@ -129,6 +137,12 @@ fn main() -> Result<()> {
             println!("Imported {count} records.");
         }
         Command::Export => Store::open(&data)?.export(io::stdout().lock())?,
+        Command::Eval { database, sample } => {
+            let temp = tempfile::tempdir()?;
+            let (store, queries) = eval::prepare(&database, &temp.path().join("data"), sample)?;
+            let report = eval::score(&store, &queries, &eval::lexical_methods())?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::Forget { ids } => {
             let removed = Store::open(&data)?.forget(&ids)?;
             println!("Forgot {removed} records.");

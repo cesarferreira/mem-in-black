@@ -550,6 +550,41 @@ impl Store {
         Ok(id)
     }
 
+    pub fn id_for_key(&self, key: &str) -> Result<Option<i64>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row("SELECT id FROM events WHERE event_key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Remove lines that start with any prefix from every record (benchmark setup).
+    pub fn strip_lines(&self, prefixes: &[&str]) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        let rows: Vec<(i64, String)> = transaction
+            .prepare("SELECT id, body FROM events")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, body) in rows {
+            let kept = body
+                .lines()
+                .filter(|line| !prefixes.iter().any(|prefix| line.starts_with(prefix)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if kept != body {
+                transaction.execute(
+                    "UPDATE events SET body = ?1 WHERE id = ?2",
+                    params![kept, id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn was_delivered(&self, source: &str, session: &str, id: i64) -> Result<bool> {
         let _guard = self.read_guard()?;
         Ok(self.db.query_row(
