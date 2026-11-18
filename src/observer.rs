@@ -1,6 +1,6 @@
 use crate::{
     hooks::{clean, cut, excerpt},
-    store::{Observation, Record, Store},
+    store::{Observation, Store},
     workspace::Workspace,
 };
 use anyhow::{Context, Result, ensure};
@@ -40,7 +40,7 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
     let Some(anchor) = store.observe_next()? else {
         return Ok(false);
     };
-    let records = store.related(&anchor, None, true, 12)?;
+    let records = store.related(&anchor, None, true, 60)?;
     let mut sources = Vec::new();
     for record in &records {
         if record.kind == "summary" {
@@ -65,17 +65,35 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
         .collect::<Vec<_>>()
         .join("\n");
     let generated = observer.and_then(|observer| summarize(observer, &evidence).ok());
-    let references = sources
+    let ids: Vec<_> = sources
         .iter()
         .map(|record| format!("[#{}]", record.id))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
+    // Keep the request and the latest events; timeline expands the rest.
+    let references = if ids.len() > 10 {
+        format!(
+            "{} … {} ({} records)",
+            ids[0],
+            ids[ids.len() - 8..].join(" "),
+            ids.len()
+        )
+    } else {
+        ids.join(" ")
+    };
+    let prompt = sources
+        .iter()
+        .find(|record| record.kind == "prompt")
+        .map(|record| record.body.as_str())
+        .unwrap_or_default();
+    let tools: Vec<_> = sources
+        .iter()
+        .filter(|record| record.kind == "tool")
+        .map(|record| record.body.as_str())
+        .collect();
+    let facts = crate::distill::distill(&anchor.workspace, prompt, &tools, &anchor.body);
     let (body, tokens) = match generated {
-        Some((summary, tokens)) => (
-            format!("Model summary. Evidence {references}\n{summary}"),
-            tokens,
-        ),
-        None => (local_summary(&anchor, &sources, &references), 0),
+        Some((summary, tokens)) => (facts.render("Model summary", &summary, &references), tokens),
+        None => (facts.render("Outcome", &anchor.body, &references), 0),
     };
     let workspace = Workspace {
         root: anchor.workspace.clone(),
@@ -96,24 +114,6 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
         tokens,
     )?;
     Ok(true)
-}
-
-fn local_summary(anchor: &Record, sources: &[&Record], references: &str) -> String {
-    let prompt = sources
-        .iter()
-        .find(|record| record.kind == "prompt")
-        .map(|record| cut(&record.body, 240))
-        .unwrap_or_default();
-    let last_tool = sources
-        .iter()
-        .rev()
-        .find(|record| record.kind == "tool")
-        .map(|record| excerpt(&record.body, 360))
-        .unwrap_or_default();
-    format!(
-        "Evidence {references}\nRequest: {prompt}\nLast tool: {last_tool}\nLatest agent update: {}",
-        cut(&anchor.body, 650)
-    )
 }
 
 fn summarize(observer: &Observer, evidence: &str) -> Result<(String, i64)> {

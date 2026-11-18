@@ -368,7 +368,20 @@ fn local_worker_builds_a_summary_with_source_references_and_no_model() {
     assert_eq!(summaries.len(), 1);
     let text = summaries[0]["body"].as_str().unwrap();
     assert!(text.contains("[#"));
-    assert!(text.contains("move the reset after handshake"));
+    assert!(
+        text.starts_with("Investigation: Fix the websocket retry regression"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Checks: `cargo test websocket_retry` → failed"),
+        "{text}"
+    );
+    assert!(text.contains("Next: move the reset after handshake."));
+    let preview = workspace.run_with_env(&["preview"], None, &[("NO_COLOR", "1")]);
+    assert!(
+        preview.contains("Summary  Investigation: Fix the websocket retry"),
+        "{preview}"
+    );
 }
 
 #[test]

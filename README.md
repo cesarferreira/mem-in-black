@@ -133,7 +133,7 @@ Import reads the source database and preserves original timestamps. Use a projec
 
 ## Optional model summaries
 
-The worker builds a compact summary locally from each completed turn. To opt in to an OpenAI-compatible observer for future summaries, create `observer.json` in the data directory and restart the worker.
+The worker builds a structured summary locally from each completed turn. It records the type of work, edited files, checks with their pass or fail result, error signatures, decisions, and the next step. No model is needed. To opt in to an OpenAI-compatible observer for future summaries, create `observer.json` in the data directory and restart the worker.
 
 ```json
 {

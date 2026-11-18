@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod distill;
 mod hooks;
 mod import;
 mod install;
