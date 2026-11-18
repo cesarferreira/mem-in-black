@@ -23,6 +23,9 @@ pub enum Target {
     OpenCode,
     Pi,
     Omp,
+    /// T3 Code's Codex and Claude Code providers.
+    #[value(name = "t3code", alias = "t3")]
+    T3Code,
 }
 
 pub fn install(
@@ -53,39 +56,44 @@ pub fn install(
     let selected_or_detected =
         |target, detected| selected == Some(target) || (selected.is_none() && detected);
 
+    let mut homes = Vec::new();
     if selected_or_detected(Target::Claude, true) {
-        changes.push(hooks_file(
-            claude_config.join("settings.json"),
-            exe,
-            data,
-            Host::Claude,
-        )?);
-        let path = if claude_config == home.join(".claude") {
-            home.join(".claude.json")
-        } else {
-            claude_config.join(".claude.json")
-        };
-        changes.push(stdio_mcp_file(path, exe, data)?);
+        homes.push((Host::Claude, claude_config.clone()));
     }
     if selected_or_detected(Target::Codex, true) {
-        changes.push(hooks_file(
-            codex_config.join("hooks.json"),
-            exe,
-            data,
-            Host::Codex,
-        )?);
-        let path = codex_config.join("config.toml");
-        let mut doc = read(&path)?.unwrap_or_default().parse::<DocumentMut>()?;
-        if let Some(existing) = doc.get("mcp_servers") {
-            ensure!(existing.is_table_like(), "mcp_servers must be a TOML table");
+        homes.push((Host::Codex, codex_config.clone()));
+    }
+    let t3 = t3_settings_path(&home, home_override.is_none());
+    if selected_or_detected(Target::T3Code, t3.is_file()) {
+        let providers = t3_provider_homes(&t3, &home)
+            .with_context(|| format!("reading T3 Code settings at {}", t3.display()))?;
+        ensure!(
+            !providers.is_empty(),
+            "no enabled Codex or Claude Code provider in {}",
+            t3.display()
+        );
+        homes.extend(providers);
+    }
+    homes.sort();
+    homes.dedup();
+    for (host, dir) in homes {
+        match host {
+            Host::Claude => {
+                changes.push(hooks_file(dir.join("settings.json"), exe, data, host)?);
+                // Claude Code keeps user MCP servers beside the default home, or
+                // inside a custom CLAUDE_CONFIG_DIR.
+                let path = if dir == home.join(".claude") {
+                    home.join(".claude.json")
+                } else {
+                    dir.join(".claude.json")
+                };
+                changes.push(stdio_mcp_file(path, exe, data)?);
+            }
+            Host::Codex => {
+                changes.push(hooks_file(dir.join("hooks.json"), exe, data, host)?);
+                changes.push(codex_mcp_file(dir.join("config.toml"), exe, data)?);
+            }
         }
-        doc["mcp_servers"]["quietmem"]["command"] = value(exe);
-        let mut args = Array::new();
-        for part in mcp_args(data) {
-            args.push(part);
-        }
-        doc["mcp_servers"]["quietmem"]["args"] = value(args);
-        changes.push((path, doc.to_string()));
     }
     let opencode = opencode_path(&home, home_override.is_none());
     if selected_or_detected(
@@ -128,6 +136,97 @@ pub fn install(
         }
     }
     Ok(())
+}
+
+fn codex_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(PathBuf, String)> {
+    let mut doc = read(&path)?.unwrap_or_default().parse::<DocumentMut>()?;
+    if let Some(existing) = doc.get("mcp_servers") {
+        ensure!(existing.is_table_like(), "mcp_servers must be a TOML table");
+    }
+    doc["mcp_servers"]["quietmem"]["command"] = value(exe);
+    let mut args = Array::new();
+    for part in mcp_args(data) {
+        args.push(part);
+    }
+    doc["mcp_servers"]["quietmem"]["args"] = value(args);
+    Ok((path, doc.to_string()))
+}
+
+fn t3_settings_path(home: &Path, read_environment: bool) -> PathBuf {
+    let root = read_environment
+        .then(|| std::env::var_os("T3CODE_HOME"))
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".t3"));
+    expand_home(&root, home).join("userdata/settings.json")
+}
+
+fn expand_home(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(relative) => home.join(relative),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// The config homes of T3 Code's enabled Codex and Claude Code providers.
+/// T3 stores only settings that differ from its defaults, so a built-in
+/// provider without an entry counts when its default home exists.
+fn t3_provider_homes(settings: &Path, home: &Path) -> Result<Vec<(Host, PathBuf)>> {
+    let document = read_json(settings)?;
+    let instances = document["providerInstances"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let legacy = document["providers"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut entries: Vec<(String, Value)> = instances.into_iter().collect();
+    for driver in ["codex", "claudeAgent"] {
+        if entries.iter().any(|(id, _)| id == driver) {
+            continue;
+        }
+        match legacy.get(driver) {
+            Some(config) => {
+                entries.push((driver.into(), json!({"driver": driver, "config": config})))
+            }
+            None => entries.push((driver.into(), json!({"driver": driver, "unsaved": true}))),
+        }
+    }
+    let mut homes = Vec::new();
+    for (_, instance) in entries {
+        let host = match instance["driver"].as_str() {
+            Some("codex") => Host::Codex,
+            Some("claudeAgent") => Host::Claude,
+            _ => continue,
+        };
+        let config = &instance["config"];
+        if instance["enabled"] == false || config["enabled"] == false {
+            continue;
+        }
+        let (variable, default) = match host {
+            Host::Codex => ("CODEX_HOME", ".codex"),
+            Host::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
+        };
+        let from_environment = instance["environment"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["name"] == variable && entry["sensitive"] != true)
+            .and_then(|entry| entry["value"].as_str());
+        let dir = config["homePath"]
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .or(from_environment)
+            .map(|path| expand_home(Path::new(path.trim()), home))
+            .unwrap_or_else(|| home.join(default));
+        if instance["unsaved"] == true && !dir.is_dir() {
+            continue;
+        }
+        homes.push((host, dir));
+    }
+    Ok(homes)
 }
 
 fn mcp_args(data: Option<&str>) -> Vec<&str> {

@@ -1697,3 +1697,63 @@ fn idle_model_unloads_and_reloads_on_the_next_query() {
     workspace.run(&["stop"], None);
     worker.wait().unwrap();
 }
+
+#[test]
+fn t3code_install_configures_each_enabled_provider_home() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("t3 home");
+    let custom_claude = home.join("t3-claude");
+    let settings = home.join(".t3/userdata/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        &settings,
+        json!({
+            "providerInstances": {
+                "claude-work": {"driver": "claudeAgent", "config": {"homePath": custom_claude}},
+                "codex-off": {"driver": "codex", "enabled": false, "config": {"homePath": home.join("unused-codex")}}
+            },
+            "providers": {"codex": {"binaryPath": "codex"}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    workspace.run(
+        &[
+            "install",
+            "--home",
+            home.to_str().unwrap(),
+            "--host",
+            "t3code",
+        ],
+        None,
+    );
+    let claude: Value =
+        serde_json::from_slice(&std::fs::read(custom_claude.join("settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        claude["hooks"]["UserPromptSubmit"]
+            .to_string()
+            .contains("hook claude")
+    );
+    let mcp: Value =
+        serde_json::from_slice(&std::fs::read(custom_claude.join(".claude.json")).unwrap())
+            .unwrap();
+    assert!(mcp["mcpServers"]["quietmem"].is_object());
+    let codex_hooks = std::fs::read_to_string(home.join(".codex/hooks.json")).unwrap();
+    assert!(codex_hooks.contains("hook codex"));
+    let codex_config: toml_edit::DocumentMut =
+        std::fs::read_to_string(home.join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert!(codex_config["mcp_servers"]["quietmem"]["command"].is_str());
+    assert!(
+        !home.join("unused-codex").exists(),
+        "disabled provider is skipped"
+    );
+    assert!(
+        !home.join(".claude/settings.json").exists(),
+        "only T3's providers are configured with --host t3code"
+    );
+}
