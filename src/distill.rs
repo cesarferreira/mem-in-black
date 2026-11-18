@@ -7,6 +7,7 @@ pub struct Facts {
     pub kind: &'static str,
     pub title: String,
     pub files: Vec<String>,
+    pub explored: Vec<String>,
     pub checks: Vec<(String, &'static str)>,
     pub errors: Vec<String>,
     pub decision: Option<String>,
@@ -18,6 +19,25 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
     let mut facts = Facts::default();
     for body in tools {
         edited_paths(body, root, &mut facts.files);
+        let first = body.lines().next().unwrap_or_default();
+        let explored = first
+            .strip_prefix("Read ")
+            .map(|path| relative(path, root).to_owned())
+            .or_else(|| {
+                ["Grep ", "Glob "]
+                    .iter()
+                    .find_map(|tool| first.strip_prefix(tool))
+                    .map(|rest| {
+                        rest.rsplit_once(" in ")
+                            .map_or(rest, |(pattern, _)| pattern)
+                    })
+                    .map(|pattern| format!("/{}/", cut(pattern.trim(), 60)))
+            });
+        if let Some(item) = explored
+            && !facts.explored.contains(&item)
+        {
+            facts.explored.push(item);
+        }
         let Some((command, output)) = shell(body) else {
             continue;
         };
@@ -37,6 +57,8 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         }
     }
     facts.files.truncate(8);
+    facts.explored.retain(|item| !facts.files.contains(item));
+    facts.explored.truncate(8);
     let checks = facts.checks.len();
     facts.checks.drain(..checks.saturating_sub(4));
     facts.errors.truncate(3);
@@ -115,6 +137,9 @@ impl Facts {
         if !self.files.is_empty() {
             text.push_str(&format!("\nFiles: {}", self.files.join(", ")));
         }
+        if !self.explored.is_empty() {
+            text.push_str(&format!("\nExplored: {}", self.explored.join(", ")));
+        }
         if !self.checks.is_empty() {
             let checks = self
                 .checks
@@ -144,11 +169,7 @@ impl Facts {
 
 fn edited_paths(body: &str, root: &str, files: &mut Vec<String>) {
     let mut push = |path: &str| {
-        let path = path.trim();
-        let path = path
-            .strip_prefix(root)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .unwrap_or(path);
+        let path = relative(path, root);
         if !path.is_empty() && !files.iter().any(|seen| seen == path) {
             files.push(path.to_owned());
         }
@@ -175,6 +196,13 @@ fn edited_paths(body: &str, root: &str, files: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn relative<'a>(path: &'a str, root: &str) -> &'a str {
+    let path = path.trim();
+    path.strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
 }
 
 fn shell(body: &str) -> Option<(&str, &str)> {
@@ -334,6 +362,9 @@ mod tests {
             "Bash command: cargo test websocket_retry\nResult:\nthread 'x' panicked at src/ws.rs:4\nerror: test failed",
             "apply_patch *** Update File: src/retry.rs\n*** Add File: tests/retry.rs",
             "Bash command: ls\nResult:\nsrc",
+            "Read /repo/src/ws.rs",
+            "Read /repo/src/handshake.rs",
+            "Grep reset_counter in /repo/src\nMatches: 1 files",
         ];
         let facts = distill(
             "/repo",
@@ -347,6 +378,7 @@ mod tests {
             facts.checks,
             [("cargo test websocket_retry".to_owned(), "failed")]
         );
+        assert_eq!(facts.explored, ["src/handshake.rs", "/reset_counter/"]);
         assert_eq!(facts.errors.len(), 2);
         assert!(facts.decision.unwrap().contains("because the handshake"));
         assert_eq!(facts.next.as_deref(), Some("add a soak test."));

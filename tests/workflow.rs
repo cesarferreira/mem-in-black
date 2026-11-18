@@ -1254,3 +1254,78 @@ fn pi_install_expands_a_home_relative_profile() {
     );
     assert!(!workspace.repo.join("~").exists());
 }
+
+#[test]
+fn reads_searches_and_web_lookups_are_captured_without_file_contents() {
+    let workspace = Workspace::new();
+    let repo = workspace.repo.to_str().unwrap();
+    workspace.hook(
+        "claude",
+        "explore",
+        "UserPromptSubmit",
+        json!({"prompt":"Why does the handshake reset the retry counter"}),
+    );
+    for (id, tool, input, response) in [
+        (
+            "t1",
+            "Read",
+            json!({"file_path": format!("{repo}/src/handshake.rs")}),
+            json!({"file":{"content":"SECRET_FILE_BODY"}}),
+        ),
+        (
+            "t2",
+            "Grep",
+            json!({"pattern":"reset_counter","path":repo}),
+            json!({"filenames":["src/handshake.rs","src/retry.rs"],"numFiles":2}),
+        ),
+        (
+            "t3",
+            "WebFetch",
+            json!({"url":"https://example.com/rfc6455","prompt":"close codes"}),
+            json!({"result":"Close code 1006 means abnormal closure"}),
+        ),
+        (
+            "t4",
+            "Edit",
+            json!({"file_path": format!("{repo}/src/retry.rs"),"old_string":"a\nb","new_string":"a\nb\nc"}),
+            json!({}),
+        ),
+        (
+            "t5",
+            "mcp__slack__read",
+            json!({"channel":"x"}),
+            json!({"text":"PRIVATE_SLACK_MESSAGE"}),
+        ),
+    ] {
+        workspace.hook(
+            "claude",
+            "explore",
+            "PostToolUse",
+            json!({"tool_name":tool,"tool_use_id":id,"tool_input":input,"tool_response":response}),
+        );
+    }
+    workspace.hook(
+        "claude",
+        "explore",
+        "Stop",
+        json!({"last_assistant_message":"The handshake resets it. Next: move the reset."}),
+    );
+    workspace.run(&["observe"], None);
+    let export = workspace.run(&["export"], None);
+    assert!(!export.contains("SECRET_FILE_BODY"));
+    assert!(!export.contains("PRIVATE_SLACK_MESSAGE"));
+    assert!(export.contains("Matches: 2 files"));
+    assert!(export.contains("Close code 1006 means abnormal closure"));
+    assert!(export.contains("Lines: +3 -2"));
+    let summary: Value = export
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|row| row["kind"] == "summary")
+        .unwrap();
+    let body = summary["body"].as_str().unwrap();
+    assert!(body.contains("Files: src/retry.rs"), "{body}");
+    assert!(
+        body.contains("Explored: src/handshake.rs, /reset_counter/"),
+        "{body}"
+    );
+}

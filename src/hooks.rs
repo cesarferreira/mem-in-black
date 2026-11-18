@@ -174,7 +174,55 @@ fn tool_record(event: &Input) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n");
         let detail = path.and_then(Value::as_str).unwrap_or(&paths);
-        return Some(format!("{name} {detail}"));
+        let (added, removed) = line_changes(name, &event.tool_input);
+        return Some(format!("{name} {detail}\nLines: +{added} -{removed}"));
+    }
+    let input = |key: &str| event.tool_input.get(key).and_then(Value::as_str);
+    match name {
+        "Read" | "NotebookRead" => {
+            return input("file_path")
+                .or_else(|| input("notebook_path"))
+                .map(|path| format!("Read {}", cut(path, 300)));
+        }
+        "Grep" | "Glob" => {
+            let pattern = clean(input("pattern")?, 200);
+            let scope = input("path").map(|path| format!(" in {}", cut(path, 200)));
+            let files: Vec<_> = event
+                .tool_response
+                .get("filenames")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let shown = files
+                .iter()
+                .take(8)
+                .map(|file| cut(file, 200))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(format!(
+                "{name} {pattern}{}\nMatches: {} files\n{shown}",
+                scope.unwrap_or_default(),
+                files.len()
+            ));
+        }
+        "WebFetch" | "WebSearch" => {
+            let target = input("url").or_else(|| input("query"))?;
+            let result = match &event.tool_response {
+                Value::String(text) => text.clone(),
+                value => value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| value.to_string(), str::to_owned),
+            };
+            return Some(format!(
+                "{name} {}\nResult:\n{}",
+                clean(target, 400),
+                excerpt(&clean(&result, 16 * 1024), 600)
+            ));
+        }
+        _ => {}
     }
     let command = event.tool_input.get("command").and_then(Value::as_str);
     if matches!(
@@ -194,6 +242,45 @@ fn tool_record(event: &Input) -> Option<String> {
         ));
     }
     None
+}
+
+fn line_changes(name: &str, input: &Value) -> (usize, usize) {
+    let lines = |key: &str, value: &Value| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map_or(0, |text| text.lines().count())
+    };
+    match name {
+        "Edit" => (lines("new_string", input), lines("old_string", input)),
+        "Write" => (lines("content", input), 0),
+        "MultiEdit" => input
+            .get("edits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .fold((0, 0), |(added, removed), edit| {
+                (
+                    added + lines("new_string", edit),
+                    removed + lines("old_string", edit),
+                )
+            }),
+        _ => {
+            let patch = ["patch", "input", "command"]
+                .iter()
+                .find_map(|key| input.get(*key).and_then(Value::as_str))
+                .unwrap_or_default();
+            patch.lines().fold((0, 0), |(added, removed), line| {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    (added + 1, removed)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    (added, removed + 1)
+                } else {
+                    (added, removed)
+                }
+            })
+        }
+    }
 }
 
 pub fn cut(text: &str, limit: usize) -> &str {

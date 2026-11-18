@@ -93,7 +93,7 @@ quietmem export > quietmem.jsonl
 
 Open the private `viewer_url` from `quietmem status` for a local search and activity view. The worker starts on the first hook. `quietmem serve` starts it in the foreground, and `quietmem stop` stops it until the next hook. Set `QUIETMEM_NO_AUTOSTART=1` to keep the worker stopped while hooks continue recording. Use `QUIETMEM_DEBUG=1` for hook error output.
 
-The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering.
+The default data directory is `$XDG_DATA_HOME/quietmem`, or `~/.local/share/quietmem` if XDG data storage is unset. Override it with `QUIETMEM_DATA_DIR` or `--data-dir`. A prompt containing `<private>…</private>` suppresses capture for that turn. Shell captures contain bounded snippets and heuristic credential filtering. File reads record the path only. Searches record the pattern and matching file names, and edits record paths and line counts, not file contents. Web lookups keep a short excerpt. MCP tool results are not captured.
 
 Other harnesses can register the command `quietmem mcp` for stdio. The server provides `search`, `timeline`, `get_observations`, and `save_memory`. Automatic capture and recall require that harness's hooks or adapter.
 
