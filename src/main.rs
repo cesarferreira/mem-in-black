@@ -200,7 +200,7 @@ fn main() -> Result<()> {
             let mut report = eval::score(&store, &queries, &eval::lexical_methods())?;
             for name in models {
                 let spec = embed::spec(&name)?;
-                embed::install(&data.directory, spec)?;
+                embed::install(&data.directory, spec, io::stderr().is_terminal())?;
                 let embedder = embed::Embedder::load(&data.directory, spec)?;
                 let mut index = embed::Index::default();
                 eval::embed_all(&store, &embedder, &mut index)?;
@@ -239,7 +239,8 @@ fn main() -> Result<()> {
                     spec.repo,
                     &spec.revision[..12]
                 );
-                embed::install(&data.directory, spec)?;
+                embed::install(&data.directory, spec, io::stderr().is_terminal())?;
+                eprintln!("Verified. Checking that the model loads…");
                 embed::Embedder::load(&data.directory, spec)?.embed_query("check")?;
                 embed::configure(&data.directory, Some(spec))?;
                 let _ = daemon::stop(&data);

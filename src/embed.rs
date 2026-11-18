@@ -167,8 +167,11 @@ pub fn model_dir(data: &Path, spec: &Spec) -> PathBuf {
 }
 
 /// Download any missing model files and verify them. Returns the model directory.
-pub fn install(data: &Path, spec: &Spec) -> Result<PathBuf> {
+/// With `show_progress`, a live progress line is drawn on stderr.
+pub fn install(data: &Path, spec: &Spec, show_progress: bool) -> Result<PathBuf> {
     let dir = model_dir(data, spec);
+    let total: u64 = spec.files.iter().map(|(_, _, size)| size).sum();
+    let mut progress = Progress::new(total, show_progress);
     crate::store::prepare_dir(&dir)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(20)))
@@ -179,6 +182,7 @@ pub fn install(data: &Path, spec: &Spec) -> Result<PathBuf> {
     for (file, digest, size) in spec.files {
         let path = dir.join(file);
         if fs::metadata(&path).is_ok_and(|meta| meta.len() == size) {
+            progress.advance(size, false);
             continue;
         }
         let url = format!(
@@ -202,6 +206,7 @@ pub fn install(data: &Path, spec: &Spec) -> Result<PathBuf> {
             hasher.update(&buffer[..read]);
             temp.write_all(&buffer[..read])?;
             written += read as u64;
+            progress.advance(read as u64, true);
         }
         let actual: String = hasher
             .finalize()
@@ -215,7 +220,81 @@ pub fn install(data: &Path, spec: &Spec) -> Result<PathBuf> {
         );
         temp.persist(&path)?;
     }
+    progress.finish();
     Ok(dir)
+}
+
+/// A single self-overwriting stderr line: downloaded / total, percent, speed.
+struct Progress {
+    total: u64,
+    done: u64,
+    fetched: u64,
+    started: std::time::Instant,
+    drawn: Option<std::time::Instant>,
+    visible: bool,
+}
+
+impl Progress {
+    fn new(total: u64, visible: bool) -> Self {
+        Self {
+            total,
+            done: 0,
+            fetched: 0,
+            started: std::time::Instant::now(),
+            drawn: None,
+            visible,
+        }
+    }
+
+    /// `fetched` separates bytes from the network from files already on disk,
+    /// so the speed reflects the download only.
+    fn advance(&mut self, bytes: u64, fetched: bool) {
+        self.done += bytes;
+        if fetched {
+            self.fetched += bytes;
+        }
+        if self
+            .drawn
+            .is_none_or(|drawn| drawn.elapsed() >= Duration::from_millis(100))
+        {
+            self.draw();
+        }
+    }
+
+    fn draw(&mut self) {
+        if !self.visible {
+            return;
+        }
+        self.drawn = Some(std::time::Instant::now());
+        let line = progress_line(self.done, self.total, self.fetched, self.started.elapsed());
+        eprint!("\r\x1b[2K{line}");
+    }
+
+    fn finish(&mut self) {
+        if self.visible && self.drawn.is_some() {
+            self.draw();
+            eprintln!();
+        }
+    }
+}
+
+fn progress_line(done: u64, total: u64, fetched: u64, elapsed: Duration) -> String {
+    const MB: f64 = 1_000_000.0;
+    let percent = (done as f64 / total.max(1) as f64 * 100.0).min(100.0);
+    let width = 24;
+    let filled = ((percent / 100.0) * width as f64).round() as usize;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+    let seconds = elapsed.as_secs_f64();
+    let speed = if seconds > 0.2 {
+        format!("  {:.1} MB/s", fetched as f64 / MB / seconds)
+    } else {
+        String::new()
+    };
+    format!(
+        "  {bar} {:>5.1} / {:.1} MB  {percent:>3.0}%{speed}",
+        done as f64 / MB,
+        total as f64 / MB
+    )
 }
 
 pub fn installed(data: &Path, spec: &Spec) -> bool {
@@ -461,6 +540,20 @@ pub fn from_bytes(bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_line_shows_size_percent_and_speed() {
+        let line = progress_line(
+            218_000_000,
+            436_000_000,
+            218_000_000,
+            Duration::from_secs(10),
+        );
+        assert!(line.contains("218.0 / 436.0 MB"), "{line}");
+        assert!(line.contains(" 50%"), "{line}");
+        assert!(line.contains("21.8 MB/s"), "{line}");
+        assert_eq!(line.matches('█').count(), 12);
+    }
 
     #[test]
     fn fusion_rewards_agreement_between_rankings() {
