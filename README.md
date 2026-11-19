@@ -29,7 +29,7 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 
 | What you get | |
 | --- | --- |
-| New sessions know past work | Each prompt gets the outcome of matching earlier work, not your old questions |
+| New sessions know past work | Claude Code and Codex get the outcome of matching earlier work with automatic recall |
 | Switch agents mid-task | Ask Codex to "continue the work I started in Claude", or the other way round |
 | Model tokens spent on memory | **0**: summaries are built locally |
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
@@ -57,16 +57,16 @@ mib install
 
 `mib install` configures every supported agent it finds and keeps your
 existing hooks and MCP servers. Restart your agents afterwards. Codex asks you to
-trust the new hooks once.
+trust the new hooks once. Capture starts with new activity after the hooks load.
 
-| Agent | Automatic capture and recall | Memory search (MCP) | Configured by `mib install` |
+| Agent | Automatic capture | Memory search (MCP) | Configured by `mib install` |
 | --- | --- | --- | --- |
 | Claude Code | ✓ | ✓ | Always |
 | Codex | ✓ | ✓ | Always |
 | T3 Code (Codex and Claude Code providers) | ✓ | ✓ | When T3 Code is set up, or `--host t3code` |
-| OpenCode | | ✓ | When installed, or `--host opencode` |
-| Pi | | ✓ | When installed. `--host pi` adds a startup preview |
-| Oh My Pi | | ✓ | When installed, or `--host omp` (`OMP_PROFILE=work` for a profile) |
+| OpenCode | ✓ | ✓ | OpenCode 2.3+, or OpenCode 1.18.29+ with a running V1 server |
+| Pi | ✓ | ✓ | When installed. `--host pi` adds a startup preview |
+| Oh My Pi | ✓ | ✓ | When installed, or `--host omp` (`OMP_PROFILE=work` for a profile) |
 | Any MCP client | | ✓ | Register the stdio command `mib mcp` |
 
 T3 Code support configures the home of each enabled provider in
@@ -82,7 +82,7 @@ Rename any `QUIETMEM_*` environment variables to `MIB_*`.
 
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
-- **Recall.** A prompt that matches earlier work gets that work's outcome: the request, files, test results, decision and next step. A prompt with no match gets nothing.
+- **Recall.** Claude Code and Codex automatically get relevant outcomes when a prompt matches earlier work, including the request, files, test results, decisions and next step. Agents can also search memory through MCP.
 - **Handoff.** In the same worktree, ask one agent to *continue the work I started in Claude* or *resume the latest Codex task*. Evidence from a different Git commit is flagged.
 - **Startup preview.** A new session shows recent activity for the worktree. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.

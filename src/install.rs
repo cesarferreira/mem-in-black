@@ -100,6 +100,7 @@ pub fn install(
                 changes.push(hooks_file(dir.join("hooks.json"), exe, data, host)?);
                 changes.push(codex_mcp_file(dir.join("config.toml"), exe, data)?);
             }
+            _ => unreachable!("only Claude Code and Codex use JSON hooks"),
         }
     }
     let opencode = opencode_path(&home, home_override.is_none());
@@ -108,6 +109,14 @@ pub fn install(
         opencode.parent().is_some_and(Path::is_dir),
     ) {
         changes.push(opencode_mcp_file(opencode, exe, data)?);
+        let plugin_dir = opencode_config_dir(&home, home_override.is_none());
+        changes.push(capture_file(
+            &plugin_dir.join("plugins"),
+            exe,
+            data,
+            Host::OpenCode,
+            include_str!("opencode-capture.js"),
+        )?);
     }
 
     let pi = match home_override
@@ -125,6 +134,13 @@ pub fn install(
     };
     if selected_or_detected(Target::Pi, pi.is_dir()) {
         changes.push(stdio_mcp_file(pi.join("mcp.json"), exe, data)?);
+        changes.push(capture_file(
+            &pi.join("extensions"),
+            exe,
+            data,
+            Host::Pi,
+            include_str!("pi-capture.js"),
+        )?);
         let legacy = legacy_pi_extension(&pi)?;
         if selected == Some(Target::Pi) || legacy.is_some() {
             changes.push(pi_extension_file(&pi, exe, data)?);
@@ -136,6 +152,13 @@ pub fn install(
         let omp = omp_agent_dir(&home, home_override.is_none())?;
         if selected_or_detected(Target::Omp, omp.is_dir()) {
             changes.push(stdio_mcp_file(omp.join("mcp.json"), exe, data)?);
+            changes.push(capture_file(
+                &omp.join("hooks/pre"),
+                exe,
+                data,
+                Host::Omp,
+                include_str!("pi-capture.js"),
+            )?);
         }
     }
 
@@ -216,19 +239,15 @@ fn t3_provider_homes(settings: &Path, home: &Path) -> Result<Vec<(Host, PathBuf)
     }
     let mut homes = Vec::new();
     for (_, instance) in entries {
-        let host = match instance["driver"].as_str() {
-            Some("codex") => Host::Codex,
-            Some("claudeAgent") => Host::Claude,
+        let (host, variable, default) = match instance["driver"].as_str() {
+            Some("codex") => (Host::Codex, "CODEX_HOME", ".codex"),
+            Some("claudeAgent") => (Host::Claude, "CLAUDE_CONFIG_DIR", ".claude"),
             _ => continue,
         };
         let config = &instance["config"];
         if instance["enabled"] == false || config["enabled"] == false {
             continue;
         }
-        let (variable, default) = match host {
-            Host::Codex => ("CODEX_HOME", ".codex"),
-            Host::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
-        };
         let from_environment = instance["environment"]
             .as_array()
             .into_iter()
@@ -293,12 +312,7 @@ fn opencode_path(home: &Path, read_environment: bool) -> PathBuf {
     if read_environment && let Some(path) = std::env::var_os("OPENCODE_CONFIG") {
         return PathBuf::from(path);
     }
-    let config_home = read_environment
-        .then(|| std::env::var_os("XDG_CONFIG_HOME"))
-        .flatten()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let directory = config_home.join("opencode");
+    let directory = opencode_config_dir(home, read_environment);
     let json = directory.join("opencode.json");
     let jsonc = directory.join("opencode.jsonc");
     if !json.is_file() && jsonc.is_file() {
@@ -306,6 +320,20 @@ fn opencode_path(home: &Path, read_environment: bool) -> PathBuf {
     } else {
         json
     }
+}
+
+fn opencode_config_dir(home: &Path, read_environment: bool) -> PathBuf {
+    if read_environment
+        && let Some(path) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|path| !path.is_empty())
+    {
+        return expand_home(Path::new(&path), home);
+    }
+    read_environment
+        .then(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .flatten()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("opencode")
 }
 
 fn omp_agent_dir(home: &Path, read_environment: bool) -> Result<PathBuf> {
@@ -420,6 +448,30 @@ fn pi_extension_file(
         );
     }
     Ok((path, extension))
+}
+
+fn capture_file(
+    directory: &Path,
+    binary: &str,
+    data: Option<&str>,
+    host: Host,
+    adapter: &str,
+) -> Result<(PathBuf, String)> {
+    const MARKER: &str = "// Installed by Mem in Black\n";
+    let path = directory.join(format!("{NAME}-capture.js"));
+    if let Some(existing) = read(&path)? {
+        ensure!(
+            existing.starts_with(MARKER),
+            "another hook exists at {}",
+            path.display()
+        );
+    }
+    let config = json!({"binary": binary, "dataDirectory": data, "host": host.name()});
+    let bridge = include_str!("capture.js");
+    Ok((
+        path,
+        format!("{MARKER}const meminblack = {config};\n{bridge}\n{adapter}"),
+    ))
 }
 
 /// The startup extension written before the rename, if Mem in Black wrote it.

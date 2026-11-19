@@ -1309,7 +1309,46 @@ fn opencode_v2_install_keeps_jsonc_comments_and_registers_nested_stdio() {
         json!(["other"])
     );
     assert_eq!(parsed["mcp"]["servers"]["meminblack"]["type"], "local");
+    assert!(
+        home.join(".config/opencode/plugins/meminblack-capture.js")
+            .is_file()
+    );
     assert!(!home.join(".codex").exists());
+}
+
+#[test]
+fn default_install_uses_the_custom_opencode_config_directory() {
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("custom-opencode-home");
+    let config = home.join("my-opencode");
+    std::fs::create_dir_all(&config).unwrap();
+    let settings = config.join("opencode.jsonc");
+    std::fs::write(&settings, "{\n// keep my config\n}\n").unwrap();
+    let mut install = workspace.command();
+    let output = install
+        .args(["install"])
+        .env("HOME", &home)
+        .env("OPENCODE_CONFIG_DIR", &config)
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env_remove("OPENCODE_CONFIG")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("T3CODE_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OMP_PROFILE")
+        .env_remove("PI_PROFILE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let jsonc = std::fs::read_to_string(settings).unwrap();
+    assert!(jsonc.contains("// keep my config"));
+    assert!(jsonc.contains("meminblack"));
+    assert!(config.join("plugins/meminblack-capture.js").is_file());
+    assert!(!home.join("xdg-config/opencode").exists());
 }
 
 #[test]
@@ -1339,6 +1378,10 @@ fn omp_install_targets_the_active_named_profile() {
         "mcp"
     );
     assert!(!override_path.exists());
+    assert!(
+        home.join(".custom-omp/profiles/work/agent/hooks/pre/meminblack-capture.js")
+            .is_file()
+    );
 }
 
 #[test]
@@ -1354,6 +1397,10 @@ fn pi_install_expands_a_home_relative_profile() {
         ],
     );
     assert!(home.join("pi-profile/mcp.json").is_file());
+    assert!(
+        home.join("pi-profile/extensions/meminblack-capture.js")
+            .is_file()
+    );
     assert!(
         home.join("pi-profile/extensions/meminblack-startup.js")
             .is_file()

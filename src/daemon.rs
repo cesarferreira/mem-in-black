@@ -602,6 +602,9 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         let agent = escape(match item.source.as_str() {
             "claude" => "Claude Code",
             "codex" => "Codex",
+            "opencode" => "OpenCode",
+            "pi" => "Pi",
+            "omp" => "Oh My Pi",
             "claude-mem" => "Claude-Mem",
             "manual" => "Manual note",
             "" => "Unknown source",

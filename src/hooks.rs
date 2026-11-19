@@ -12,6 +12,10 @@ use std::{io::Read, path::PathBuf};
 pub enum Host {
     Claude,
     Codex,
+    #[value(name = "opencode")]
+    OpenCode,
+    Pi,
+    Omp,
 }
 
 impl Host {
@@ -19,7 +23,14 @@ impl Host {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
         }
+    }
+
+    fn injects_recall(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
     }
 }
 
@@ -74,6 +85,7 @@ pub fn handle(
                 crate::preview::color_allowed(),
             ),
             Host::Codex => (3, false),
+            _ => return Ok(None),
         };
         return Ok(crate::preview::render(store, &workspace, limit, color)?
             .map(|message| json!({"systemMessage": message})));
@@ -120,8 +132,12 @@ pub fn handle(
                 return Ok(None);
             }
             let prompt = clean(&event.prompt, 1600);
-            let context = recall(store, &workspace, source, session, &prompt, semantic)
-                .context("selecting context")?;
+            let context = if host.injects_recall() {
+                recall(store, &workspace, source, session, &prompt, semantic)
+                    .context("selecting context")?
+            } else {
+                None
+            };
             let key = turn_id.map(|turn| format!("prompt:{turn}"));
             write("prompt", &prompt, key.as_deref(), event.prompt.len())
                 .context("storing prompt")?;
@@ -219,25 +235,22 @@ fn tool_record(event: &Input) -> Option<String> {
         "Grep" | "Glob" => {
             let pattern = clean(input("pattern")?, 200);
             let scope = input("path").map(|path| format!(" in {}", cut(path, 200)));
-            let files: Vec<_> = event
+            let matches = event
                 .tool_response
                 .get("filenames")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
-            let shown = files
-                .iter()
-                .take(8)
-                .map(|file| cut(file, 200))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Some(format!(
-                "{name} {pattern}{}\nMatches: {} files\n{shown}",
-                scope.unwrap_or_default(),
-                files.len()
-            ));
+                .and_then(Value::as_array);
+            let mut summary = format!("{name} {pattern}{}", scope.unwrap_or_default());
+            if let Some(matches) = matches {
+                let files: Vec<_> = matches.iter().filter_map(Value::as_str).collect();
+                let shown = files
+                    .iter()
+                    .take(8)
+                    .map(|file| cut(file, 200))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                summary.push_str(&format!("\nMatches: {} files\n{shown}", files.len()));
+            }
+            return Some(summary);
         }
         "WebFetch" | "WebSearch" => {
             let target = input("url").or_else(|| input("query"))?;

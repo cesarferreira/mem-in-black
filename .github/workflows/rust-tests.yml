@@ -38,3 +38,5 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo nextest run --locked --no-tests=pass
+      - name: Agent capture fixtures
+        run: MIB_TEST_BINARY="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)/debug/mib" node --test tests/capture-hooks.mjs

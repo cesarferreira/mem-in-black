@@ -66,6 +66,9 @@ pub fn render(
         let (source, source_style) = match row.source.as_str() {
             "claude" => ("Claude", "35"),
             "codex" => ("Codex", "36"),
+            "opencode" => ("OpenCode", "36"),
+            "pi" => ("Pi", "35"),
+            "omp" => ("Oh My Pi", "35"),
             "manual" => ("Local", "37"),
             "claude-mem" => ("Import", "37"),
             _ => ("Agent", "37"),
