@@ -1,4 +1,8 @@
-use crate::{config::NAME, hooks::Host, store::prepare_dir};
+use crate::{
+    config::{LEGACY_NAMES, NAME},
+    hooks::Host,
+    store::prepare_dir,
+};
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
 use jsonc_parser::{
@@ -17,9 +21,11 @@ use toml_edit::{Array, DocumentMut, value};
 
 /// MCP server name and hook marker from before the rename. Install moves
 /// those entries to the current name and keeps their other settings.
-const LEGACY_NAME: &str = "quietmem";
-const HOOK_MARKER: &str = " # meminblack-managed";
-const LEGACY_HOOK_MARKER: &str = " # quietmem-managed";
+const HOOK_MARKER: &str = " # mem-in-black-managed";
+const LEGACY_HOOK_MARKERS: [&str; 2] = [" # meminblack-managed", " # quietmem-managed"];
+/// The first line of every file the installer writes.
+const FILE_MARKER: &str = "// Installed by Mem in Black\n";
+const LEGACY_FILE_MARKERS: [&str; 2] = [FILE_MARKER, "// Installed by QuietMem\n"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Target {
@@ -109,9 +115,10 @@ pub fn install(
         opencode.parent().is_some_and(Path::is_dir),
     ) {
         changes.push(opencode_mcp_file(opencode, exe, data)?);
-        let plugin_dir = opencode_config_dir(&home, home_override.is_none());
+        let plugin_dir = opencode_config_dir(&home, home_override.is_none()).join("plugins");
+        removals.extend(legacy_files(&plugin_dir, "capture")?);
         changes.push(capture_file(
-            &plugin_dir.join("plugins"),
+            &plugin_dir,
             exe,
             data,
             Host::OpenCode,
@@ -134,6 +141,7 @@ pub fn install(
     };
     if selected_or_detected(Target::Pi, pi.is_dir()) {
         changes.push(stdio_mcp_file(pi.join("mcp.json"), exe, data)?);
+        removals.extend(legacy_files(&pi.join("extensions"), "capture")?);
         changes.push(capture_file(
             &pi.join("extensions"),
             exe,
@@ -141,8 +149,8 @@ pub fn install(
             Host::Pi,
             include_str!("pi-capture.js"),
         )?);
-        let legacy = legacy_pi_extension(&pi)?;
-        if selected == Some(Target::Pi) || legacy.is_some() {
+        let legacy = legacy_files(&pi.join("extensions"), "startup")?;
+        if selected == Some(Target::Pi) || !legacy.is_empty() {
             changes.push(pi_extension_file(&pi, exe, data)?);
         }
         removals.extend(legacy);
@@ -152,6 +160,7 @@ pub fn install(
         let omp = omp_agent_dir(&home, home_override.is_none())?;
         if selected_or_detected(Target::Omp, omp.is_dir()) {
             changes.push(stdio_mcp_file(omp.join("mcp.json"), exe, data)?);
+            removals.extend(legacy_files(&omp.join("hooks/pre"), "capture")?);
             changes.push(capture_file(
                 &omp.join("hooks/pre"),
                 exe,
@@ -181,10 +190,14 @@ fn codex_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(PathB
     if let Some(servers) = doc
         .get_mut("mcp_servers")
         .and_then(|item| item.as_table_like_mut())
-        && let Some(legacy) = servers.remove(LEGACY_NAME)
-        && servers.get(NAME).is_none()
     {
-        servers.insert(NAME, legacy);
+        for name in LEGACY_NAMES {
+            if let Some(legacy) = servers.remove(name)
+                && servers.get(NAME).is_none()
+            {
+                servers.insert(NAME, legacy);
+            }
+        }
     }
     doc["mcp_servers"][NAME]["command"] = value(exe);
     let mut args = Array::new();
@@ -284,8 +297,10 @@ fn stdio_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(PathB
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("mcpServers must be an object")?;
-    if let Some(legacy) = servers.remove(LEGACY_NAME) {
-        servers.entry(NAME).or_insert(legacy);
+    for name in LEGACY_NAMES {
+        if let Some(legacy) = servers.remove(name) {
+            servers.entry(NAME).or_insert(legacy);
+        }
     }
     let server = servers
         .entry(NAME)
@@ -392,13 +407,18 @@ fn opencode_mcp_file(path: PathBuf, exe: &str, data: Option<&str>) -> Result<(Pa
         mcp.object_value_or_create("servers")
             .context("OpenCode mcp.servers must be an object")?
     };
-    if let Some(legacy) = servers.get(LEGACY_NAME) {
+    for name in LEGACY_NAMES {
+        let Some(legacy) = servers.get(name) else {
+            continue;
+        };
         if servers.get(NAME).is_some() {
             legacy.remove();
         } else {
+            // The new name has dashes, so it must be a quoted property name.
+            let quoted = format!("\"{NAME}\"");
             match legacy.name() {
-                Some(ObjectPropName::String(name)) => name.set_raw_value(format!("\"{NAME}\"")),
-                Some(ObjectPropName::Word(name)) => name.set_raw_value(NAME.into()),
+                Some(ObjectPropName::String(name)) => name.set_raw_value(quoted),
+                Some(ObjectPropName::Word(name)) => name.set_raw_value(quoted),
                 None => {}
             }
         }
@@ -433,16 +453,15 @@ fn pi_extension_file(
     binary: &str,
     data: Option<&str>,
 ) -> Result<(PathBuf, String)> {
-    const MARKER: &str = "// Installed by Mem in Black\n";
     let path = config_dir.join(format!("extensions/{NAME}-startup.js"));
     let config = json!({"binary": binary, "dataDirectory": data});
     let extension = format!(
-        "{MARKER}const meminblack = {config};\n{}",
+        "{FILE_MARKER}const meminblack = {config};\n{}",
         include_str!("pi-preview.js")
     );
     if let Some(existing) = read(&path)? {
         ensure!(
-            existing.starts_with(MARKER),
+            existing.starts_with(FILE_MARKER),
             "another Pi extension exists at {}",
             path.display()
         );
@@ -457,11 +476,10 @@ fn capture_file(
     host: Host,
     adapter: &str,
 ) -> Result<(PathBuf, String)> {
-    const MARKER: &str = "// Installed by Mem in Black\n";
     let path = directory.join(format!("{NAME}-capture.js"));
     if let Some(existing) = read(&path)? {
         ensure!(
-            existing.starts_with(MARKER),
+            existing.starts_with(FILE_MARKER),
             "another hook exists at {}",
             path.display()
         );
@@ -470,16 +488,25 @@ fn capture_file(
     let bridge = include_str!("capture.js");
     Ok((
         path,
-        format!("{MARKER}const meminblack = {config};\n{bridge}\n{adapter}"),
+        format!("{FILE_MARKER}const meminblack = {config};\n{bridge}\n{adapter}"),
     ))
 }
 
-/// The startup extension written before the rename, if Mem in Black wrote it.
-fn legacy_pi_extension(config_dir: &Path) -> Result<Option<PathBuf>> {
-    let path = config_dir.join(format!("extensions/{LEGACY_NAME}-startup.js"));
-    Ok(read(&path)?
-        .is_some_and(|existing| existing.starts_with("// Installed by QuietMem\n"))
-        .then_some(path))
+/// Files of one `kind` (`capture` or `startup`) that the installer wrote under
+/// an earlier name. They are removed after the new files are written.
+fn legacy_files(directory: &Path, kind: &str) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for name in LEGACY_NAMES {
+        let path = directory.join(format!("{name}-{kind}.js"));
+        if read(&path)?.is_some_and(|existing| {
+            LEGACY_FILE_MARKERS
+                .iter()
+                .any(|marker| existing.starts_with(marker))
+        }) {
+            found.push(path);
+        }
+    }
+    Ok(found)
 }
 
 fn hooks_file(
@@ -529,7 +556,9 @@ fn hooks_file(
             let before = list.len();
             list.retain_mut(|hook| {
                 let managed = hook["command"].as_str().is_some_and(|command| {
-                    command.ends_with(HOOK_MARKER) || command.ends_with(LEGACY_HOOK_MARKER)
+                    std::iter::once(HOOK_MARKER)
+                        .chain(LEGACY_HOOK_MARKERS)
+                        .any(|marker| command.ends_with(marker))
                 });
                 if !managed {
                     return true;

@@ -52,7 +52,7 @@ run:
 
 # Quick demo
 demo: install
-	@echo "=== meminblack demo ==="
+	@echo "=== mem-in-black demo ==="
 	mib --help
 
 # Bump version, regenerate CHANGELOG.md, tag, and push (requires cargo-release + git-cliff)

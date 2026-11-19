@@ -360,20 +360,15 @@ fn installer_preserves_existing_config_and_is_idempotent() {
     assert!(codex_settings.contains("model = 'custom'"));
     assert!(codex_settings.contains("[mcp_servers.other]"));
     let parsed = codex_settings.parse::<toml_edit::DocumentMut>().unwrap();
-    let meminblack = &parsed["mcp_servers"]["meminblack"];
+    let server = &parsed["mcp_servers"]["mem-in-black"];
     assert_eq!(
-        meminblack["args"]
-            .as_array()
-            .unwrap()
-            .get(2)
-            .unwrap()
-            .as_str(),
+        server["args"].as_array().unwrap().get(2).unwrap().as_str(),
         Some("mcp")
     );
     let claude_mcp: Value =
         serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
     assert_eq!(
-        claude_mcp["mcpServers"]["meminblack"]["args"]
+        claude_mcp["mcpServers"]["mem-in-black"]["args"]
             .as_array()
             .unwrap()
             .last()
@@ -415,7 +410,7 @@ fn mcp_can_search_and_fetch_source_evidence() {
         &mut output,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
     );
-    assert_eq!(initialized["result"]["serverInfo"]["name"], "meminblack");
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "mem-in-black");
     writeln!(
         input,
         r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
@@ -1405,7 +1400,7 @@ fn pi_install_registers_a_local_startup_extension_idempotently() {
     let home = workspace.temp.path().join("Pi home's fixture");
     let install = ["install", "--host", "pi", "--home", home.to_str().unwrap()];
     workspace.run(&install, None);
-    let path = home.join(".pi/agent/extensions/meminblack-startup.js");
+    let path = home.join(".pi/agent/extensions/mem-in-black-startup.js");
     let extension = std::fs::read_to_string(&path).unwrap();
     assert!(extension.contains("session_start"));
     assert!(extension.contains("preview"));
@@ -1432,7 +1427,7 @@ fn new_local_memory_databases_use_wal_journaling() {
 fn config_places_the_database_at_a_custom_absolute_path() {
     let workspace = Workspace::new();
     let config_root = workspace.temp.path().join("config");
-    let config = config_root.join("meminblack");
+    let config = config_root.join("mem-in-black");
     let data_home = workspace.temp.path().join("xdg-data");
     let database = workspace.temp.path().join("local disk/history.db");
     std::fs::create_dir_all(&config).unwrap();
@@ -1457,7 +1452,7 @@ fn config_places_the_database_at_a_custom_absolute_path() {
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["database_path"], database.to_str().unwrap());
     assert!(database.is_file());
-    assert!(!data_home.join("meminblack/memory.sqlite3").exists());
+    assert!(!data_home.join("mem-in-black/memory.sqlite3").exists());
     workspace.run_with_env(
         &["status"],
         None,
@@ -1498,11 +1493,11 @@ fn default_installer_lets_hooks_use_database_settings() {
     assert!(!command.contains("--data-dir"));
     let mcp: Value =
         serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
-    assert_eq!(mcp["mcpServers"]["meminblack"]["args"], json!(["mcp"]));
+    assert_eq!(mcp["mcpServers"]["mem-in-black"]["args"], json!(["mcp"]));
 }
 
 #[test]
-fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
+fn default_install_adds_mem_in_black_to_existing_opencode_pi_and_omp_profiles() {
     let workspace = Workspace::new();
     let home = workspace.temp.path().join("mcp-profiles");
     let open = home.join(".config/opencode/opencode.json");
@@ -1514,7 +1509,7 @@ fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
     }
     std::fs::write(
         &open,
-        r#"{"mcp":{"codegraph":{"type":"local","command":["codegraph"]},"meminblack":{"type":"local","command":["old"],"enabled":false}}}"#,
+        r#"{"mcp":{"codegraph":{"type":"local","command":["codegraph"]},"mem-in-black":{"type":"local","command":["old"],"enabled":false}}}"#,
     )
     .unwrap();
     for file in [&pi, &omp] {
@@ -1522,7 +1517,7 @@ fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
             file,
             json!({"mcpServers":{
                 "existing": another_server,
-                "meminblack": {"type":"stdio","command":"old","enabled":false}
+                "mem-in-black": {"type":"stdio","command":"old","enabled":false}
             }})
             .to_string(),
         )
@@ -1536,10 +1531,10 @@ fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
     let open_config = read_json(&open);
     let servers = &open_config["mcp"];
     assert_eq!(servers["codegraph"]["command"], json!(["codegraph"]));
-    assert_eq!(servers["meminblack"]["type"], "local");
-    assert_eq!(servers["meminblack"]["enabled"], false);
+    assert_eq!(servers["mem-in-black"]["type"], "local");
+    assert_eq!(servers["mem-in-black"]["enabled"], false);
     assert_eq!(
-        servers["meminblack"]["command"]
+        servers["mem-in-black"]["command"]
             .as_array()
             .unwrap()
             .last()
@@ -1549,10 +1544,10 @@ fn default_install_adds_meminblack_to_existing_opencode_pi_and_omp_profiles() {
     for file in [&pi, &omp] {
         let config = read_json(file);
         assert_eq!(config["mcpServers"]["existing"], another_server);
-        assert_eq!(config["mcpServers"]["meminblack"]["type"], "stdio");
-        assert_eq!(config["mcpServers"]["meminblack"]["enabled"], false);
+        assert_eq!(config["mcpServers"]["mem-in-black"]["type"], "stdio");
+        assert_eq!(config["mcpServers"]["mem-in-black"]["enabled"], false);
         assert_eq!(
-            config["mcpServers"]["meminblack"]["args"]
+            config["mcpServers"]["mem-in-black"]["args"]
                 .as_array()
                 .unwrap()
                 .last()
@@ -1592,9 +1587,9 @@ fn opencode_v2_install_keeps_jsonc_comments_and_registers_nested_stdio() {
         parsed["mcp"]["servers"]["other"]["command"],
         json!(["other"])
     );
-    assert_eq!(parsed["mcp"]["servers"]["meminblack"]["type"], "local");
+    assert_eq!(parsed["mcp"]["servers"]["mem-in-black"]["type"], "local");
     assert!(
-        home.join(".config/opencode/plugins/meminblack-capture.js")
+        home.join(".config/opencode/plugins/mem-in-black-capture.js")
             .is_file()
     );
     assert!(!home.join(".codex").exists());
@@ -1630,8 +1625,8 @@ fn default_install_uses_the_custom_opencode_config_directory() {
     );
     let jsonc = std::fs::read_to_string(settings).unwrap();
     assert!(jsonc.contains("// keep my config"));
-    assert!(jsonc.contains("meminblack"));
-    assert!(config.join("plugins/meminblack-capture.js").is_file());
+    assert!(jsonc.contains("mem-in-black"));
+    assert!(config.join("plugins/mem-in-black-capture.js").is_file());
     assert!(!home.join("xdg-config/opencode").exists());
 }
 
@@ -1654,7 +1649,7 @@ fn omp_install_targets_the_active_named_profile() {
     let config = home.join(".custom-omp/profiles/work/agent/mcp.json");
     let config: Value = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
     assert_eq!(
-        config["mcpServers"]["meminblack"]["args"]
+        config["mcpServers"]["mem-in-black"]["args"]
             .as_array()
             .unwrap()
             .last()
@@ -1663,7 +1658,7 @@ fn omp_install_targets_the_active_named_profile() {
     );
     assert!(!override_path.exists());
     assert!(
-        home.join(".custom-omp/profiles/work/agent/hooks/pre/meminblack-capture.js")
+        home.join(".custom-omp/profiles/work/agent/hooks/pre/mem-in-black-capture.js")
             .is_file()
     );
 }
@@ -1682,11 +1677,11 @@ fn pi_install_expands_a_home_relative_profile() {
     );
     assert!(home.join("pi-profile/mcp.json").is_file());
     assert!(
-        home.join("pi-profile/extensions/meminblack-capture.js")
+        home.join("pi-profile/extensions/mem-in-black-capture.js")
             .is_file()
     );
     assert!(
-        home.join("pi-profile/extensions/meminblack-startup.js")
+        home.join("pi-profile/extensions/mem-in-black-startup.js")
             .is_file()
     );
     assert!(!workspace.repo.join("~").exists());
@@ -2171,7 +2166,7 @@ fn t3code_install_configures_each_enabled_provider_home() {
     let mcp: Value =
         serde_json::from_slice(&std::fs::read(custom_claude.join(".claude.json")).unwrap())
             .unwrap();
-    assert!(mcp["mcpServers"]["meminblack"].is_object());
+    assert!(mcp["mcpServers"]["mem-in-black"].is_object());
     let codex_hooks = std::fs::read_to_string(home.join(".codex/hooks.json")).unwrap();
     assert!(codex_hooks.contains("hook codex"));
     let codex_config: toml_edit::DocumentMut =
@@ -2179,7 +2174,7 @@ fn t3code_install_configures_each_enabled_provider_home() {
             .unwrap()
             .parse()
             .unwrap();
-    assert!(codex_config["mcp_servers"]["meminblack"]["command"].is_str());
+    assert!(codex_config["mcp_servers"]["mem-in-black"]["command"].is_str());
     assert!(
         !home.join("unused-codex").exists(),
         "disabled provider is skipped"
@@ -2324,7 +2319,7 @@ fn install_moves_hooks_and_servers_from_the_old_name() {
             .iter()
             .flat_map(|group| group["hooks"].as_array().unwrap())
             .filter_map(|hook| hook["command"].as_str())
-            .filter(|command| command.ends_with(" # meminblack-managed"))
+            .filter(|command| command.ends_with(" # mem-in-black-managed"))
             .map(str::to_owned)
             .collect()
     };
@@ -2344,9 +2339,9 @@ fn install_moves_hooks_and_servers_from_the_old_name() {
     assert_eq!(managed(&codex_hooks["hooks"]["Stop"]).len(), 1);
 
     let claude: Value = serde_json::from_str(&read(".claude.json")).unwrap();
-    assert_eq!(claude["mcpServers"]["meminblack"]["enabled"], false);
+    assert_eq!(claude["mcpServers"]["mem-in-black"]["enabled"], false);
     assert_eq!(
-        claude["mcpServers"]["meminblack"]["args"]
+        claude["mcpServers"]["mem-in-black"]["args"]
             .as_array()
             .unwrap()
             .last(),
@@ -2356,18 +2351,18 @@ fn install_moves_hooks_and_servers_from_the_old_name() {
         .parse::<toml_edit::DocumentMut>()
         .unwrap();
     assert_eq!(
-        codex["mcp_servers"]["meminblack"]["startup_timeout_sec"].as_integer(),
+        codex["mcp_servers"]["mem-in-black"]["startup_timeout_sec"].as_integer(),
         Some(30)
     );
     let opencode: Value = serde_json::from_str(&read(".config/opencode/opencode.json")).unwrap();
-    assert_eq!(opencode["mcp"]["meminblack"]["enabled"], false);
+    assert_eq!(opencode["mcp"]["mem-in-black"]["enabled"], false);
 
     assert!(
         !home
             .join(".pi/agent/extensions/quietmem-startup.js")
             .exists()
     );
-    assert!(read(".pi/agent/extensions/meminblack-startup.js").contains("const meminblack"));
+    assert!(read(".pi/agent/extensions/mem-in-black-startup.js").contains("const meminblack"));
 }
 
 #[test]
@@ -2410,7 +2405,7 @@ fn first_run_moves_the_old_data_directory_and_stops_its_worker() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let moved = data_home.join("meminblack");
+    let moved = data_home.join("mem-in-black");
     assert_eq!(status["data_dir"], moved.to_str().unwrap());
     assert_eq!(
         std::fs::read_to_string(moved.join("marker")).unwrap(),
@@ -2418,7 +2413,7 @@ fn first_run_moves_the_old_data_directory_and_stops_its_worker() {
     );
     assert!(moved.join("memory.sqlite3").is_file());
     assert!(!legacy.exists());
-    assert!(config_home.join("meminblack/config.toml").is_file());
+    assert!(config_home.join("mem-in-black/config.toml").is_file());
     assert!(!config_home.join("quietmem").exists());
 
     let stopped = std::time::Instant::now();
@@ -2426,4 +2421,96 @@ fn first_run_moves_the_old_data_directory_and_stops_its_worker() {
         assert!(stopped.elapsed().as_secs() < 5, "old worker kept running");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+#[test]
+fn install_and_first_run_move_everything_from_meminblack() {
+    use std::os::unix::fs::PermissionsExt;
+    let workspace = Workspace::new();
+    let home = workspace.temp.path().join("meminblack-home");
+    let write = |path: PathBuf, contents: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    let old_hook =
+        json!({"type":"command","command":"'/old/mib' hook claude # meminblack-managed"});
+    write(
+        home.join(".claude/settings.json"),
+        &json!({"hooks":{"Stop":[{"hooks":[old_hook]}]}}).to_string(),
+    );
+    write(
+        home.join(".config/opencode/opencode.json"),
+        r#"{"mcp":{meminblack:{"type":"local","command":["old"],"enabled":false}}}"#,
+    );
+    let installed = "// Installed by Mem in Black\nconst meminblack = {};\n";
+    for path in [
+        ".config/opencode/plugins/meminblack-capture.js",
+        ".pi/agent/extensions/meminblack-capture.js",
+        ".pi/agent/extensions/meminblack-startup.js",
+    ] {
+        write(home.join(path), installed);
+    }
+
+    workspace.run(&["install", "--home", home.to_str().unwrap()], None);
+
+    let read = |path: &str| std::fs::read_to_string(home.join(path)).unwrap();
+    let settings = read(".claude/settings.json");
+    assert!(!settings.contains("meminblack-managed"), "{settings}");
+    assert_eq!(settings.matches(" # mem-in-black-managed").count(), 6);
+    let opencode = read(".config/opencode/opencode.json");
+    assert!(
+        opencode.contains(r#""mem-in-black":{"type":"local""#),
+        "{opencode}"
+    );
+    assert!(!opencode.contains("meminblack"), "{opencode}");
+    for (old, new) in [
+        (
+            ".config/opencode/plugins/meminblack-capture.js",
+            ".config/opencode/plugins/mem-in-black-capture.js",
+        ),
+        (
+            ".pi/agent/extensions/meminblack-capture.js",
+            ".pi/agent/extensions/mem-in-black-capture.js",
+        ),
+        (
+            ".pi/agent/extensions/meminblack-startup.js",
+            ".pi/agent/extensions/mem-in-black-startup.js",
+        ),
+    ] {
+        assert!(!home.join(old).exists(), "{old} was kept");
+        assert!(
+            read(new).starts_with("// Installed by Mem in Black\n"),
+            "{new}"
+        );
+    }
+
+    let data_home = workspace.temp.path().join("xdg-data");
+    let config_home = workspace.temp.path().join("xdg-config");
+    write(data_home.join("meminblack/marker"), "kept");
+    std::fs::set_permissions(
+        data_home.join("meminblack"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    write(config_home.join("meminblack/config.toml"), "# settings\n");
+    let output = workspace
+        .command()
+        .env_remove("MIB_DATA_DIR")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let moved = data_home.join("mem-in-black");
+    assert_eq!(
+        std::fs::read_to_string(moved.join("marker")).unwrap(),
+        "kept"
+    );
+    assert!(!data_home.join("meminblack").exists());
+    assert!(config_home.join("mem-in-black/config.toml").is_file());
 }

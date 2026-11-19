@@ -1,4 +1,4 @@
-const turnMetadataKey = "meminblack.turn";
+const turnMetadataKey = "mem-in-black.turn";
 
 async function setupOpenCode(ctx) {
   const sessions = new Map();
@@ -171,4 +171,4 @@ async function legacyOpenCode({ client, directory }) {
   };
 }
 
-export default { id: "meminblack.capture", setup: setupOpenCode, server: legacyOpenCode };
+export default { id: "mem-in-black.capture", setup: setupOpenCode, server: legacyOpenCode };

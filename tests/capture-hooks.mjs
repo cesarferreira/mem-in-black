@@ -36,8 +36,8 @@ async function memory(command, source, tools = ["tool"]) {
 }
 
 for (const [host, path] of [
-  ["pi", ".pi/agent/extensions/meminblack-capture.js"],
-  ["omp", ".omp/agent/hooks/pre/meminblack-capture.js"],
+  ["pi", ".pi/agent/extensions/mem-in-black-capture.js"],
+  ["omp", ".omp/agent/hooks/pre/mem-in-black-capture.js"],
 ]) {
   test(`${host} captures a completed response and leaves a private turn out`, async (test) => {
     const { home, command, plugin } = await fixture(test, host, path);
@@ -101,7 +101,7 @@ for (const [host, path] of [
 }
 
 test("OpenCode V2 captures a delivered prompt and its completed work", async (test) => {
-  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/meminblack-capture.js");
+  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/mem-in-black-capture.js");
   const handlers = new Map();
   const register = (name, handler) => handlers.set(name, handler);
   let sessionID = "session";
@@ -149,7 +149,7 @@ test("OpenCode V2 captures a delivered prompt and its completed work", async (te
 });
 
 test("OpenCode V1 captures tool output and the reply for the active prompt", async (test) => {
-  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/meminblack-capture.js");
+  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/mem-in-black-capture.js");
   const sessionID = "session";
   const reply = (parentID, text, command) => ({
     info: { id: `${parentID}-reply`, role: "assistant", parentID },

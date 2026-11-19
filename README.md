@@ -4,8 +4,8 @@
   <p><strong>We remember so your agents don't have to.</strong></p>
 
   <p>
-    <a href="https://github.com/cesarferreira/meminblack/actions/workflows/rust-tests.yml">
-      <img alt="Tests" src="https://github.com/cesarferreira/meminblack/actions/workflows/rust-tests.yml/badge.svg?branch=main">
+    <a href="https://github.com/cesarferreira/mem-in-black/actions/workflows/rust-tests.yml">
+      <img alt="Tests" src="https://github.com/cesarferreira/mem-in-black/actions/workflows/rust-tests.yml/badge.svg?branch=main">
     </a>
     <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
   </p>
@@ -49,8 +49,8 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 Linux or macOS with [Rust](https://rustup.rs) 1.99 or newer:
 
 ```bash
-git clone https://github.com/cesarferreira/meminblack.git
-cd meminblack
+git clone https://github.com/cesarferreira/mem-in-black.git
+cd mem-in-black
 cargo install --path . --locked
 mib install
 ```
@@ -73,10 +73,11 @@ T3 Code support configures the home of each enabled provider in
 `~/.t3/userdata/settings.json`, including custom `homePath`s. Set `T3CODE_HOME`
 for a custom T3 location.
 
-**Upgrading from QuietMem:** install `mib`, run `mib install`, then
-`cargo uninstall quietmem`. The first `mib` run moves your memory and settings
-to the new directories. `mib install` replaces the old hooks and MCP entries.
-Rename any `QUIETMEM_*` environment variables to `MIB_*`.
+**Upgrading from an earlier name:** run `cargo uninstall meminblack` or
+`cargo uninstall quietmem`, install `mib`, then run `mib install`. The first
+`mib` run moves your memory and settings from `meminblack` or `quietmem` to the
+`mem-in-black` directories. `mib install` replaces the old hooks, MCP entries
+and plugin files. Rename any `QUIETMEM_*` environment variables to `MIB_*`.
 
 ## Use it
 
@@ -154,8 +155,8 @@ that look like credentials are not stored.
 
 | Setting | Effect |
 | --- | --- |
-| `MIB_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/meminblack` |
-| `database_path` in `~/.config/meminblack/config.toml` | Put the database on a specific disk. Run `mib stop` first |
+| `MIB_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/mem-in-black` |
+| `database_path` in `~/.config/mem-in-black/config.toml` | Put the database on a specific disk. Run `mib stop` first |
 | `observer.json` in the data directory | Use an OpenAI-compatible model for summaries ([example](#model-summaries)) |
 | `MIB_MODEL_IDLE_SECS` | Seconds before an idle model unloads. Default 1800 |
 | `RAYON_NUM_THREADS` | Threads for semantic search. Default 2 |

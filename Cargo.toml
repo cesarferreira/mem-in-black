@@ -1,5 +1,5 @@
 [package]
-name = "meminblack"
+name = "mem-in-black"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
@@ -7,7 +7,7 @@ description = "We remember so your agents don't have to. Local memory for coding
 license = "MIT"
 publish = false
 authors = ["Cesar Ferreira"]
-repository = "https://github.com/cesarferreira/meminblack"
+repository = "https://github.com/cesarferreira/mem-in-black"
 
 [[bin]]
 name = "mib"

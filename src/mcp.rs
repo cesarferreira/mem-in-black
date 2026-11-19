@@ -204,7 +204,7 @@ impl MemoryServer {
 }
 
 #[tool_handler(
-    name = "meminblack",
+    name = "mem-in-black",
     instructions = "Use Mem in Black for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Use memories_only when searching for decisions or completed work. Fetch full observations only as needed."
 )]
 impl ServerHandler for MemoryServer {}

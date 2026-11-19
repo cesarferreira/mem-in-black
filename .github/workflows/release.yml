@@ -48,14 +48,14 @@ jobs:
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../meminblack-${{ matrix.target }}.tar.gz mib
+          tar czf ../../../mem-in-black-${{ matrix.target }}.tar.gz mib
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: meminblack-${{ matrix.target }}
-          path: meminblack-${{ matrix.target }}.*
+          name: mem-in-black-${{ matrix.target }}
+          path: mem-in-black-${{ matrix.target }}.*
 
   release:
     name: Release

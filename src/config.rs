@@ -8,9 +8,9 @@ use std::{
 use toml_edit::DocumentMut;
 
 /// Directory name for data and configuration.
-pub const NAME: &str = "meminblack";
-/// The name used before the rename. Its directories move on first use.
-const LEGACY_NAME: &str = "quietmem";
+pub const NAME: &str = "mem-in-black";
+/// Earlier names, newest first. Their directories move on first use.
+pub const LEGACY_NAMES: [&str; 2] = ["meminblack", "quietmem"];
 
 #[derive(Clone)]
 pub struct Storage {
@@ -63,17 +63,22 @@ impl Storage {
     }
 }
 
-/// Moves the data directory of the old name to `directory` on first use.
+/// Moves the data directory of an earlier name to `directory` on first use.
 /// The old worker is stopped first so that no process writes to the moved
 /// files. If the move cannot happen now, the old directory stays in use and
 /// a later run retries.
 fn adopt_legacy_data(directory: PathBuf) -> PathBuf {
-    let Some(legacy) = directory.parent().map(|parent| parent.join(LEGACY_NAME)) else {
-        return directory;
-    };
-    if directory.exists() || !legacy.is_dir() {
+    if directory.exists() {
         return directory;
     }
+    let Some(legacy) = directory.parent().and_then(|parent| {
+        LEGACY_NAMES
+            .iter()
+            .map(|name| parent.join(name))
+            .find(|legacy| legacy.is_dir())
+    }) else {
+        return directory;
+    };
     let old = Storage {
         database: legacy.join("memory.sqlite3"),
         directory: legacy.clone(),
@@ -102,8 +107,12 @@ fn database_setting() -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let directory = base.join(NAME);
-    let legacy = base.join(LEGACY_NAME);
-    if !directory.exists() && legacy.is_dir() {
+    if !directory.exists()
+        && let Some(legacy) = LEGACY_NAMES
+            .iter()
+            .map(|name| base.join(name))
+            .find(|legacy| legacy.is_dir())
+    {
         // A failed move leaves the old settings in place; the next run retries.
         let _ = fs::rename(&legacy, &directory);
     }
