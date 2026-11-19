@@ -657,7 +657,8 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, view: &ViewerQuery) -
 .agent-label{{background:rgb(0 0 0 / .2);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .24)}}
 .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:0 0 16px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}
 #viewer-recall{{margin:0 0 28px;padding:14px 16px;border:1px solid var(--line);border-radius:10px}}#viewer-recall h2{{font-size:15px;margin:0}}#viewer-recall p,#viewer-recall ul{{font-size:14px;margin:8px 0 0}}#viewer-recall ul{{padding:0;list-style:none}}#viewer-recall li+li{{border-top:1px solid var(--line);margin-top:8px;padding-top:8px}}#viewer-recall li{{overflow-wrap:anywhere}}
-a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{padding:8px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted);text-decoration:none}}nav a[aria-current="page"]{{background:var(--panel);color:var(--ink);border-color:var(--accent)}}.memory-preview{{display:block;margin-top:6px;color:var(--muted);font-size:14px;line-height:1.45}}details[open] .memory-preview{{display:none}}.source-link{{display:inline-block;margin-top:12px;font-size:14px}}
+a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{padding:8px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted);text-decoration:none}}nav a[aria-current="page"]{{background:var(--panel);color:var(--ink);border-color:var(--accent)}}.memory-preview{{display:block;margin-top:6px;color:var(--muted);font-size:14px;line-height:1.45}}details[open] .memory-preview{{display:none}}
+.markdown{{margin:16px 0 0;line-height:1.55;overflow-wrap:anywhere}}.markdown>:first-child{{margin-top:0}}.markdown>:last-child{{margin-bottom:0}}.markdown p{{color:inherit;margin:0 0 .75em}}.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6{{font-size:1em;margin:1em 0 .5em}}.markdown ul,.markdown ol{{margin:0 0 .75em;padding-inline-start:1.4em}}.markdown pre{{margin:0 0 .75em;padding:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;white-space:pre;overflow-x:auto}}code{{font:.9em ui-monospace,monospace}}:not(pre)>code{{padding:1px 5px;border-radius:5px;background:rgb(255 255 255 / .08)}}.markdown blockquote{{margin:0 0 .75em;padding-inline-start:12px;border-inline-start:3px solid var(--line);color:var(--muted)}}.markdown table{{border-collapse:collapse;margin:0 0 .75em;display:block;overflow-x:auto}}.markdown th,.markdown td{{border:1px solid var(--line);padding:6px 10px;text-align:start}}.source-link{{display:inline-block;margin-top:12px;font-size:14px}}
 </style><main><header class="viewer-heading"><h1>Mem in Black</h1><span id="viewer-status" role="status" hidden></span></header>{stats}<nav aria-label="Memory views">{view_tabs}</nav><form action="{token}" method="get">{mode_input}<input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>{evidence_heading}<div id="viewer-activity">"#,
         escape(&view.text),
         stats = stat_cards(store, token)?,
@@ -706,12 +707,17 @@ a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{pad
 <summary><span class="record-heading"><span class="record-title">{heading}</span><span class="record-tags">
 <span class="project-label" title="{name}">{name}</span><span class="agent-label" title="{agent}">{agent}</span>
 </span></span>{preview}{time}</summary>
-<small>#{id} · {kind} · {workspace}</small><pre>{body}</pre>{source_link}</details>"#,
+<small>#{id} · {kind} · {workspace}</small>{body}{source_link}</details>"#,
             id = item.id,
-            heading = escape(crate::hooks::cut(heading, 165)),
+            heading = inline_markdown(crate::hooks::cut(heading, 165)),
             kind = escape(&item.kind),
             workspace = escape(&item.workspace),
-            body = escape(&item.body),
+            // Tool records hold command output, which is not Markdown.
+            body = if item.kind == "tool" {
+                format!("<pre>{}</pre>", escape(&item.body))
+            } else {
+                format!(r#"<div class="markdown">{}</div>"#, markdown(&item.body))
+            },
         ));
     }
     html.push_str("</div></main></html>");
@@ -752,7 +758,7 @@ fn memory_preview(record: &crate::store::Record) -> String {
         if let Some(value) = value.filter(|text| !text.is_empty()) {
             html.push_str(&format!(
                 r#"<span class="memory-preview">{label}{}</span>"#,
-                escape(crate::hooks::cut(value, 240))
+                inline_markdown(crate::hooks::cut(value, 240))
             ));
         }
     }
@@ -890,10 +896,126 @@ fn stat_cards(store: &Store, token: &str) -> Result<String> {
     Ok(html)
 }
 
+const MARKDOWN: pulldown_cmark::Options = pulldown_cmark::Options::ENABLE_TABLES
+    .union(pulldown_cmark::Options::ENABLE_STRIKETHROUGH)
+    .union(pulldown_cmark::Options::ENABLE_TASKLISTS);
+
+/// Renders stored Markdown as HTML. The text comes from agents and tools, so
+/// raw HTML is shown as code, images as their alt text, and only web and mail
+/// links stay clickable. Single line breaks are kept, as agents write them.
+fn markdown(text: &str) -> String {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd, html};
+    let mut dropped_link = false;
+    let events = Parser::new_ext(text, MARKDOWN).filter_map(|event| match event {
+        Event::Start(Tag::HtmlBlock) => Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))),
+        Event::End(TagEnd::HtmlBlock) => Some(Event::End(TagEnd::CodeBlock)),
+        Event::Html(raw) | Event::InlineHtml(raw) => Some(Event::Text(raw)),
+        Event::SoftBreak => Some(Event::HardBreak),
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        Event::Start(Tag::Link { ref dest_url, .. }) if !safe_link(dest_url) => {
+            dropped_link = true;
+            None
+        }
+        Event::End(TagEnd::Link) if dropped_link => {
+            dropped_link = false;
+            None
+        }
+        other => Some(other),
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, events);
+    out
+}
+
+/// Renders the inline Markdown of a one-line heading or preview: code,
+/// emphasis and strikethrough. Block structure and links become plain text.
+fn inline_markdown(text: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut out = String::new();
+    for event in Parser::new_ext(text, MARKDOWN) {
+        match event {
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                out.push_str(&escape(&text))
+            }
+            Event::Code(code) => out.push_str(&format!("<code>{}</code>", escape(&code))),
+            Event::SoftBreak | Event::HardBreak => out.push(' '),
+            Event::Start(Tag::Emphasis) => out.push_str("<em>"),
+            Event::End(TagEnd::Emphasis) => out.push_str("</em>"),
+            Event::Start(Tag::Strong) => out.push_str("<strong>"),
+            Event::End(TagEnd::Strong) => out.push_str("</strong>"),
+            Event::Start(Tag::Strikethrough) => out.push_str("<s>"),
+            Event::End(TagEnd::Strikethrough) => out.push_str("</s>"),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn safe_link(url: &str) -> bool {
+    let url = url.trim_start().to_ascii_lowercase();
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+}
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inline_markdown, markdown};
+
+    #[test]
+    fn markdown_renders_agent_formatting() {
+        let html = markdown(
+            "Pulled **4** commits into `main`:\nsecond line\n\n```\n9e7a1f7 feat: x\n```\n\n- one\n- two\n\n| a | b |\n| - | - |\n| 1 | 2 |",
+        );
+        assert!(html.contains("<strong>4</strong>"), "{html}");
+        assert!(html.contains("<code>main</code>"), "{html}");
+        assert!(html.contains("<br />"), "{html}");
+        assert!(
+            html.contains("<pre><code>9e7a1f7 feat: x\n</code></pre>"),
+            "{html}"
+        );
+        assert!(html.contains("<li>one</li>"), "{html}");
+        assert!(html.contains("<table>"), "{html}");
+    }
+
+    #[test]
+    fn markdown_cannot_inject_html_scripts_or_remote_images() {
+        let html = markdown(
+            "<script>alert(1)</script>\n\nInline <img src=x onerror=alert(1)> text\n\n[bad](javascript:alert(1)) [data](data:text/html,x) [ok](https://example.com/a?b=\"c\") ![pixel](https://tracker.example/p.png)",
+        );
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("javascript:"), "{html}");
+        assert!(!html.contains("href=\"data:"), "{html}");
+        assert!(html.contains("bad"), "{html}");
+        assert!(
+            html.contains("href=\"https://example.com/a?b=%22c%22\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("pixel") && !html.contains("tracker.example"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn inline_markdown_keeps_headings_on_one_line() {
+        assert_eq!(
+            inline_markdown("Fix **recall** in `hooks.rs` <b>now</b>"),
+            "Fix <strong>recall</strong> in <code>hooks.rs</code> &lt;b&gt;now&lt;/b&gt;"
+        );
+        assert_eq!(
+            inline_markdown("[docs](javascript:x) and *more*"),
+            "docs and <em>more</em>"
+        );
+    }
 }
