@@ -113,7 +113,7 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         .find(|lead| lower.starts_with(**lead))?;
         let rest = plain[lead.len()..].trim().trim_end_matches('*');
         let rest = if rest.is_empty() {
-            *sentences.get(index + 1)?
+            sentences.get(index + 1)?
         } else {
             rest
         };
@@ -368,9 +368,12 @@ fn kind(prompt: &str, edited: bool) -> &'static str {
     }
 }
 
-fn sentences(text: &str) -> Vec<&str> {
+/// Splits a reply into plain sentences. Bold markers are dropped, because a
+/// split inside `**bold.** text` would leave one marker on each side.
+fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
+        let line = line.replace("**", "");
         let line = line.trim();
         if line.starts_with('|') || line.starts_with("```") {
             continue;
@@ -384,11 +387,11 @@ fn sentences(text: &str) -> Vec<&str> {
         for (index, byte) in bytes.iter().enumerate() {
             if matches!(byte, b'.' | b'!' | b'?') && bytes.get(index + 1).is_none_or(|b| *b == b' ')
             {
-                out.push(line[start..=index].trim());
+                out.push(line[start..=index].trim().to_owned());
                 start = index + 1;
             }
         }
-        out.push(line[start..].trim());
+        out.push(line[start..].trim().to_owned());
     }
     out.retain(|s| s.len() > 3);
     out
@@ -455,6 +458,20 @@ mod tests {
         let facts = distill("/r", "make it pass", &tools, "");
         assert_eq!(facts.checks, [("cargo test".to_owned(), "passed")]);
         assert_eq!(facts.kind, "Investigation");
+    }
+
+    #[test]
+    fn a_decision_does_not_keep_half_of_a_bold_pair() {
+        let facts = distill(
+            "/repo",
+            "Fix the viewer",
+            &[],
+            "**One unrelated test fix.** A test failed because the umask made its folder writable.",
+        );
+        assert_eq!(
+            facts.decision.as_deref(),
+            Some("A test failed because the umask made its folder writable.")
+        );
     }
 
     #[test]

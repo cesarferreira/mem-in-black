@@ -905,8 +905,9 @@ const MARKDOWN: pulldown_cmark::Options = pulldown_cmark::Options::ENABLE_TABLES
 /// links stay clickable. Single line breaks are kept, as agents write them.
 fn markdown(text: &str) -> String {
     use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd, html};
+    let text = repair_markdown(text);
     let mut dropped_link = false;
-    let events = Parser::new_ext(text, MARKDOWN).filter_map(|event| match event {
+    let events = Parser::new_ext(&text, MARKDOWN).filter_map(|event| match event {
         Event::Start(Tag::HtmlBlock) => Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Indented))),
         Event::End(TagEnd::HtmlBlock) => Some(Event::End(TagEnd::CodeBlock)),
         Event::Html(raw) | Event::InlineHtml(raw) => Some(Event::Text(raw)),
@@ -931,8 +932,9 @@ fn markdown(text: &str) -> String {
 /// emphasis and strikethrough. Block structure and links become plain text.
 fn inline_markdown(text: &str) -> String {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let text = repair_markdown(text);
     let mut out = String::new();
-    for event in Parser::new_ext(text, MARKDOWN) {
+    for event in Parser::new_ext(&text, MARKDOWN) {
         match event {
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 out.push_str(&escape(&text))
@@ -949,6 +951,68 @@ fn inline_markdown(text: &str) -> String {
         }
     }
     out
+}
+
+/// Stored text is often shortened: a long reply keeps its start and end around
+/// a `…` line, and a heading or preview is cut at a length. A cut can leave a
+/// code block, a code span or a bold marker open, and the rest of the record
+/// then renders as code or shows raw markers. This closes or drops them.
+fn repair_markdown(text: &str) -> String {
+    const DIVIDER: &str = "\n…\n";
+    let is_fence = |line: &str| {
+        let line = line.trim_start();
+        line.starts_with("```") || line.starts_with("~~~")
+    };
+    let parts: Vec<&str> = text.split(DIVIDER).collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    for (index, part) in parts.iter().enumerate() {
+        let unbalanced = part.lines().filter(|line| is_fence(line)).count() % 2 == 1;
+        // A complete reply has balanced fences, so an odd count means the cut
+        // ended the start inside a block, or began the end inside one.
+        let mut in_code = index > 0 && unbalanced;
+        if index > 0 {
+            out.push_str("\n\n…\n\n");
+            if in_code {
+                out.push_str("```\n");
+            }
+        }
+        for (number, line) in part.split_inclusive('\n').enumerate() {
+            if is_fence(line) {
+                in_code = !in_code;
+                out.push_str(line);
+            } else if in_code {
+                out.push_str(line);
+            } else {
+                // The end of a reply can begin inside a code span.
+                out.push_str(&repair_inline(line, index > 0 && number == 0));
+            }
+        }
+        if in_code {
+            out.push_str("\n```");
+        }
+    }
+    out
+}
+
+/// Closes a code span and drops bold markers that a cut left unpaired. When
+/// the line begins where a cut was made, an unpaired span opens at its start.
+fn repair_inline(line: &str, cut_before: bool) -> String {
+    let (body, newline) = match line.strip_suffix('\n') {
+        Some(body) => (body, "\n"),
+        None => (line, ""),
+    };
+    let mut body = body.to_owned();
+    if body.matches("**").count() % 2 == 1 {
+        body = body.replace("**", "");
+    }
+    if body.matches('`').count() % 2 == 1 {
+        if cut_before {
+            body.insert(0, '`');
+        } else {
+            body.push('`');
+        }
+    }
+    body + newline
 }
 
 fn safe_link(url: &str) -> bool {
@@ -1004,6 +1068,29 @@ mod tests {
         assert!(
             html.contains("pixel") && !html.contains("tracker.example"),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn shortened_text_does_not_leave_markdown_open() {
+        let html = markdown(
+            "Outcome: it shows a bar:\n```\nDownloading\n\n…\nclean.\n```\n\nCommitted as `473b328`.",
+        );
+        assert!(html.contains("<code>473b328</code>"), "{html}");
+        assert_eq!(html.matches("<pre>").count(), 2, "{html}");
+        assert!(html.contains("<p>…</p>"), "{html}");
+        let html = markdown("See `notes\n…\nscratchpad/recovered.db` for it.");
+        assert!(html.contains("<code>notes</code>"), "{html}");
+        assert!(
+            html.contains("<code>scratchpad/recovered.db</code> for it."),
+            "{html}"
+        );
+        let html = markdown("Decision: One test fix.** A test failed.\nIt's on `cesar/precise-rec");
+        assert!(!html.contains("**"), "{html}");
+        assert!(html.contains("<code>cesar/precise-rec</code>"), "{html}");
+        assert_eq!(
+            inline_markdown("I reinstalled it with `make inst"),
+            "I reinstalled it with <code>make inst</code>"
         );
     }
 
