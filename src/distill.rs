@@ -38,13 +38,23 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         {
             facts.explored.push(item);
         }
-        let Some((command, output)) = shell(body) else {
+        let Some((command, output, failed)) = shell(body) else {
             continue;
         };
-        let Some(check) = check_segment(command) else {
+        let Some(check) = named_check(command, failed) else {
+            if !failed
+                && !output.trim().is_empty()
+                && command.split_whitespace().any(|arg| arg == "--help")
+            {
+                let reference =
+                    format!("`{}`", cut(command.lines().next().unwrap_or(command), 100));
+                if !facts.explored.contains(&reference) {
+                    facts.explored.push(reference);
+                }
+            }
             continue;
         };
-        let status = status(output);
+        let status = if failed { "failed" } else { status(output) };
         facts.checks.retain(|(seen, _)| *seen != check);
         facts.checks.push((check, status));
         if status == "failed" {
@@ -87,8 +97,9 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
             .any(|marker| lower.contains(marker))
         })
         .map(|s| cut(s, 220).to_owned());
-    facts.next = sentences.iter().find_map(|s| {
-        let lower = s.to_lowercase();
+    facts.next = sentences.iter().enumerate().find_map(|(index, sentence)| {
+        let plain = sentence.replace("**", "");
+        let lower = plain.to_lowercase();
         let lead = [
             "next step:",
             "next steps:",
@@ -100,7 +111,12 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         ]
         .iter()
         .find(|lead| lower.starts_with(**lead))?;
-        let rest = s[lead.len()..].trim().trim_end_matches('*');
+        let rest = plain[lead.len()..].trim().trim_end_matches('*');
+        let rest = if rest.is_empty() {
+            *sentences.get(index + 1)?
+        } else {
+            rest
+        };
         (rest.len() > 3 && !rest.ends_with(':')).then(|| cut(rest, 220).to_owned())
     });
     facts
@@ -167,6 +183,29 @@ impl Facts {
     }
 }
 
+pub fn check_command(body: &str) -> Option<String> {
+    let (command, _, failed) = shell(body)?;
+    named_check(command, failed)
+}
+
+fn named_check(command: &str, failed: bool) -> Option<String> {
+    let check = check_segment(command)?;
+    // A nonzero shell exit applies to the full command. A later segment may
+    // have failed after an earlier check succeeded.
+    if failed {
+        Some(cut(command.lines().next().unwrap_or_default(), 80).to_owned())
+    } else {
+        Some(check)
+    }
+}
+
+pub fn summary_fact<'a>(body: &'a str, prefix: &str) -> Option<&'a str> {
+    body.lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with("Outcome: ") && !line.starts_with("Model summary: "))
+        .find_map(|line| line.strip_prefix(prefix))
+}
+
 fn edited_paths(body: &str, root: &str, files: &mut Vec<String>) {
     let mut push = |path: &str| {
         let path = relative(path, root);
@@ -205,13 +244,17 @@ fn relative<'a>(path: &'a str, root: &str) -> &'a str {
         .unwrap_or(path)
 }
 
-fn shell(body: &str) -> Option<(&str, &str)> {
+fn shell(body: &str) -> Option<(&str, &str, bool)> {
     let (head, rest) = body.split_once(" command: ")?;
     if head.contains(char::is_whitespace) {
         return None;
     }
     let (command, output) = rest.split_once("\nResult:\n").unwrap_or((rest, ""));
-    Some((command.trim(), output))
+    let (command, failed) = match command.strip_suffix("\nTool status: failed") {
+        Some(command) => (command, true),
+        None => (command, false),
+    };
+    Some((command.trim(), output, failed))
 }
 
 fn is_check(command: &str) -> bool {
@@ -412,5 +455,31 @@ mod tests {
         let facts = distill("/r", "make it pass", &tools, "");
         assert_eq!(facts.checks, [("cargo test".to_owned(), "passed")]);
         assert_eq!(facts.kind, "Investigation");
+    }
+
+    #[test]
+    fn a_next_steps_heading_preserves_the_first_follow_up_action() {
+        let facts = distill(
+            "/repo",
+            "Check the Stax command",
+            &[],
+            "The help output confirmed the alias.\n\n**Next steps:**\n1. Add a coverage test for the ls alias.\n2. Update the docs.",
+        );
+        assert_eq!(
+            facts.next.as_deref(),
+            Some("Add a coverage test for the ls alias.")
+        );
+    }
+
+    #[test]
+    fn a_compound_failure_is_reported_against_the_whole_command() {
+        let tools = [
+            "Shell command: cargo test && ./publish-artifact\nTool status: failed\nResult:\ntest result: ok\nPublish rejected",
+        ];
+        let facts = distill("/repo", "Verify and publish the package", &tools, "");
+        assert_eq!(
+            facts.checks,
+            [("cargo test && ./publish-artifact".to_owned(), "failed")]
+        );
     }
 }

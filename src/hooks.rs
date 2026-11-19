@@ -29,7 +29,7 @@ impl Host {
         }
     }
 
-    fn injects_recall(self) -> bool {
+    fn recalls_on_submit(self) -> bool {
         matches!(self, Self::Claude | Self::Codex)
     }
 }
@@ -57,6 +57,8 @@ struct Input {
     tool_input: Value,
     #[serde(default)]
     tool_response: Value,
+    #[serde(default)]
+    tool_response_is_error: bool,
     #[serde(default)]
     error: Option<String>,
 }
@@ -119,6 +121,17 @@ pub fn handle(
         Ok(())
     };
     match event.hook_event_name.as_str() {
+        "Recall" if !host.recalls_on_submit() => {
+            let Some(turn) = turn_id else { return Ok(None) };
+            if store.is_private(source, session, Some(turn))? {
+                return Ok(None);
+            }
+            let Some(prompt) = store.captured_prompt(source, session, &workspace.root, turn)?
+            else {
+                return Ok(None);
+            };
+            Ok(recall(store, &workspace, source, session, &prompt, semantic)?.map(recall_response))
+        }
         "UserPromptSubmit" => {
             let private = event
                 .prompt
@@ -132,7 +145,7 @@ pub fn handle(
                 return Ok(None);
             }
             let prompt = clean(&event.prompt, 1600);
-            let context = if host.injects_recall() {
+            let context = if host.recalls_on_submit() {
                 recall(store, &workspace, source, session, &prompt, semantic)
                     .context("selecting context")?
             } else {
@@ -141,14 +154,7 @@ pub fn handle(
             let key = turn_id.map(|turn| format!("prompt:{turn}"));
             write("prompt", &prompt, key.as_deref(), event.prompt.len())
                 .context("storing prompt")?;
-            Ok(context.map(|additional_context| {
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
-                        "additionalContext": additional_context
-                    }
-                })
-            }))
+            Ok(context.map(recall_response))
         }
         "Stop" if !store.is_private(source, session, turn_id)? => {
             if let Some(message) = &event.last_assistant_message {
@@ -176,6 +182,12 @@ pub fn handle(
     }
 }
 
+fn recall_response(additional_context: String) -> Value {
+    json!({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit", "additionalContext": additional_context,
+    }})
+}
+
 /// Harness-generated turns, such as background task notifications and local
 /// command output, are not requests from the user.
 fn machine_prompt(prompt: &str) -> bool {
@@ -194,6 +206,7 @@ fn machine_prompt(prompt: &str) -> bool {
 
 fn tool_record(event: &Input) -> Option<String> {
     let name = event.tool_name.as_str();
+    let failed = event.hook_event_name == "PostToolUseFailure" || event.tool_response_is_error;
     if matches!(name, "Edit" | "Write" | "MultiEdit" | "apply_patch") {
         let path = event
             .tool_input
@@ -223,7 +236,11 @@ fn tool_record(event: &Input) -> Option<String> {
             .join("\n");
         let detail = path.and_then(Value::as_str).unwrap_or(&paths);
         let (added, removed) = line_changes(name, &event.tool_input);
-        return Some(format!("{name} {detail}\nLines: +{added} -{removed}"));
+        return Some(if failed {
+            format!("Failed {name} {detail}")
+        } else {
+            format!("{name} {detail}\nLines: +{added} -{removed}")
+        });
     }
     let input = |key: &str| event.tool_input.get(key).and_then(Value::as_str);
     match name {
@@ -281,8 +298,19 @@ fn tool_record(event: &Input) -> Option<String> {
             Value::Null => clean(event.error.as_deref().unwrap_or(""), 128 * 1024),
             value => clean(&value.to_string(), 128 * 1024),
         };
+        let status = if failed
+            || event
+                .tool_response
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+        {
+            "\nTool status: failed"
+        } else {
+            ""
+        };
         return Some(format!(
-            "{name} command: {command}\nResult:\n{}",
+            "{name} command: {command}{status}\nResult:\n{}",
             excerpt(&result, 1150)
         ));
     }
@@ -425,8 +453,8 @@ pub fn clean(text: &str, limit: usize) -> String {
 
 pub fn phrases(query: &str, adaptive: bool) -> Vec<String> {
     const STOP: &[&str] = &[
-        "about", "after", "again", "also", "could", "continue", "from", "have", "help", "here",
-        "into", "just", "make", "need", "please", "should", "some", "that", "them", "then",
+        "about", "after", "again", "also", "could", "continue", "fixing", "from", "have", "help",
+        "here", "into", "just", "make", "need", "please", "should", "some", "that", "them", "then",
         "there", "these", "they", "this", "want", "what", "when", "where", "which", "with", "work",
         "would", "your", "fix", "test", "task", "claude", "codex",
     ];
@@ -476,20 +504,21 @@ fn recall(
                     .strip_prefix(phrase)
                     .is_some_and(|suffix| suffix.starts_with(' '))
         });
-    let wanted = ["claude", "codex"].into_iter().find(|name| {
-        *name != source
-            && directive
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|word| word == *name)
-    });
+    let wanted = requested.then(|| handoff_source(directive)).flatten();
     let implicit = ["continue", "resume", "keep going", "carry on"].contains(&directive)
         || ["previous task", "last task", "where we left off"]
             .iter()
             .any(|phrase| directive.contains(phrase));
     if requested && (wanted.is_some() || (implicit && !store.has_work(source, session)?)) {
-        let Some(anchor) = store.latest_other(&workspace.root, source, wanted)? else {
+        let Some(anchor) = store.latest_other(&workspace.root, source, session, wanted)? else {
             return Ok(None);
         };
+        if anchor.kind == "assistant"
+            && let Some(summary) = store.summary_of(&anchor)?
+            && substantive(store, &summary)?
+        {
+            return record_context(store, workspace, source, session, &[&summary]);
+        }
         let prompt = store.related(&anchor, Some("prompt"), true, 1)?;
         let history = store.related(&anchor, None, true, 30)?;
         let turn: Vec<_> = history
@@ -544,9 +573,9 @@ fn recall(
         .unwrap_or_default();
     let semantic_ids: Vec<_> = semantic.iter().map(|(id, _)| *id).collect();
     let fused = crate::embed::fuse(&[lexical.clone(), semantic_ids], 12);
-    let rarity = store.term_rarity(&words)?;
+    let rarity = store.term_rarity(&words, &workspace.project, source, session)?;
     let total_rarity: f64 = rarity.values().sum();
-    let candidates = store.recall_ids(&fused, source, session)?;
+    let candidates = store.recall_ids(&fused, &workspace.project, source, session)?;
     let mut evidence: Vec<Record> = Vec::new();
     let mut matched = Vec::new();
     for record in &candidates {
@@ -561,8 +590,9 @@ fn recall(
         }
         let (shared, weight) = overlap(&words, &rarity, substance(&outcome));
         let coverage = weight / total_rarity.max(f64::EPSILON);
-        let keyword =
-            shared >= KEYWORD_TERMS && weight >= KEYWORD_RARITY && coverage >= KEYWORD_COVERAGE;
+        let keyword = shared >= KEYWORD_TERMS
+            && coverage >= KEYWORD_COVERAGE
+            && (weight >= KEYWORD_RARITY || shares_topic(&words, substance(&outcome)));
         let meaning = semantic.iter().any(|(id, strong)| {
             *id == record.id && (*strong || (shared >= 1 && weight >= ASSISTED_RARITY))
         });
@@ -583,11 +613,56 @@ fn recall(
         }
     }
     let shown: Vec<_> = evidence.iter().collect();
-    let context = render(workspace, &shown);
-    if let Some(text) = &context {
-        store.record_delivery(source, session, &shown, &matched, text.len())?;
+    store.record_delivery(source, session, &shown, &matched, |records| {
+        render(workspace, records)
+    })
+}
+
+fn handoff_source(directive: &str) -> Option<&'static str> {
+    let words: Vec<_> = directive
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let is_task = |word: &str| matches!(word, "task" | "work" | "session" | "turn");
+    let is_command = |words: &[&str]| {
+        matches!(
+            words,
+            ["continue"] | ["resume"] | ["pick", "up"] | ["keep", "going"] | ["carry", "on"]
+        )
+    };
+    for i in 1..words.len() {
+        let before = &words[..i];
+        let (agent, width) = match &words[i..] {
+            ["oh", "my", "pi", ..] => ("omp", 3),
+            ["open", "code", ..] => ("opencode", 2),
+            ["claude", "code", ..] => ("claude", 2),
+            ["opencode", ..] => ("opencode", 1),
+            ["claude", ..] => ("claude", 1),
+            ["codex", ..] => ("codex", 1),
+            ["pi", ..] => ("pi", 1),
+            ["omp", ..] => ("omp", 1),
+            _ => continue,
+        };
+        let after = &words[i + width..];
+        let from_agent = before.ends_with(&["started", "in"])
+            || before.ends_with(&["started", "with"])
+            || before.ends_with(&["left", "off", "in"])
+            || (before.last() == Some(&"from")
+                && (is_command(&before[..i - 1])
+                    || matches!(before, [.., word, "from"] if is_task(word))));
+        let named_task = matches!(before.last(), Some(&("latest" | "last" | "previous")))
+            && after.first().is_some_and(|word| is_task(word));
+        let direct = match after.first() {
+            None => is_command(before),
+            Some(word) => {
+                is_task(word) && is_command(before.strip_suffix(&["the"]).unwrap_or(before))
+            }
+        };
+        if from_agent || named_task || direct {
+            return Some(agent);
+        }
     }
-    Ok(context)
+    None
 }
 
 /// Keyword recall needs this many shared terms…
@@ -615,7 +690,7 @@ fn substantive(store: &Store, record: &Record) -> Result<bool> {
             "\nDecision: ",
         ]
         .iter()
-        .any(|line| record.body.contains(line)),
+        .any(|prefix| crate::distill::summary_fact(&record.body, prefix.trim_start()).is_some()),
         "assistant" => store.turn_has_tools(record)?,
         _ => true,
     })
@@ -649,6 +724,17 @@ fn phrases_all(text: &str) -> Vec<String> {
         .filter(|word| word.len() >= 3)
         .map(str::to_lowercase)
         .collect()
+}
+
+/// A precise topic phrase can still be distinctive in a tiny project history.
+fn shares_topic(words: &[String], evidence: &str) -> bool {
+    let query: Vec<_> = words.iter().map(|word| stem(word)).collect();
+    evidence.lines().any(|line| {
+        let terms: Vec<_> = phrases_all(line).iter().map(|word| stem(word)).collect();
+        query
+            .windows(3)
+            .any(|topic| terms.windows(3).any(|phrase| phrase == topic))
+    })
 }
 
 /// A light suffix stripper so `importer`, `imports` and `import` agree.
@@ -725,11 +811,9 @@ fn record_context(
     session: &str,
     records: &[&Record],
 ) -> Result<Option<String>> {
-    let context = render(workspace, records);
-    if let Some(text) = &context {
-        store.record_delivery(source, session, records, &[], text.len())?;
-    }
-    Ok(context)
+    store.record_delivery(source, session, records, &[], |records| {
+        render(workspace, records)
+    })
 }
 
 fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
@@ -756,7 +840,9 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
             record.id,
             record.kind,
             state,
-            if matches!(record.kind.as_str(), "tool" | "assistant") {
+            if record.kind == "summary" && is_local_summary(&record.body) {
+                summary_excerpt(&record.body)
+            } else if matches!(record.kind.as_str(), "tool" | "assistant") {
                 excerpt(&record.body, 520)
             } else {
                 cut(&record.body, 420).to_owned()
@@ -764,6 +850,29 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
         ));
     }
     Some(result)
+}
+
+fn summary_excerpt(body: &str) -> String {
+    let mut lines = vec![body.lines().next().unwrap_or_default().to_owned()];
+    if let Some(outcome) = body
+        .lines()
+        .find(|line| line.starts_with("Outcome: ") || line.starts_with("Model summary: "))
+    {
+        lines.push(cut(outcome, 230).to_owned());
+    }
+    for prefix in [
+        "Checks: ",
+        "Errors seen: ",
+        "Decision: ",
+        "Next: ",
+        "Files: ",
+        "Explored: ",
+    ] {
+        if let Some(fact) = crate::distill::summary_fact(body, prefix) {
+            lines.push(format!("{prefix}{}", cut(fact, 145)));
+        }
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]

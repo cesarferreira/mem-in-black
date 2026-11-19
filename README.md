@@ -29,13 +29,13 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 
 | What you get | |
 | --- | --- |
-| New sessions know past work | Claude Code and Codex get the outcome of matching earlier work with automatic recall |
-| Switch agents mid-task | Ask Codex to "continue the work I started in Claude", or the other way round |
+| New sessions know past work | Claude Code, Codex, OpenCode, Pi, and Oh My Pi get a brief when earlier project work matches the prompt |
+| Switch agents mid-task | Ask an agent to continue the work started in another agent |
 | Model tokens spent on memory | **0**: summaries are built locally |
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
-| Your data stays local | Nothing leaves your machine unless you configure a remote summary model |
+| Local storage and retrieval | Recalled context travels with the agent’s normal model request |
 | Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
-| See what it saved | `mib stats` and `mib open` |
+| See what was reused | `mib open` shows recent automatic recall and MCP usage |
 
 | What it costs | |
 | --- | --- |
@@ -64,7 +64,7 @@ trust the new hooks once. Capture starts with new activity after the hooks load.
 | Claude Code | ✓ | ✓ | Always |
 | Codex | ✓ | ✓ | Always |
 | T3 Code (Codex and Claude Code providers) | ✓ | ✓ | When T3 Code is set up, or `--host t3code` |
-| OpenCode | ✓ | ✓ | OpenCode 2.3+, or OpenCode 1.18.29+ with a running V1 server |
+| OpenCode | ✓ | ✓ | OpenCode 2.2.4+, or OpenCode 1.18.29+ with a running V1 server |
 | Pi | ✓ | ✓ | When installed. `--host pi` adds a startup preview |
 | Oh My Pi | ✓ | ✓ | When installed, or `--host omp` (`OMP_PROFILE=work` for a profile) |
 | Any MCP client | | ✓ | Register the stdio command `mib mcp` |
@@ -82,13 +82,15 @@ Rename any `QUIETMEM_*` environment variables to `MIB_*`.
 
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
-- **Recall.** Claude Code and Codex automatically get relevant outcomes when a prompt matches earlier work, including the request, files, test results, decisions and next step. Agents can also search memory through MCP.
-- **Handoff.** In the same worktree, ask one agent to *continue the work I started in Claude* or *resume the latest Codex task*. Evidence from a different Git commit is flagged.
+- **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
+- **Handoff.** Ask to continue work from Claude, Codex, OpenCode, Pi, or Oh My Pi in the same worktree. Evidence from a different Git revision is flagged.
+- **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
 - **Startup preview.** A new session shows recent activity for the worktree. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
 
 Agents can also call the MCP tools `search`, `timeline`, `get_observations`,
 `save_memory` (with `replaces` to correct old records) and `forget`.
+Pass `memories_only: true` to `search` for decisions and completed work.
 
 ## Semantic search
 
@@ -136,9 +138,12 @@ you describe a problem in different words than the record used.
 
 The viewer refreshes activity and usage while the tab is visible. Each row shows
 a local timestamp, a project tint and label, and an agent or source badge.
+**Recent recall** links to the records sent to agents and shows the receiving
+agent and delivery time. The MCP lookup card counts searches and full records
+fetched on demand.
 
-The tokens-saved figure is an upper bound: it assumes each delivered record
-replaced re-reading its full original output.
+`mib stats` includes an upper bound for tokens saved. It assumes each delivered
+record replaced re-reading its full original output.
 
 **What gets captured:** prompts, agent replies, shell commands with a trimmed
 result, edited paths with line counts, read paths, search patterns with matching

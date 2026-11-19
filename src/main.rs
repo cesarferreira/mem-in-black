@@ -148,6 +148,7 @@ fn main() -> Result<()> {
                     &embed::Scope::Project(project),
                     12,
                     std::time::Duration::from_millis(900),
+                    false,
                 )?;
                 Some(
                     hits.into_iter()
@@ -300,8 +301,12 @@ fn main() -> Result<()> {
         } => {
             let store = Store::open(&data)?;
             let root = workspace.map(|path| Workspace::read(&path).root);
-            let semantic =
-                mcp::worker_semantic(&data, root.as_deref(), std::time::Duration::from_secs(5));
+            let semantic = mcp::worker_semantic(
+                &data,
+                root.as_deref(),
+                std::time::Duration::from_secs(5),
+                false,
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&mcp::search(

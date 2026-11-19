@@ -4,6 +4,7 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::ErrorKind,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -11,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 7;
+const SCHEMA: i64 = 8;
 
 /// (record id, workspace, project, little-endian f32 vector)
 pub type VectorRow = (i64, String, String, Vec<u8>);
@@ -19,6 +20,27 @@ pub type VectorRow = (i64, String, String, Vec<u8>);
 pub type PendingText = (i64, String, String, String);
 
 const RECORD_COLUMNS: &str = "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id, e.project";
+const MEMORY_FILTER: &str = "(
+    e.kind IN ('note', 'observation') OR (e.kind = 'summary' AND (
+        e.source = 'claude-mem' OR EXISTS (
+            SELECT 1 FROM (
+                SELECT 'Files: ' AS label UNION ALL SELECT 'Explored: ' UNION ALL SELECT 'Checks: '
+                UNION ALL SELECT 'Errors seen: ' UNION ALL SELECT 'Decision: ' UNION ALL SELECT 'Next: '
+            ) AS fact
+            WHERE instr(e.body, char(10) || fact.label) BETWEEN 1 AND min(
+                coalesce(nullif(instr(e.body, char(10) || 'Outcome: '), 0), length(e.body) + 1),
+                coalesce(nullif(instr(e.body, char(10) || 'Model summary: '), 0), length(e.body) + 1)
+            ) - 1
+        ) OR (
+            (e.body LIKE 'Evidence [#%' OR e.body LIKE 'Model summary. Evidence [#%') AND EXISTS (
+                SELECT 1 FROM events t WHERE t.session = e.session AND t.source = e.source
+                  AND t.workspace = e.workspace AND t.turn_id IS e.turn_id AND t.id < e.id
+                  AND t.kind = 'tool' AND t.superseded_by IS NULL
+                  AND instr(substr(e.body, 1, instr(e.body || char(10), char(10)) - 1), '[#' || t.id || ']') > 0
+            )
+        )
+    ))
+)";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -40,6 +62,7 @@ pub struct Record {
 pub struct Stats {
     pub workspace: Option<String>,
     pub records: i64,
+    pub memories: i64,
     pub sessions: i64,
     pub workspaces: i64,
     pub sessions_helped: i64,
@@ -52,6 +75,12 @@ pub struct Stats {
     pub mcp_bytes: i64,
     pub mcp_source_bytes: i64,
     pub observer_tokens: i64,
+}
+
+pub struct RecentDelivery {
+    pub record: Record,
+    pub recipient: String,
+    pub delivered_at: i64,
 }
 
 impl Stats {
@@ -270,13 +299,17 @@ impl Store {
                      END;",
                 )?;
             }
-            // `source_bytes` is the raw size of what a record condenses, such as
-            // full tool output. `shown` separates evidence put in front of an
-            // agent from records only marked so they are not matched again.
+            if version < 7 {
+                migration.execute_batch(
+                    "ALTER TABLE events ADD COLUMN source_bytes INTEGER;
+                     ALTER TABLE deliveries ADD COLUMN shown INTEGER NOT NULL DEFAULT 1;",
+                )?;
+            }
             migration.execute_batch(
-                "ALTER TABLE events ADD COLUMN source_bytes INTEGER;
-                 ALTER TABLE deliveries ADD COLUMN shown INTEGER NOT NULL DEFAULT 1;
-                 PRAGMA user_version=7;",
+                "ALTER TABLE deliveries ADD COLUMN delivered_at INTEGER;
+                 CREATE INDEX deliveries_recent ON deliveries(delivered_at DESC)
+                    WHERE delivered_at IS NOT NULL AND shown;
+                 PRAGMA user_version=8;",
             )?;
             migration.commit()?;
         }
@@ -429,15 +462,31 @@ impl Store {
         workspace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Record>> {
+        self.search_filtered(query, workspace, limit, false)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: Option<&str>,
+        workspace: Option<&str>,
+        limit: usize,
+        memories_only: bool,
+    ) -> Result<Vec<Record>> {
+        let filter = if memories_only { MEMORY_FILTER } else { "1" };
+        let newest = if memories_only {
+            "e.created_at DESC, e.id DESC"
+        } else {
+            "e.id DESC"
+        };
         match query {
             Some(fts) => self.query(&format!(
                 "SELECT {RECORD_COLUMNS} FROM event_search JOIN events e ON e.id = event_search.rowid
-                 WHERE event_search MATCH ?1 AND (?2 IS NULL OR e.workspace = ?2) AND e.superseded_by IS NULL
-                 ORDER BY bm25(event_search), e.id DESC LIMIT ?3"
+                 WHERE event_search MATCH ?1 AND (?2 IS NULL OR e.workspace = ?2) AND e.superseded_by IS NULL AND {filter}
+                 ORDER BY bm25(event_search), {newest} LIMIT ?3"
             ), params![fts, workspace, limit.clamp(1, 100) as i64]),
             None => self.query(&format!(
                 "SELECT {RECORD_COLUMNS} FROM events e WHERE (?1 IS NULL OR e.workspace = ?1) AND e.superseded_by IS NULL
-                 ORDER BY e.id DESC LIMIT ?2"
+                 AND {filter} ORDER BY {newest} LIMIT ?2"
             ), params![workspace, limit.clamp(1, 100) as i64]),
         }
     }
@@ -484,18 +533,24 @@ impl Store {
     }
 
     /// Apply the recall filters to semantic matches, keeping their order.
-    pub fn recall_ids(&self, ids: &[i64], source: &str, session: &str) -> Result<Vec<Record>> {
+    pub fn recall_ids(
+        &self,
+        ids: &[i64],
+        project: &str,
+        source: &str,
+        session: &str,
+    ) -> Result<Vec<Record>> {
         let _guard = self.read_guard()?;
         let mut statement = self.db.prepare(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e
-             WHERE e.id = ?1 AND (e.source != ?2 OR e.session != ?3)
+             WHERE e.id = ?1 AND (e.source != ?2 OR e.session != ?3) AND e.project = ?4
                AND e.superseded_by IS NULL AND e.created_at > unixepoch() - 15552000
                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.source = ?2 AND d.session = ?3 AND d.event_id = e.id)"
         ))?;
         let mut records = Vec::new();
         for id in ids.iter().take(50) {
             if let Some(record) = statement
-                .query_row(params![id, source, session], row_record)
+                .query_row(params![id, source, session, project], row_record)
                 .optional()?
             {
                 records.push(record);
@@ -504,21 +559,36 @@ impl Store {
         Ok(records)
     }
 
-    /// The rarity of each term, scaled to the size of the history: 1.0 for a
-    /// term in a single record, near 0 for a term in every record. The search
-    /// index applies stemming, so `retries` also counts `retry`.
-    pub fn term_rarity(&self, terms: &[String]) -> Result<std::collections::HashMap<String, f64>> {
+    /// Measure rarity against prior project evidence. Repeated questions with
+    /// no tool activity should not change which evidence a prompt retrieves.
+    pub fn term_rarity(
+        &self,
+        terms: &[String],
+        project: &str,
+        source: &str,
+        session: &str,
+    ) -> Result<std::collections::HashMap<String, f64>> {
         let _guard = self.read_guard()?;
-        let total: i64 = self
-            .db
-            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))?;
-        let mut frequency = self
-            .db
-            .prepare("SELECT count(*) FROM event_search WHERE event_search MATCH ?1")?;
+        let scope = "e.project = ?1 AND (e.source != ?2 OR e.session != ?3)
+            AND e.superseded_by IS NULL AND (e.kind != 'prompt' OR EXISTS (
+                SELECT 1 FROM events r WHERE r.source = e.source AND r.session = e.session
+                   AND r.workspace = e.workspace AND r.turn_id IS e.turn_id AND r.id > e.id
+                   AND r.kind = 'tool' AND r.superseded_by IS NULL
+            ))";
+        let total: i64 = self.db.query_row(
+            &format!("SELECT count(*) FROM events e WHERE {scope}"),
+            params![project, source, session],
+            |row| row.get(0),
+        )?;
+        let mut frequency = self.db.prepare(&format!(
+            "SELECT count(*) FROM event_search JOIN events e ON e.id = event_search.rowid
+             WHERE event_search MATCH ?4 AND {scope}"
+        ))?;
         let mut rarity = std::collections::HashMap::new();
         for term in terms {
             let query = format!("\"{}\"", term.replace('"', ""));
-            let documents: i64 = frequency.query_row([&query], |row| row.get(0))?;
+            let documents: i64 =
+                frequency.query_row(params![project, source, session, query], |row| row.get(0))?;
             if documents > 0 {
                 let records = total.max(1) as f64 + 1.0;
                 rarity.insert(
@@ -553,21 +623,41 @@ impl Store {
         )?)
     }
 
+    pub fn captured_prompt(
+        &self,
+        source: &str,
+        session: &str,
+        workspace: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT body FROM events WHERE source = ?1 AND session = ?2 AND workspace = ?3
+               AND event_key = 'prompt:' || ?4 AND kind = 'prompt' AND superseded_by IS NULL",
+                params![source, session, workspace, turn],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn latest_other(
         &self,
         root: &str,
         source: &str,
+        session: &str,
         wanted: Option<&str>,
     ) -> Result<Option<Record>> {
         let _guard = self.read_guard()?;
         Ok(self.db.query_row(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e
-             WHERE e.workspace = ?1 AND e.source != ?2 AND (?3 IS NULL OR e.source = ?3)
+             WHERE e.workspace = ?1 AND (e.source != ?2 OR e.session != ?3) AND (?4 IS NULL OR e.source = ?4)
                AND e.superseded_by IS NULL
                AND e.kind IN ('assistant', 'tool', 'prompt') AND e.created_at > unixepoch() - 1209600
                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source = e.source AND s.session = e.session AND s.private)
              ORDER BY e.id DESC LIMIT 1"
-        ), params![root, source, wanted], row_record).optional()?)
+        ), params![root, source, session, wanted], row_record).optional()?)
     }
 
     pub fn related(
@@ -744,9 +834,23 @@ impl Store {
 
     /// The records for `ids` that still exist and are not superseded, in the given order.
     pub fn live(&self, ids: &[i64]) -> Result<Vec<Record>> {
+        self.live_filtered(ids, false)
+    }
+
+    pub fn memory_ids(&self) -> Result<HashSet<i64>> {
         let _guard = self.read_guard()?;
         let mut statement = self.db.prepare(&format!(
-            "SELECT {RECORD_COLUMNS} FROM events e WHERE e.id = ?1 AND e.superseded_by IS NULL"
+            "SELECT e.id FROM events e WHERE e.superseded_by IS NULL AND {MEMORY_FILTER}"
+        ))?;
+        let ids = statement.query_map([], |row| row.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn live_filtered(&self, ids: &[i64], memories_only: bool) -> Result<Vec<Record>> {
+        let filter = if memories_only { MEMORY_FILTER } else { "1" };
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM events e WHERE e.id = ?1 AND e.superseded_by IS NULL AND {filter}"
         ))?;
         let mut records = Vec::new();
         for id in ids.iter().take(100) {
@@ -808,23 +912,40 @@ impl Store {
         session: &str,
         shown: &[&Record],
         matched: &[&Record],
-        bytes: usize,
-    ) -> Result<()> {
+        render: impl FnOnce(&[&Record]) -> Option<String>,
+    ) -> Result<Option<String>> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
-        for (records, flag) in [(shown, 1), (matched, 0)] {
+        let mut fresh = Vec::new();
+        {
+            let mut delivered = transaction.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM deliveries WHERE source = ?1 AND session = ?2 AND event_id = ?3)",
+            )?;
+            for record in shown {
+                if !delivered.query_row(params![source, session, record.id], |row| row.get(0))? {
+                    fresh.push(*record);
+                }
+            }
+        }
+        let Some(context) = render(&fresh) else {
+            return Ok(None);
+        };
+        for (records, flag) in [(fresh.as_slice(), 1), (matched, 0)] {
             for record in records {
                 transaction.execute(
-                    "INSERT INTO deliveries(source, session, event_id, shown) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(source, session, event_id) DO UPDATE SET shown = max(shown, excluded.shown)",
+                    "INSERT INTO deliveries(source, session, event_id, shown, delivered_at)
+                       VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 THEN unixepoch() END)
+                     ON CONFLICT(source, session, event_id) DO UPDATE SET
+                       shown = max(shown, excluded.shown),
+                       delivered_at = coalesce(excluded.delivered_at, delivered_at)",
                     params![source, session, record.id, flag],
                 )?;
             }
         }
         self.add_metric("context_injections", 1)?;
-        self.add_metric("context_bytes", bytes as i64)?;
+        self.add_metric("context_bytes", context.len() as i64)?;
         transaction.commit()?;
-        Ok(())
+        Ok(Some(context))
     }
 
     pub fn bump(&self, metrics: &[(&str, i64)]) -> Result<()> {
@@ -833,6 +954,25 @@ impl Store {
             self.add_metric(key, *amount)?;
         }
         Ok(())
+    }
+
+    pub fn recent_deliveries(&self) -> Result<Vec<RecentDelivery>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS}, d.source, d.delivered_at
+             FROM deliveries d JOIN events e ON e.id = d.event_id
+             WHERE d.delivered_at IS NOT NULL AND d.shown AND e.kind != 'prompt'
+               AND e.superseded_by IS NULL
+             ORDER BY d.delivered_at DESC, e.id DESC LIMIT 5"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok(RecentDelivery {
+                record: row_record(row)?,
+                recipient: row.get(10)?,
+                delivered_at: row.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Total raw size behind records, falling back to the stored text.
@@ -874,6 +1014,8 @@ impl Store {
         Ok(Stats {
             workspace: workspace.map(str::to_owned),
             records: scalar("SELECT count(*) FROM events WHERE ?1 IS NULL OR workspace = ?1")?,
+            memories: scalar(&format!("SELECT count(*) FROM events e WHERE (?1 IS NULL OR e.workspace = ?1)
+                AND e.superseded_by IS NULL AND {MEMORY_FILTER}"))?,
             sessions: scalar(
                 "SELECT count(*) FROM (SELECT DISTINCT source, session FROM events
                  WHERE (?1 IS NULL OR workspace = ?1) AND source != 'claude-mem')",

@@ -13,16 +13,27 @@ function captureError(error) {
 function sendMemory(turn, name, fields) {
   return new Promise((resolve) => {
     try {
+      const wantsRecall = name === "Recall";
       const input = JSON.stringify({
         cwd: turn.cwd, session_id: turn.session, turn_id: turn.id,
         hook_event_name: name, ...fields,
       });
       const child = spawn(meminblack.binary, memoryArgs, {
-        stdio: ["pipe", "ignore", process.env.MIB_DEBUG ? "inherit" : "ignore"],
+        stdio: ["pipe", wantsRecall ? "pipe" : "ignore", process.env.MIB_DEBUG ? "inherit" : "ignore"],
         timeout: 2500,
         killSignal: "SIGKILL",
       });
-      child.once("close", resolve);
+      let output = "";
+      child.stdout?.setEncoding("utf8").on("data", (chunk) => { output += chunk; });
+      child.once("close", (code) => {
+        if (code !== 0 || !wantsRecall || !output.trim()) return resolve();
+        try {
+          resolve(JSON.parse(output).hookSpecificOutput?.additionalContext);
+        } catch (error) {
+          captureError(error);
+          resolve();
+        }
+      });
       child.on("error", captureError);
       child.stdin.on("error", captureError);
       child.stdin.end(input);
@@ -55,11 +66,22 @@ function withoutFileContents(prompt) {
 async function startMemoryTurn(cwd, session, id, prompt) {
   if (!cwd || !session || !id || !prompt.trim()) return undefined;
   const privateTurn = /<private>/i.test(prompt);
-  const turn = { cwd, session, id, private: privateTurn, reply: "" };
+  const publicPrompt = privateTurn ? "<private>" : boundedText(withoutFileContents(prompt));
+  const turn = { cwd, session, id, private: privateTurn, prompt: publicPrompt, reply: "" };
   await sendMemory(turn, "UserPromptSubmit", {
-    prompt: privateTurn ? "<private>" : boundedText(withoutFileContents(prompt)),
+    prompt: publicPrompt,
   });
   return turn;
+}
+
+function recallForTurn(turn) {
+  if (!turn || turn.private) return undefined;
+  turn.recall ??= sendMemory(turn, "Recall");
+  return turn.recall;
+}
+
+function recallPart(brief) {
+  return { type: "text", text: `\n\nHistorical context from Mem in Black\n${brief}` };
 }
 
 async function finishMemoryTurn(turn) {
@@ -92,10 +114,13 @@ async function captureTool(turn, id, name, rawInput, output, failed, metadata) {
   let result;
   switch (tool) {
     case "Bash":
-    case "Shell":
+    case "Shell": {
       args = { command: boundedText(input.command) };
       result = boundedText(contentText(output));
+      const exit = metadata?.exit ?? metadata?.exitCode ?? metadata?.exit_code;
+      if (Number.isInteger(exit) && exit !== 0) failed = true;
       break;
+    }
     case "Grep":
     case "Glob":
       args = { pattern: boundedText(input.pattern), path: boundedText(input.path) };

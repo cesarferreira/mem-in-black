@@ -11,6 +11,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertEncoder, Config};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -518,9 +519,20 @@ impl Index {
     }
 
     pub fn search(&self, query: &[f32], scope: &Scope<'_>, limit: usize) -> Vec<(i64, f32)> {
+        self.search_filtered(query, scope, limit, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        scope: &Scope<'_>,
+        limit: usize,
+        allowed: Option<&HashSet<i64>>,
+    ) -> Vec<(i64, f32)> {
         let mut scored: Vec<_> = self
             .rows
             .iter()
+            .filter(|row| allowed.is_none_or(|ids| ids.contains(&row.id)))
             .filter(|row| match scope {
                 Scope::All => true,
                 Scope::Workspace(root) => row.workspace == *root,
@@ -640,5 +652,19 @@ mod tests {
         assert_eq!(index.search(&[0.0, 1.0], &Scope::Project("p"), 5).len(), 3);
         assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), [2, 1]);
         assert_eq!(from_bytes(&to_bytes(&[0.25, -1.5])), [0.25, -1.5]);
+    }
+
+    #[test]
+    fn index_filters_eligible_records_before_applying_the_limit() {
+        let mut index = Index::default();
+        index.insert(1, "a".into(), "p".into(), vec![0.6, 0.8]);
+        for id in 2..=151 {
+            index.insert(id, "a".into(), "p".into(), vec![1.0, 0.0]);
+        }
+        let allowed = HashSet::from([1]);
+        assert_eq!(
+            index.search_filtered(&[1.0, 0.0], &Scope::All, 1, Some(&allowed)),
+            [(1, 0.6)]
+        );
     }
 }

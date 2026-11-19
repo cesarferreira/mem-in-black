@@ -128,6 +128,145 @@ fn cross_host_resume_carries_goal_test_and_next_step() {
 }
 
 #[test]
+fn plugin_recall_delivers_a_verified_brief_in_fresh_sessions_only_for_related_work() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    for host in ["opencode", "pi", "omp"] {
+        let session = format!("{host}-follow-up");
+        let submit = |turn: &str, prompt: &str| {
+            let payload = json!({"turn_id":turn,"prompt":prompt});
+            let capture = workspace.hook(host, &session, "UserPromptSubmit", payload.clone());
+            assert!(capture.is_empty());
+            workspace.hook(host, &session, "Recall", payload)
+        };
+        assert!(
+            submit(
+                "private",
+                "<private>Resume the latest Claude task</private>"
+            )
+            .is_empty()
+        );
+        assert!(submit("unrelated", "Write a birthday card for my grandmother").is_empty());
+        let result = submit(
+            "follow-up",
+            "Continue fixing the websocket retry regression",
+        );
+        let response: Value =
+            serde_json::from_str(&result).expect("plugin recall returned context");
+        let brief = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(brief.contains("cargo test websocket_retry"), "{brief}");
+        assert!(brief.contains("move the reset after handshake"), "{brief}");
+        let repeated = workspace.hook(
+            host,
+            &session,
+            "Recall",
+            json!({
+                "turn_id":"follow-up", "prompt":"Continue fixing the websocket retry regression"
+            }),
+        );
+        assert!(repeated.is_empty());
+    }
+    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    assert_eq!(stats["sessions_helped"], 3);
+    assert_eq!(stats["context_injections"], 3);
+}
+
+#[test]
+fn summaries_keep_test_failures_even_when_the_result_is_ambiguous() {
+    let workspace = Workspace::new();
+    workspace.hook(
+        "codex",
+        "test-run",
+        "UserPromptSubmit",
+        json!({"turn_id":"turn", "prompt":"Fix retry behavior"}),
+    );
+    workspace.hook("codex", "test-run", "PostToolUseFailure", json!({
+        "turn_id":"turn", "tool_name":"Bash", "tool_use_id":"check",
+        "tool_input":{"command":"cargo test retry"}, "tool_response":"process exited with status 1"
+    }));
+    workspace.hook(
+        "codex",
+        "test-run",
+        "PostToolUseFailure",
+        json!({
+            "turn_id":"turn", "tool_name":"Edit", "tool_use_id":"edit",
+            "tool_input":{"file_path":"src/unmodified.rs"}, "tool_response":"patch did not apply"
+        }),
+    );
+    workspace.hook("codex", "test-run", "Stop", json!({"turn_id":"turn", "last_assistant_message":"The retry bug remains. Next: fix the counter before rerunning the test."}));
+    workspace.run(&["observe"], None);
+    let row: Value =
+        serde_json::from_str(workspace.run(&["export"], None).lines().last().unwrap()).unwrap();
+    let body = row["body"].as_str().unwrap();
+    assert!(body.contains("`cargo test retry` → failed"), "{body}");
+    assert!(!body.contains("Files: src/unmodified.rs"), "{body}");
+    assert!(body.contains("Next: fix the counter"), "{body}");
+}
+
+#[test]
+fn shell_verified_discoveries_are_recalled_by_topic_in_the_next_session() {
+    let workspace = Workspace::new();
+    workspace.hook("opencode", "first", "UserPromptSubmit", json!({"turn_id":"a", "prompt":"Inspect the Stax stack listing command. Run stax --help and verify which command lists all stacks."}));
+    workspace.hook("opencode", "first", "PostToolUse", json!({"turn_id":"a", "tool_name":"Shell", "tool_input":{"command":"stax --help"}, "tool_response":"status    Show all stacks [alias: ls]"}));
+    workspace.hook("opencode", "first", "Stop", json!({"turn_id":"a", "last_assistant_message":"Stax status lists all stacks and ls is its alias. Next: add a coverage test for the ls alias."}));
+    workspace.run(&["observe"], None);
+    let prompt =
+        json!({"turn_id":"b", "prompt":"What did we learn about the Stax stack listing command?"});
+    workspace.hook("opencode", "second", "UserPromptSubmit", prompt.clone());
+    let brief = workspace.hook("opencode", "second", "Recall", prompt);
+    assert!(brief.contains("[opencode #4 • summary]"), "{brief}");
+    assert!(brief.contains("stax --help"), "{brief}");
+    assert!(
+        brief.contains("add a coverage test for the ls alias"),
+        "{brief}"
+    );
+    workspace.hook(
+        "opencode",
+        "second",
+        "Stop",
+        json!({"turn_id":"b", "last_assistant_message":"The ls alias needs a coverage test."}),
+    );
+    let follow_up =
+        json!({"turn_id":"c", "prompt":"What did we learn about the Stax stack listing command?"});
+    workspace.hook("pi", "third", "UserPromptSubmit", follow_up.clone());
+    let recalled = workspace.hook("pi", "third", "Recall", follow_up);
+    assert!(
+        recalled.contains("add a coverage test for the ls alias"),
+        "{recalled}"
+    );
+}
+
+#[test]
+fn a_summary_links_the_test_even_after_a_long_tool_log() {
+    let workspace = Workspace::new();
+    workspace.hook(
+        "codex",
+        "verify",
+        "UserPromptSubmit",
+        json!({"turn_id":"turn", "prompt":"Verify reconnect regression"}),
+    );
+    workspace.hook("codex", "verify", "PostToolUse", json!({"turn_id":"turn", "tool_use_id":"test", "tool_name":"Bash", "tool_input":{"command":"cargo test reconnect"}, "tool_response":"test result: ok"}));
+    for index in 0..12 {
+        workspace.hook("codex", "verify", "PostToolUse", json!({"turn_id":"turn", "tool_use_id":format!("read-{index}"), "tool_name":"Read", "tool_input":{"file_path":format!("src/file_{index}.rs")}}));
+    }
+    workspace.hook(
+        "codex",
+        "verify",
+        "Stop",
+        json!({"turn_id":"turn", "last_assistant_message":"The reconnect test passes."}),
+    );
+    workspace.run(&["observe"], None);
+    let row: Value =
+        serde_json::from_str(workspace.run(&["export"], None).lines().last().unwrap()).unwrap();
+    let body = row["body"].as_str().unwrap();
+    assert!(body.contains("`cargo test reconnect` → passed"), "{body}");
+    assert!(body.lines().last().unwrap().contains("[#2]"), "{body}");
+}
+
+#[test]
 fn unrelated_prompt_gets_no_context_and_private_text_is_not_searchable() {
     let workspace = Workspace::new();
     workspace.seed();
@@ -410,6 +549,12 @@ fn private_turn_does_not_capture_followup_tool_or_assistant_text() {
 fn worker_viewer_serves_history_only_at_its_private_url() {
     let workspace = Workspace::new();
     workspace.seed();
+    workspace.hook(
+        "codex",
+        "follow-up",
+        "UserPromptSubmit",
+        json!({"prompt":"Resume the latest Claude task"}),
+    );
     let mut worker = workspace
         .command()
         .arg("serve")
@@ -422,7 +567,7 @@ fn worker_viewer_serves_history_only_at_its_private_url() {
         .unwrap();
     let url = line.trim();
     let response = (|| -> anyhow::Result<(String, u16)> {
-        let body = ureq::get(format!("{url}?q=websocket"))
+        let body = ureq::get(format!("{url}?view=activity&q=websocket"))
             .call()?
             .body_mut()
             .read_to_string()?;
@@ -440,10 +585,13 @@ fn worker_viewer_serves_history_only_at_its_private_url() {
     assert!(body.contains("websocket retry regression"));
     assert!(body.contains("class=\"agent-label\" title=\"Claude Code\">Claude Code</span>"));
     assert!(
-        body.contains("Saved (est.)"),
-        "the viewer shows usage stats"
+        body.contains("with automatic recall"),
+        "the viewer names what was counted"
     );
-    assert!(body.contains("Model cost"));
+    assert!(body.contains("Recent recall"));
+    assert!(body.contains("Codex received"));
+    assert!(body.contains("cargo test websocket_retry"));
+    assert!(!body.contains("Saved (est.)"));
 }
 
 #[test]
@@ -459,15 +607,15 @@ fn viewer_refreshes_after_capture_and_shows_record_timestamps() {
     BufReader::new(worker.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
-    let url = line.trim();
+    let url = format!("{}?view=activity", line.trim());
     let response = (|| -> anyhow::Result<_> {
-        let initial = ureq::get(url).call()?;
+        let initial = ureq::get(&url).call()?;
         let etag = initial
             .headers()
             .get("etag")
             .ok_or_else(|| anyhow::anyhow!("viewer did not send a revision"))?
             .to_str()?;
-        let status = ureq::get(url)
+        let status = ureq::get(&url)
             .header("If-None-Match", etag)
             .call()?
             .status();
@@ -477,7 +625,7 @@ fn viewer_refreshes_after_capture_and_shows_record_timestamps() {
             "UserPromptSubmit",
             json!({"prompt":"Capture an observation while the viewer is open"}),
         );
-        let body = ureq::get(url)
+        let body = ureq::get(&url)
             .header("If-None-Match", etag)
             .call()?
             .body_mut()
@@ -494,6 +642,140 @@ fn viewer_refreshes_after_capture_and_shows_record_timestamps() {
     assert!(body.contains("class=\"project-label\" title=\"repo\">repo</span>"));
     assert!(body.contains("class=\"agent-label\" title=\"Codex\">Codex</span>"));
     assert!(body.contains("style=\"--project-hue:"));
+}
+
+#[test]
+fn viewer_keeps_work_summaries_visible_and_links_to_their_evidence() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    let json = workspace.run(&["export"], None);
+    let records: Vec<Value> = json
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let id = |kind: &str| {
+        records
+            .iter()
+            .find(|record| record["kind"] == kind)
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let summary_id = id("summary");
+    let tool_id = id("tool");
+    let db = rusqlite::Connection::open(workspace.temp.path().join("data/memory.sqlite3")).unwrap();
+    db.execute(
+        "WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i + 1 FROM n WHERE i < 45)
+         INSERT INTO events(source, session, kind, body, workspace, project)
+         SELECT 'codex', 'noise', 'tool', 'fixturepoll background probe ' || i, workspace, project
+         FROM n CROSS JOIN events WHERE events.id = ?1",
+        [summary_id],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO events(source, session, kind, body, workspace, project)
+         SELECT 'codex', 'small-talk', 'summary', ?1, workspace, project FROM events WHERE id = ?2",
+        rusqlite::params!["Change: conversationalfixture\nModel summary: small talk\nDecision: conversationalfixture\nEvidence [#1]", summary_id],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO events(source, session, kind, body, workspace, project, turn_id)
+         SELECT source, session, 'summary', ?1, workspace, project, turn_id FROM events WHERE id = ?2",
+        rusqlite::params![format!("Evidence [#{tool_id}]\nRequest: Legacy fixture\nLast tool: cargo test\nLatest agent update: Saved before structured summaries"), tool_id],
+    ).unwrap();
+    let legacy_id = db.last_insert_rowid();
+    drop(db);
+    let replies = mcp_calls(
+        &workspace,
+        &[
+            json!({"name":"search", "arguments":{"query":"fixturepoll"}}),
+            json!({"name":"search", "arguments":{"query":"fixturepoll", "memories_only":true}}),
+        ],
+    );
+    let mut worker = workspace
+        .command()
+        .arg("serve")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(worker.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = line.trim();
+    let response = (|| -> anyhow::Result<_> {
+        let get = |suffix: &str| -> anyhow::Result<String> {
+            Ok(ureq::get(format!("{url}{suffix}"))
+                .call()?
+                .body_mut()
+                .read_to_string()?)
+        };
+        Ok((
+            get("")?,
+            get("?view=activity&q=fixturepoll")?,
+            get(&format!("?view=activity&evidence={summary_id}"))?,
+            get(&format!("?view=activity&evidence={legacy_id}"))?,
+        ))
+    })();
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    let (memories, activity, evidence, legacy_evidence) = response.unwrap();
+    assert!(memories.contains("websocket retry regression"));
+    assert!(memories.contains("retry counter resets too soon"));
+    assert!(!memories.contains("fixturepoll"));
+    assert!(!memories.contains("conversationalfixture"));
+    assert!(memories.contains(&format!("view=activity&amp;evidence={summary_id}")));
+    assert!(memories.contains(&format!("view=activity&amp;evidence={legacy_id}")));
+    assert!(memories.contains("Legacy fixture"));
+    assert!(activity.contains("fixturepoll"));
+    assert!(evidence.contains("FAILED: expected three retries"));
+    assert!(!evidence.contains("fixturepoll"));
+    assert!(legacy_evidence.contains("FAILED: expected three retries"));
+    assert!(replies[0].contains("fixturepoll"));
+    assert_eq!(replies[1], "[]");
+}
+
+#[test]
+fn claude_can_resume_a_named_opencode_or_pi_family_session() {
+    let workspace = Workspace::new();
+    for (host, result) in [
+        ("opencode", "Fixed the websocket backoff"),
+        ("omp", "Verified the merge order"),
+        ("pi", "Updated the parser fixtures"),
+    ] {
+        workspace.hook(
+            host,
+            host,
+            "UserPromptSubmit",
+            json!({"turn_id":"t", "prompt":"Investigate the failing test"}),
+        );
+        workspace.hook(
+            host,
+            host,
+            "Stop",
+            json!({"turn_id":"t", "last_assistant_message":result}),
+        );
+    }
+    for (agent, result) in [
+        ("OpenCode", "Fixed the websocket backoff"),
+        ("Oh My Pi", "Verified the merge order"),
+        ("Pi", "Updated the parser fixtures"),
+    ] {
+        let response = workspace.hook(
+            "claude",
+            agent,
+            "UserPromptSubmit",
+            json!({"prompt":format!("Continue the work I started in {agent}")}),
+        );
+        assert!(response.contains(result), "{agent}: {response}");
+    }
+    let ordinary = workspace.hook(
+        "claude",
+        "firmware",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue fixing the Raspberry Pi serial firmware."}),
+    );
+    assert!(ordinary.is_empty(), "{ordinary}");
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1631,7 +1913,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]

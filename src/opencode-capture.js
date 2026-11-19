@@ -20,12 +20,28 @@ async function setupOpenCode(ctx) {
     }
   });
 
-  await ctx.session.hook("context", ({ sessionID, messages }) => {
-    const state = sessions.get(sessionID);
-    if (!state) return;
-    const message = messages.findLast((entry) => entry.role === "user");
-    state.turn = state.turns.get(message?.metadata?.[turnMetadataKey]);
-    if (state.turn) state.turn.delivered = true;
+  await ctx.session.hook("context", async ({ sessionID, messages }) => {
+    try {
+      const state = sessions.get(sessionID);
+      if (!state) return;
+      const index = messages.findLastIndex((entry) => entry.role === "user");
+      const message = messages[index];
+      if (!message) return;
+      let id = message.metadata?.[turnMetadataKey] ?? message.id;
+      if (!state.turns.has(id)) {
+        // Some V2 releases omit IDs and metadata from the model-facing messages.
+        const stored = (await ctx.session.context({ sessionID })).findLast((entry) => entry.type === "user");
+        if (stored && contentText(stored.content) === contentText(message.content)) id = stored.id;
+      }
+      const turn = state.turns.get(id);
+      state.turn = turn;
+      if (!turn) return;
+      turn.delivered = true;
+      const brief = Array.isArray(message.content) ? await recallForTurn(turn) : undefined;
+      if (brief) messages[index] = { ...message, content: [...message.content, recallPart(brief)] };
+    } catch (error) {
+      captureError(error);
+    }
   });
 
   await ctx.tool.hook("execute.before", ({ sessionID, messageID, id, tool }) => {
@@ -113,6 +129,17 @@ async function legacyOpenCode({ client, directory }) {
       } catch (error) {
         captureError(error);
       }
+    },
+    "experimental.chat.messages.transform": async (_input, { messages }) => {
+      const index = messages.findLastIndex(({ info }) => info.role === "user");
+      const message = messages[index];
+      if (!message) return;
+      const { id, sessionID } = message.info;
+      const brief = await recallForTurn(sessions.get(sessionID)?.get(id));
+      if (!brief) return;
+      messages[index] = { ...message, parts: [...message.parts, {
+        ...recallPart(brief), id: `${id}-mib`, sessionID, messageID: id, synthetic: true,
+      }] };
     },
     event: async ({ event }) => {
       const id = event.properties?.sessionID;

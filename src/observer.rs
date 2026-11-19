@@ -65,21 +65,6 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
         .collect::<Vec<_>>()
         .join("\n");
     let generated = observer.and_then(|observer| summarize(observer, &evidence).ok());
-    let ids: Vec<_> = sources
-        .iter()
-        .map(|record| format!("[#{}]", record.id))
-        .collect();
-    // Keep the request and the latest events; timeline expands the rest.
-    let references = if ids.len() > 10 {
-        format!(
-            "{} … {} ({} records)",
-            ids[0],
-            ids[ids.len() - 8..].join(" "),
-            ids.len()
-        )
-    } else {
-        ids.join(" ")
-    };
     let prompt = sources
         .iter()
         .find(|record| record.kind == "prompt")
@@ -91,6 +76,38 @@ pub fn process_one(store: &Store, observer: Option<&Observer>) -> Result<bool> {
         .map(|record| record.body.as_str())
         .collect();
     let facts = crate::distill::distill(&anchor.workspace, prompt, &tools, &anchor.body);
+    let mut references = Vec::new();
+    if let Some(first) = sources.first() {
+        references.push(first.id);
+    }
+    let mut checks = std::collections::HashSet::new();
+    for record in sources.iter().rev().filter(|record| record.kind == "tool") {
+        if let Some(command) = crate::distill::check_command(&record.body)
+            && facts.checks.iter().any(|(shown, _)| *shown == command)
+            && checks.insert(command)
+            && !references.contains(&record.id)
+        {
+            references.push(record.id);
+        }
+    }
+    for record in sources.iter().rev() {
+        if references.len() == 10 {
+            break;
+        }
+        if !references.contains(&record.id) {
+            references.push(record.id);
+        }
+    }
+    let omitted = sources.len() > references.len();
+    references.sort_unstable();
+    let mut references = references
+        .into_iter()
+        .map(|id| format!("[#{id}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if omitted {
+        references.push_str(&format!(" ({} records)", sources.len()));
+    }
     let (body, tokens) = match generated {
         Some((summary, tokens)) => (facts.render("Model summary", &summary, &references), tokens),
         None => (facts.render("Outcome", &anchor.body, &references), 0),

@@ -1,5 +1,6 @@
 const connectionStatus = document.querySelector("#viewer-status");
 const stats = document.querySelector("#viewer-stats");
+const recall = document.querySelector("#viewer-recall");
 const activity = document.querySelector("#viewer-activity");
 const timestampFormat = new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
@@ -55,6 +56,9 @@ async function refresh() {
                 const page = new DOMParser().parseFromString(await response.text(), "text/html");
                 const nextStats = page.querySelector("#viewer-stats");
                 if (!stats.isEqualNode(nextStats)) stats.replaceChildren(...nextStats.childNodes);
+                const nextRecall = page.querySelector("#viewer-recall");
+                localizeTimestamps(nextRecall);
+                if (!recall.isEqualNode(nextRecall)) recall.replaceChildren(...nextRecall.childNodes);
                 updateActivity(page.querySelector("#viewer-activity"));
                 etag = response.headers.get("ETag");
             }
@@ -67,4 +71,5 @@ async function refresh() {
 }
 
 localizeTimestamps(activity);
+localizeTimestamps(recall);
 refresh();

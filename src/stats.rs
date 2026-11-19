@@ -14,19 +14,24 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
     vec![
         Line {
             label: "Memory",
-            value: compact(stats.records),
-            unit: "records",
+            value: compact(stats.memories),
+            unit: plural(stats.memories, "memory", "memories"),
             detail: format!(
-                "{} sessions across {} {}",
-                compact(stats.sessions),
+                "{} total activity {} across {} {}",
+                compact(stats.records),
+                plural(stats.records, "record", "records"),
                 stats.workspaces,
-                plural(stats.workspaces, "workspace", "workspaces")
+                plural(stats.workspaces, "workspace", "workspaces"),
             ),
         },
         Line {
             label: "Recall",
             value: compact(stats.sessions_helped),
-            unit: "sessions helped",
+            unit: plural(
+                stats.sessions_helped,
+                "session with automatic recall",
+                "sessions with automatic recall",
+            ),
             detail: format!(
                 "{} injections, {} records of evidence, ≈{} tokens injected",
                 compact(stats.context_injections),
@@ -35,12 +40,13 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
             ),
         },
         Line {
-            label: "Lookups",
+            label: "MCP lookups",
             value: compact(stats.mcp_searches),
-            unit: "searches",
+            unit: plural(stats.mcp_searches, "search", "searches"),
             detail: format!(
-                "{} records fetched by agents, ≈{} tokens returned",
+                "{} {} fetched by agents, ≈{} tokens returned",
                 compact(stats.mcp_records),
+                plural(stats.mcp_records, "record", "records"),
                 tokens(stats.mcp_bytes)
             ),
         },

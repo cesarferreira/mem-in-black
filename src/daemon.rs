@@ -374,9 +374,11 @@ impl Semantic {
 
     fn search(
         &self,
+        store: &Store,
         query: &str,
         scope: &Scope<'_>,
         limit: usize,
+        memories_only: bool,
     ) -> Result<Option<Vec<(i64, f32)>>> {
         if !self.ready.load(Ordering::Acquire) {
             return Ok(None);
@@ -393,11 +395,12 @@ impl Semantic {
             };
             embedder.embed_query(query)?
         };
+        let allowed = memories_only.then(|| store.memory_ids()).transpose()?;
         Ok(Some(
             self.index
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .search(&vector, scope, limit),
+                .search_filtered(&vector, scope, limit, allowed.as_ref()),
         ))
     }
 }
@@ -410,6 +413,7 @@ pub fn semantic_search(
     scope: &Scope<'_>,
     limit: usize,
     timeout: Duration,
+    memories_only: bool,
 ) -> Option<Vec<(i64, f32)>> {
     let base = fs::read_to_string(data.directory.join(URL)).ok()?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -426,7 +430,7 @@ pub fn semantic_search(
     let mut response = agent
         .post(format!("{}/semantic", base.trim()))
         .send_json(
-            json!({"query": query, "workspace": workspace, "project": project, "limit": limit}),
+            json!({"query": query, "workspace": workspace, "project": project, "limit": limit, "memories_only": memories_only}),
         )
         .ok()?;
     let value: Value = response
@@ -443,7 +447,11 @@ pub fn semantic_search(
     )
 }
 
-fn semantic_response(semantic: &Semantic, request: &mut Request) -> Response<io::Cursor<Vec<u8>>> {
+fn semantic_response(
+    store: &Store,
+    semantic: &Semantic,
+    request: &mut Request,
+) -> Response<io::Cursor<Vec<u8>>> {
     let mut body = String::new();
     let parsed = request
         .as_reader()
@@ -461,7 +469,8 @@ fn semantic_response(semantic: &Semantic, request: &mut Request) -> Response<io:
         _ => Scope::All,
     };
     let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-    match semantic.search(query, &scope, limit) {
+    let memories_only = input["memories_only"].as_bool().unwrap_or_default();
+    match semantic.search(store, query, &scope, limit, memories_only) {
         Ok(Some(hits)) => Response::from_string(json!({"hits": hits}).to_string()),
         Ok(None) => Response::from_string("Not ready").with_status_code(503),
         Err(_) => Response::from_string("Embedding failed").with_status_code(500),
@@ -491,7 +500,7 @@ fn handle(
         return true;
     }
     if request.method() == &Method::Post && path == format!("{token}/semantic") {
-        let response = semantic_response(semantic, &mut request);
+        let response = semantic_response(store, semantic, &mut request);
         let _ = request.respond(response);
         return false;
     }
@@ -506,11 +515,8 @@ fn handle(
         let _ = request.respond(Response::from_string("Not found").with_status_code(404));
         return false;
     }
-    let query = form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == "q")
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default();
-    let mut response = viewer_response(store, semantic, token, &query, &request)
+    let view = ViewerQuery::parse(query);
+    let mut response = viewer_response(store, semantic, token, &view, &request)
         .unwrap_or_else(|_| Response::from_string("Unable to load memory").with_status_code(500));
     for (name, value) in [
         ("Content-Type", "text/html; charset=utf-8"),
@@ -529,11 +535,36 @@ fn handle(
     false
 }
 
+#[derive(Default)]
+struct ViewerQuery {
+    text: String,
+    activity: bool,
+    evidence: Option<i64>,
+    record: Option<i64>,
+}
+
+impl ViewerQuery {
+    fn parse(query: &str) -> Self {
+        let mut view = Self::default();
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "q" => view.text = value.into_owned(),
+                "view" => view.activity = value == "activity",
+                "evidence" => view.evidence = value.parse().ok(),
+                "record" => view.record = value.parse().ok(),
+                _ => {}
+            }
+        }
+        view.activity |= view.evidence.is_some();
+        view
+    }
+}
+
 fn viewer_response(
     store: &Store,
     semantic: &Semantic,
     token: &str,
-    query: &str,
+    view: &ViewerQuery,
     request: &Request,
 ) -> Result<Response<io::Cursor<Vec<u8>>>> {
     // Read the version before rendering so a concurrent commit triggers the next refresh.
@@ -547,20 +578,67 @@ fn viewer_response(
     let response = if unchanged {
         Response::from_string("").with_status_code(304)
     } else {
-        Response::from_string(viewer(store, semantic, token, query)?)
+        Response::from_string(viewer(store, semantic, token, view)?)
     };
     Ok(response.with_header(Header::from_bytes("ETag", tag).unwrap()))
 }
 
-fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Result<String> {
+fn viewer(store: &Store, semantic: &Semantic, token: &str, view: &ViewerQuery) -> Result<String> {
     let find = |text: &str, limit: usize| {
         semantic
-            .search(text, &Scope::All, limit)
+            .search(store, text, &Scope::All, limit, !view.activity)
             .ok()
             .flatten()
             .map(|hits| hits.into_iter().map(|(id, _)| id).collect())
     };
-    let rows = mcp::search(store, Some(query), None, 40, Some(&find))?;
+    let rows = if let Some(id) = view.evidence {
+        source_evidence(store, id)?
+    } else if let Some(id) = view.record {
+        store.live(&[id])?
+    } else {
+        mcp::search_filtered(
+            store,
+            Some(&view.text),
+            None,
+            40,
+            Some(&find),
+            !view.activity,
+        )?
+    };
+    let mode_input = if view.activity {
+        r#"<input type="hidden" name="view" value="activity">"#
+    } else {
+        ""
+    };
+    let view_tabs = [("Memories", false), ("Activity", true)]
+        .into_iter()
+        .map(|(label, activity)| {
+            let mut query = form_urlencoded::Serializer::new(String::new());
+            if activity {
+                query.append_pair("view", "activity");
+            }
+            if !view.text.is_empty() {
+                query.append_pair("q", &view.text);
+            }
+            let query = query.finish();
+            let link = if query.is_empty() {
+                token.to_owned()
+            } else {
+                format!("{token}?{query}")
+            };
+            let selected = if activity == view.activity {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            format!(r#"<a href="{}"{selected}>{label}</a>"#, escape(&link))
+        })
+        .collect::<String>();
+    let evidence_heading = view
+        .evidence
+        .map(|id| format!("<h2>Source evidence for #{id}</h2>"))
+        .or_else(|| view.record.map(|id| format!("<h2>Record #{id}</h2>")))
+        .unwrap_or_default();
     let mut html = format!(
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mem in Black</title>
 <script src="{token}/live.js" defer></script>
@@ -577,21 +655,42 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
 .project-label,.agent-label{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:5px;padding:3px 7px;font-size:12px;font-weight:600;line-height:1.3}}
 .project-label{{background:hsl(var(--project-hue) 35% 26%);color:hsl(var(--project-hue) 72% 87%)}}
 .agent-label{{background:rgb(0 0 0 / .2);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .24)}}
-.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:0 0 28px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}.note{{font-size:13px;margin:-16px 0 28px}}
-</style><main><header class="viewer-heading"><h1>Mem in Black</h1><span id="viewer-status" role="status" hidden></span></header>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form><div id="viewer-activity">"#,
-        escape(query),
-        stats = stat_cards(store)?,
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:0 0 16px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}
+#viewer-recall{{margin:0 0 28px;padding:14px 16px;border:1px solid var(--line);border-radius:10px}}#viewer-recall h2{{font-size:15px;margin:0}}#viewer-recall p,#viewer-recall ul{{font-size:14px;margin:8px 0 0}}#viewer-recall ul{{padding:0;list-style:none}}#viewer-recall li+li{{border-top:1px solid var(--line);margin-top:8px;padding-top:8px}}#viewer-recall li{{overflow-wrap:anywhere}}
+a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{padding:8px 12px;border:1px solid var(--line);border-radius:8px;color:var(--muted);text-decoration:none}}nav a[aria-current="page"]{{background:var(--panel);color:var(--ink);border-color:var(--accent)}}.memory-preview{{display:block;margin-top:6px;color:var(--muted);font-size:14px;line-height:1.45}}details[open] .memory-preview{{display:none}}.source-link{{display:inline-block;margin-top:12px;font-size:14px}}
+</style><main><header class="viewer-heading"><h1>Mem in Black</h1><span id="viewer-status" role="status" hidden></span></header>{stats}<nav aria-label="Memory views">{view_tabs}</nav><form action="{token}" method="get">{mode_input}<input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>{evidence_heading}<div id="viewer-activity">"#,
+        escape(&view.text),
+        stats = stat_cards(store, token)?,
     );
     if rows.is_empty() {
-        let message = if query.trim().is_empty() {
-            "Captured work will appear here."
+        let message = if view.evidence.is_some() {
+            "No source records are available for this memory."
+        } else if view.record.is_some() {
+            "This record is no longer available."
+        } else if !view.text.trim().is_empty() {
+            "No records match this search."
+        } else if view.activity {
+            "Captured activity will appear here."
         } else {
-            "No observations match this search."
+            "Work summaries and saved notes will appear here."
         };
         html.push_str(&format!(r#"<p id="activity-empty">{message}</p>"#));
     }
     for item in rows {
-        let heading = item.body.lines().next().unwrap_or_default();
+        let heading = record_heading(&item);
+        let preview = if view.activity {
+            String::new()
+        } else {
+            memory_preview(&item)
+        };
+        let source_link = if !view.activity && !evidence_ids(&item).is_empty() {
+            format!(
+                r#"<a class="source-link" href="{token}?view=activity&amp;evidence={}">Source evidence</a>"#,
+                item.id
+            )
+        } else {
+            String::new()
+        };
         let project = if item.project.is_empty() {
             &item.workspace
         } else {
@@ -599,27 +698,15 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         };
         let name = escape(project_name(project));
         let hue = project_hue(project);
-        let agent = escape(match item.source.as_str() {
-            "claude" => "Claude Code",
-            "codex" => "Codex",
-            "opencode" => "OpenCode",
-            "pi" => "Pi",
-            "omp" => "Oh My Pi",
-            "claude-mem" => "Claude-Mem",
-            "manual" => "Manual note",
-            "" => "Unknown source",
-            source => source,
-        });
-        let time = DateTime::from_timestamp(item.created_at, 0)
-            .map(|date| date.to_rfc3339_opts(SecondsFormat::Secs, true))
-            .map(|date| format!(r#"<time datetime="{date}" title="{date}">{date}</time>"#))
-            .unwrap_or_default();
+        let agent = escape(agent_name(&item.source));
+        let time = timestamp(item.created_at);
+        let open = if view.record.is_some() { " open" } else { "" };
         html.push_str(&format!(
-            r#"<details id="record-{id}" style="--project-hue:{hue:.6}">
+            r#"<details id="record-{id}" style="--project-hue:{hue:.6}"{open}>
 <summary><span class="record-heading"><span class="record-title">{heading}</span><span class="record-tags">
 <span class="project-label" title="{name}">{name}</span><span class="agent-label" title="{agent}">{agent}</span>
-</span></span>{time}</summary>
-<small>#{id} · {kind} · {workspace}</small><pre>{body}</pre></details>"#,
+</span></span>{preview}{time}</summary>
+<small>#{id} · {kind} · {workspace}</small><pre>{body}</pre>{source_link}</details>"#,
             id = item.id,
             heading = escape(crate::hooks::cut(heading, 165)),
             kind = escape(&item.kind),
@@ -629,6 +716,105 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
     }
     html.push_str("</div></main></html>");
     Ok(html)
+}
+
+fn memory_preview(record: &crate::store::Record) -> String {
+    if record.kind != "summary" {
+        return String::new();
+    }
+    let preview = [
+        "Outcome: ",
+        "Model summary: ",
+        "Decision: ",
+        "learned: ",
+        "Latest agent update: ",
+    ]
+    .into_iter()
+    .find_map(|prefix| {
+        record
+            .body
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+    })
+    .unwrap_or_default();
+    let mut html = String::new();
+    for (label, value) in [
+        ("", Some(preview)),
+        (
+            "Checks: ",
+            crate::distill::summary_fact(&record.body, "Checks: "),
+        ),
+        (
+            "Next: ",
+            crate::distill::summary_fact(&record.body, "Next: "),
+        ),
+    ] {
+        if let Some(value) = value.filter(|text| !text.is_empty()) {
+            html.push_str(&format!(
+                r#"<span class="memory-preview">{label}{}</span>"#,
+                escape(crate::hooks::cut(value, 240))
+            ));
+        }
+    }
+    html
+}
+
+fn record_heading(record: &crate::store::Record) -> &str {
+    let mut lines = record.body.lines();
+    let first = lines.next().unwrap_or_default();
+    if record.kind == "summary" && first.starts_with("Evidence [#") {
+        return lines
+            .find_map(|line| line.strip_prefix("Request: "))
+            .filter(|request| !request.is_empty())
+            .unwrap_or("Work summary");
+    }
+    if record.kind == "summary" && first.starts_with("Model summary. Evidence [#") {
+        return lines
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Work summary");
+    }
+    first.strip_prefix("title: ").unwrap_or(first)
+}
+
+fn evidence_ids(record: &crate::store::Record) -> Vec<i64> {
+    if record.kind != "summary" || record.source == "claude-mem" {
+        return Vec::new();
+    }
+    let mut lines = record.body.lines();
+    let first = lines.next().unwrap_or_default();
+    first
+        .strip_prefix("Evidence ")
+        .or_else(|| first.strip_prefix("Model summary. Evidence "))
+        .or_else(|| {
+            lines
+                .next_back()
+                .and_then(|line| line.strip_prefix("Evidence "))
+        })
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|part| {
+            part.strip_prefix("[#")?
+                .strip_suffix(']')?
+                .parse::<i64>()
+                .ok()
+        })
+        .collect()
+}
+
+fn source_evidence(store: &Store, id: i64) -> Result<Vec<crate::store::Record>> {
+    let Some(summary) = store.live(&[id])?.pop() else {
+        return Ok(Vec::new());
+    };
+    let mut rows = store.live(&evidence_ids(&summary))?;
+    rows.retain(|row| {
+        row.id < summary.id
+            && row.source == summary.source
+            && row.session == summary.session
+            && row.workspace == summary.workspace
+            && row.turn_id == summary.turn_id
+            && matches!(row.kind.as_str(), "prompt" | "tool" | "assistant")
+    });
+    Ok(rows)
 }
 
 fn project_name(project: &str) -> &str {
@@ -649,10 +835,31 @@ fn project_hue(project: &str) -> f64 {
     f64::from(seed) * 360.0 / (f64::from(u32::MAX) + 1.0)
 }
 
-fn stat_cards(store: &Store) -> Result<String> {
+fn agent_name(source: &str) -> &str {
+    match source {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "pi" => "Pi",
+        "omp" => "Oh My Pi",
+        "claude-mem" => "Claude-Mem",
+        "manual" => "Manual note",
+        "" => "Unknown source",
+        source => source,
+    }
+}
+
+fn timestamp(seconds: i64) -> String {
+    DateTime::from_timestamp(seconds, 0)
+        .map(|date| date.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .map(|date| format!(r#"<time datetime="{date}" title="{date}">{date}</time>"#))
+        .unwrap_or_default()
+}
+
+fn stat_cards(store: &Store, token: &str) -> Result<String> {
     let stats = store.stats(None)?;
     let mut html = String::from(r#"<section id="viewer-stats" class="stats" aria-label="Usage">"#);
-    for line in crate::stats::lines(&stats) {
+    for line in crate::stats::lines(&stats).into_iter().take(3) {
         html.push_str(&format!(
             "<div class=\"stat\"><span>{}</span><b>{} <small>{}</small></b><em>{}</em></div>",
             escape(line.label),
@@ -661,9 +868,25 @@ fn stat_cards(store: &Store) -> Result<String> {
             escape(&line.detail)
         ));
     }
-    html.push_str(
-        "</section><p class=\"note\">Tokens are estimated at 4 bytes each. Savings are an upper bound.</p>",
-    );
+    html.push_str(r#"</section><section id="viewer-recall" aria-labelledby="recall-heading"><h2 id="recall-heading">Recent recall</h2>"#);
+    let deliveries = store.recent_deliveries()?;
+    if deliveries.is_empty() {
+        html.push_str("<p>Records will appear here when MIB adds them to an agent’s context.</p>");
+    } else {
+        html.push_str("<ul>");
+        for delivery in deliveries {
+            let record = delivery.record;
+            html.push_str(&format!(
+                r#"<li>{} received <a href="{token}?record={}">{}</a>{}</li>"#,
+                escape(agent_name(&delivery.recipient)),
+                record.id,
+                escape(crate::hooks::cut(record_heading(&record), 140)),
+                timestamp(delivery.delivered_at),
+            ));
+        }
+        html.push_str("</ul>");
+    }
+    html.push_str("</section>");
     Ok(html)
 }
 

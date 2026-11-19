@@ -26,6 +26,9 @@ struct Search {
     /// Absolute directory for the current worktree. Omit only to deliberately search all stored workspaces.
     workspace: Option<String>,
     limit: Option<usize>,
+    /// Return saved notes, imported observations, and work summaries.
+    #[serde(default)]
+    memories_only: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -95,13 +98,15 @@ impl MemoryServer {
                 &self.data,
                 root.as_deref(),
                 std::time::Duration::from_secs(5),
+                input.memories_only,
             );
-            let rows = search(
+            let rows = search_filtered(
                 store,
                 input.query.as_deref(),
                 root.as_deref(),
                 input.limit.unwrap_or(10),
                 Some(&semantic),
+                input.memories_only,
             )?;
             store.bump(&[("mcp_searches", 1)])?;
             Ok(rows.into_iter().map(IndexEntry::from).collect::<Vec<_>>())
@@ -200,7 +205,7 @@ impl MemoryServer {
 
 #[tool_handler(
     name = "meminblack",
-    instructions = "Use Mem in Black for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Start with a narrow search and fetch full observations only as needed."
+    instructions = "Use Mem in Black for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Use memories_only when searching for decisions or completed work. Fetch full observations only as needed."
 )]
 impl ServerHandler for MemoryServer {}
 
@@ -215,6 +220,17 @@ pub fn search(
     limit: usize,
     semantic: Option<Semantic<'_>>,
 ) -> Result<Vec<Record>> {
+    search_filtered(store, query, workspace, limit, semantic, false)
+}
+
+pub fn search_filtered(
+    store: &Store,
+    query: Option<&str>,
+    workspace: Option<&str>,
+    limit: usize,
+    semantic: Option<Semantic<'_>>,
+    memories_only: bool,
+) -> Result<Vec<Record>> {
     let query = query.filter(|text| !text.trim().is_empty());
     let terms = query.map(|text| phrases(text, false));
     // Natural-language queries rarely share every word with the record, so
@@ -227,11 +243,20 @@ pub fn search(
         if query.is_some() && fts.is_none() {
             return Ok(vec![]);
         }
-        return store.search(fts.as_deref(), workspace, limit);
+        return store.search_filtered(fts.as_deref(), workspace, limit, memories_only);
+    };
+    let semantic_ids = if memories_only {
+        store
+            .live_filtered(&semantic_ids, true)?
+            .into_iter()
+            .map(|record| record.id)
+            .collect()
+    } else {
+        semantic_ids
     };
     let lexical = match &fts {
         Some(fts) => store
-            .search(Some(fts), workspace, 50)?
+            .search_filtered(Some(fts), workspace, 50, memories_only)?
             .into_iter()
             .map(|record| record.id)
             .collect(),
@@ -249,13 +274,14 @@ pub fn worker_semantic<'a>(
     data: &'a Storage,
     workspace: Option<&'a str>,
     timeout: std::time::Duration,
+    memories_only: bool,
 ) -> impl Fn(&str, usize) -> Option<Vec<i64>> + 'a {
     move |query, limit| {
         let scope = match workspace {
             Some(root) => crate::embed::Scope::Workspace(root),
             None => crate::embed::Scope::All,
         };
-        crate::daemon::semantic_search(data, query, &scope, limit, timeout)
+        crate::daemon::semantic_search(data, query, &scope, limit, timeout, memories_only)
             .map(|hits| hits.into_iter().map(|(id, _)| id).collect())
     }
 }

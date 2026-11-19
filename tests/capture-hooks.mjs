@@ -43,7 +43,8 @@ for (const [host, path] of [
     const { home, command, plugin } = await fixture(test, host, path);
     const handlers = new Map();
     plugin({ on: (name, handler) => handlers.set(name, handler) });
-    const context = { cwd: home, sessionManager: { getSessionId: () => "session" } };
+    let session = "session";
+    const context = { cwd: home, sessionManager: { getSessionId: () => session } };
     const emit = (name, event = {}) => handlers.get(name)(event, context);
     const user = (text) => emit("message_start", { message: { role: "user", content: content(text) } });
     const finish = async (text) => {
@@ -78,6 +79,24 @@ for (const [host, path] of [
 
     const records = await memory(command, host, ["tool", "tool"]);
     assert.match(records[2].body, /src\/retry\.rs\nLines: \+2 -1/);
+    session = "follow-up";
+    const prompt = "Continue fixing the retry counter regression";
+    const message = { role: "user", attribution: "user", content: content(prompt), timestamp: 123 };
+    if (host === "omp") {
+      await handlers.get("before_agent_start")?.({ reason: "prompt", prompt }, context);
+    } else {
+      await emit("message_start", { message });
+    }
+    const recalled = await handlers.get("context")?.({ messages: [message] }, context);
+    assert.match(JSON.stringify(recalled ?? null), /completed the retry fix/);
+    assert.deepEqual(message.content, content(prompt), "persistent transcript stays untouched");
+    if (host === "omp") await emit("message_start", { message });
+    await finish("The retry fix is already done.");
+    await user("<private>Continue fixing the retry counter regression</private>");
+    assert.equal(await emit("context", { messages: [message] }), undefined);
+    const { stdout } = await command("export");
+    const turns = stdout.trim().split("\n").map(JSON.parse).filter((r) => r.session === session);
+    assert.deepEqual(turns.map((r) => r.kind), ["prompt", "assistant"]);
   });
 }
 
@@ -85,7 +104,7 @@ test("OpenCode V2 captures a delivered prompt and its completed work", async (te
   const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/meminblack-capture.js");
   const handlers = new Map();
   const register = (name, handler) => handlers.set(name, handler);
-  const sessionID = "session";
+  let sessionID = "session";
   const messages = [];
   const cleanup = await plugin.setup({
     session: { hook: register, context: async () => messages, get: async ({ sessionID }) => ({
@@ -96,16 +115,20 @@ test("OpenCode V2 captures a delivered prompt and its completed work", async (te
   });
   test.after(() => cleanup());
 
-  const user = async (messageID, text) => {
+  const user = async (messageID, text, copyMetadata = true) => {
     const event = { sessionID, messageID, prompt: { text } };
     await handlers.get("prompt")(event);
-    messages.push({ role: "user", type: "user", id: messageID, metadata: event.metadata });
-    await handlers.get("context")({ sessionID, messages });
+    const stored = { role: "user", type: "user", id: messageID, metadata: event.metadata, content: content(text) };
+    messages.push(stored);
+    const outbound = { ...stored, id: undefined, metadata: copyMetadata ? stored.metadata : undefined };
+    const request = { sessionID, messages: [outbound] };
+    await handlers.get("context")(request);
+    return request.messages[0];
   };
   await user("public", "Fix the retry counter regression");
   const tool = { sessionID, messageID: "answer", id: "test", tool: "shell", input: { command: "cargo test" } };
   await handlers.get("execute.before")(tool);
-  await handlers.get("execute.after")({ ...tool, status: "completed", result: { content: content("test result: ok") } });
+  await handlers.get("execute.after")({ ...tool, status: "completed", result: { content: content("test result: ok"), metadata: { exit: 1 } } });
   messages.push({ type: "assistant", content: content("I completed the retry fix.") });
   await user("private", "<private>private fixture</private>");
   await handlers.get("prompt")({ sessionID: "child", messageID: "child-prompt",
@@ -115,7 +138,14 @@ test("OpenCode V2 captures a delivered prompt and its completed work", async (te
   await handlers.get("execute.after")({ ...privateTool, status: "completed", result: { content: content("private fixture") } });
   messages.push({ type: "assistant", content: content("private fixture") });
   await handlers.get("experimental.idle")({ sessionID });
-  await memory(command, "opencode");
+  const recorded = await memory(command, "opencode");
+  assert.match(recorded.at(-1).body, /cargo test.*failed/, "the shell exit wins over success text");
+  messages.length = 0;
+  sessionID = "fresh";
+  const followUp = "Continue fixing the retry counter regression";
+  const outbound = await user("follow-up", followUp, false);
+  assert.match(JSON.stringify(outbound.content), /completed the retry fix/);
+  assert.deepEqual(messages[0].content, content(followUp));
 });
 
 test("OpenCode V1 captures tool output and the reply for the active prompt", async (test) => {
@@ -139,4 +169,12 @@ test("OpenCode V1 captures tool output and the reply for the active prompt", asy
   });
   await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
   await memory(command, "opencode");
+  const followUp = "Continue fixing the retry counter regression";
+  const info = { id: "follow-up", sessionID: "fresh", role: "user" };
+  const parts = content(followUp);
+  await hooks["chat.message"]({ sessionID: "fresh" }, { message: info, parts });
+  const output = { messages: [{ info, parts }] };
+  await hooks["experimental.chat.messages.transform"]?.({}, output);
+  assert.match(JSON.stringify(output.messages[0].parts), /completed the retry fix/);
+  assert.deepEqual(parts, content(followUp));
 });
