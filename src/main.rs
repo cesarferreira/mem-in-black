@@ -51,7 +51,7 @@ enum Command {
     Stop,
     /// Inspect the daemon, viewer URL and stored observation counts.
     Status,
-    /// Open the local viewer in your default browser.
+    /// Print the local viewer URL and open it in your default browser.
     Open,
     /// Process pending observations once.
     Observe,

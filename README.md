@@ -129,7 +129,7 @@ you describe a problem in different words than the record used.
 | Command | What it does |
 | --- | --- |
 | `mib stats` | Usage and an estimate of tokens saved (`--json`, `--workspace .`) |
-| `mib open` | Open the live viewer in your default browser, starting the worker if needed |
+| `mib open` | Print the live viewer URL and open it in your default browser, starting the worker if needed |
 | `mib status` | Worker state, database path and the private viewer URL |
 | `mib search "query"` | Search memory (`--workspace .` for one worktree) |
 | `mib preview` | Recent activity for this worktree |

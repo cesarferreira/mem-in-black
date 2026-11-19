@@ -112,6 +112,8 @@ pub fn open_viewer(data: &Storage) -> Result<()> {
         );
         thread::sleep(Duration::from_millis(50));
     };
+    // Printed first, so the URL is at hand even when no browser opens.
+    println!("{url}");
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -120,10 +122,10 @@ pub fn open_viewer(data: &Storage) -> Result<()> {
     let exit = Command::new(opener)
         .arg(url.to_string())
         .status()
-        .with_context(|| format!("could not run {opener}. Run `mib status` for the viewer URL."))?;
+        .with_context(|| format!("could not run {opener}. Open the URL above in a browser."))?;
     anyhow::ensure!(
         exit.success(),
-        "{opener} failed ({exit}). Run `mib status` for the viewer URL."
+        "{opener} failed ({exit}). Open the URL above in a browser."
     );
     Ok(())
 }

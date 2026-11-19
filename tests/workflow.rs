@@ -823,6 +823,10 @@ fn open_starts_the_worker_and_launches_its_current_viewer_url() {
         fs::read_to_string(browser_args).unwrap(),
         format!("{viewer_url}\n")
     );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{viewer_url}\n")
+    );
 }
 
 #[test]
