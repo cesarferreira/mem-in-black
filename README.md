@@ -135,7 +135,7 @@ you describe a problem in different words than the record used.
 | `mib stop` / `serve` | Stop the background worker, or run it in the foreground |
 
 The viewer refreshes activity and usage while the tab is visible. Each row shows
-a local timestamp and is tinted and labeled by project.
+a local timestamp, a project tint and label, and an agent or source badge.
 
 The tokens-saved figure is an upper bound: it assumes each delivered record
 replaced re-reading its full original output.

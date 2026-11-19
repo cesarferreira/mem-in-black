@@ -438,6 +438,7 @@ fn worker_viewer_serves_history_only_at_its_private_url() {
     let (body, status) = response.unwrap();
     assert_eq!(status, 404);
     assert!(body.contains("websocket retry regression"));
+    assert!(body.contains("class=\"agent-label\" title=\"Claude Code\">Claude Code</span>"));
     assert!(
         body.contains("Saved (est.)"),
         "the viewer shows usage stats"
@@ -491,6 +492,7 @@ fn viewer_refreshes_after_capture_and_shows_record_timestamps() {
     assert!(body.contains("Capture an observation while the viewer is open"));
     assert!(body.contains("<time datetime=\""));
     assert!(body.contains("class=\"project-label\" title=\"repo\">repo</span>"));
+    assert!(body.contains("class=\"agent-label\" title=\"Codex\">Codex</span>"));
     assert!(body.contains("style=\"--project-hue:"));
 }
 

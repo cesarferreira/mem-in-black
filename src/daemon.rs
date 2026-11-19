@@ -573,7 +573,10 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
 #viewer-activity summary::before{{content:"";position:absolute;inset-inline-start:.1em;inset-block-start:.43em;border-block:.28em solid transparent;border-inline-start:.42em solid var(--muted)}}
 #viewer-activity details[open]>summary::before{{transform:rotate(90deg)}}
 .record-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px 16px}}
-.record-title{{min-width:0}}.project-label{{flex:none;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:5px;padding:3px 7px;background:hsl(var(--project-hue) 35% 26%);color:hsl(var(--project-hue) 72% 87%);font-size:12px;font-weight:600;line-height:1.3}}
+.record-title{{min-width:0}}.record-tags{{display:flex;flex:none;flex-wrap:wrap;justify-content:flex-end;gap:4px;max-width:48%}}
+.project-label,.agent-label{{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:5px;padding:3px 7px;font-size:12px;font-weight:600;line-height:1.3}}
+.project-label{{background:hsl(var(--project-hue) 35% 26%);color:hsl(var(--project-hue) 72% 87%)}}
+.agent-label{{background:rgb(0 0 0 / .2);box-shadow:inset 0 0 0 1px rgb(255 255 255 / .24)}}
 .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:0 0 28px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}.note{{font-size:13px;margin:-16px 0 28px}}
 </style><main><header class="viewer-heading"><h1>Mem in Black</h1><span id="viewer-status" role="status" hidden></span></header>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form><div id="viewer-activity">"#,
         escape(query),
@@ -596,14 +599,29 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         };
         let name = escape(project_name(project));
         let hue = project_hue(project);
+        let agent = escape(match item.source.as_str() {
+            "claude" => "Claude Code",
+            "codex" => "Codex",
+            "claude-mem" => "Claude-Mem",
+            "manual" => "Manual note",
+            "" => "Unknown source",
+            source => source,
+        });
         let time = DateTime::from_timestamp(item.created_at, 0)
             .map(|date| date.to_rfc3339_opts(SecondsFormat::Secs, true))
             .map(|date| format!(r#"<time datetime="{date}" title="{date}">{date}</time>"#))
             .unwrap_or_default();
         html.push_str(&format!(
-            r#"<details id="record-{id}" style="--project-hue:{hue:.6}"><summary><span class="record-heading"><span class="record-title">{}</span><span class="project-label" title="{name}">{name}</span></span>{time}</summary><small>#{id} · {} · {} · {}</small><pre>{}</pre></details>"#,
-            escape(crate::hooks::cut(heading, 165)), escape(&item.source),
-            escape(&item.kind), escape(&item.workspace), escape(&item.body), id = item.id
+            r#"<details id="record-{id}" style="--project-hue:{hue:.6}">
+<summary><span class="record-heading"><span class="record-title">{heading}</span><span class="record-tags">
+<span class="project-label" title="{name}">{name}</span><span class="agent-label" title="{agent}">{agent}</span>
+</span></span>{time}</summary>
+<small>#{id} · {kind} · {workspace}</small><pre>{body}</pre></details>"#,
+            id = item.id,
+            heading = escape(crate::hooks::cut(heading, 165)),
+            kind = escape(&item.kind),
+            workspace = escape(&item.workspace),
+            body = escape(&item.body),
         ));
     }
     html.push_str("</div></main></html>");
