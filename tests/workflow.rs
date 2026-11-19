@@ -788,7 +788,7 @@ fn open_starts_the_worker_and_launches_its_current_viewer_url() {
     fs::create_dir(&data).unwrap();
     // Mem in Black refuses a group-writable directory, which a umask of 002 creates.
     fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
-    let stale_url ="http://127.0.0.1:1/0123456789abcdef0123456789abcdef";
+    let stale_url = "http://127.0.0.1:1/0123456789abcdef0123456789abcdef";
     fs::write(data.join("viewer-url"), stale_url).unwrap();
 
     let opener = if cfg!(target_os = "macos") {
