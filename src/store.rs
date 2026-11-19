@@ -18,8 +18,7 @@ pub type VectorRow = (i64, String, String, Vec<u8>);
 /// (record id, workspace, project, body)
 pub type PendingText = (i64, String, String, String);
 
-const RECORD_COLUMNS: &str =
-    "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id";
+const RECORD_COLUMNS: &str = "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id, e.project";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -32,6 +31,8 @@ pub struct Record {
     pub head: Option<String>,
     pub created_at: i64,
     pub turn_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub project: String,
 }
 
 /// Usage figures. Byte counts are measured; token figures divide by four.
@@ -324,6 +325,13 @@ impl Store {
         Ok(self
             .db
             .pragma_query_value(None, "journal_mode", |row| row.get(0))?)
+    }
+
+    pub fn data_version(&self) -> Result<i64> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .pragma_query_value(None, "data_version", |row| row.get(0))?)
     }
 
     fn read_guard(&self) -> Result<Option<DatabaseGuard<'_>>> {
@@ -1061,6 +1069,7 @@ fn row_record(row: &Row<'_>) -> rusqlite::Result<Record> {
         head: row.get(6)?,
         created_at: row.get(7)?,
         turn_id: row.get(8)?,
+        project: row.get(9)?,
     })
 }
 

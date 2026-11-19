@@ -35,7 +35,7 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
 | Your data stays local | Nothing leaves your machine unless you configure a remote summary model |
 | Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
-| See what it saved | `mib stats` and the viewer |
+| See what it saved | `mib stats` and `mib open` |
 
 | What it costs | |
 | --- | --- |
@@ -126,12 +126,16 @@ you describe a problem in different words than the record used.
 | Command | What it does |
 | --- | --- |
 | `mib stats` | Usage and an estimate of tokens saved (`--json`, `--workspace .`) |
+| `mib open` | Open the live viewer in your default browser, starting the worker if needed |
 | `mib status` | Worker state, database path and the private viewer URL |
 | `mib search "query"` | Search memory (`--workspace .` for one worktree) |
 | `mib preview` | Recent activity for this worktree |
 | `mib forget <id>…` | Delete records and the summaries built from them |
 | `mib export` | All records as JSON lines |
 | `mib stop` / `serve` | Stop the background worker, or run it in the foreground |
+
+The viewer refreshes activity and usage while the tab is visible. Each row shows
+a local timestamp and is tinted and labeled by project.
 
 The tokens-saved figure is an upper bound: it assumes each delivered record
 replaced re-reading its full original output.

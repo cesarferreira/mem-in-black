@@ -6,11 +6,14 @@ use crate::{
     store::{Store, prepare_dir},
 };
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, SecondsFormat};
 use fs2::FileExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind, Read, Write},
+    path::Path,
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, RwLock,
@@ -80,6 +83,49 @@ pub fn status(data: &Storage) -> Result<Value> {
         "context_injections": store.metric("context_injections")?,
         "context_bytes": store.metric("context_bytes")?
     }))
+}
+
+pub fn open_viewer(data: &Storage) -> Result<()> {
+    start_background(data).context("starting the Mem in Black worker")?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(250)))
+        .proxy(None)
+        .max_redirects(0)
+        .build()
+        .into();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let url = loop {
+        if let Ok(value) = fs::read_to_string(data.directory.join(URL))
+            && let Ok(uri) = value.trim().parse::<ureq::http::Uri>()
+            && uri.scheme_str() == Some("http")
+            && uri.host() == Some("127.0.0.1")
+            && agent
+                .get(&uri)
+                .call()
+                .is_ok_and(|response| response.status().is_success())
+        {
+            break uri;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the viewer did not become ready. Check `mib status` or run `mib serve`."
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let exit = Command::new(opener)
+        .arg(url.to_string())
+        .status()
+        .with_context(|| format!("could not run {opener}. Run `mib status` for the viewer URL."))?;
+    anyhow::ensure!(
+        exit.success(),
+        "{opener} failed ({exit}). Run `mib status` for the viewer URL."
+    );
+    Ok(())
 }
 
 pub fn stop(data: &Storage) -> Result<()> {
@@ -211,6 +257,7 @@ pub struct Semantic {
     embedder: Mutex<Option<Embedder>>,
     index: RwLock<Index>,
     ready: AtomicBool,
+    revision: AtomicU64,
     waiting_queries: AtomicUsize,
     /// Milliseconds since the Unix epoch of the last query.
     last_query: AtomicU64,
@@ -249,6 +296,7 @@ impl Semantic {
         let load = || -> Result<()> {
             let embedder = Embedder::load(&data.directory, spec)?;
             *self.embedder.lock().unwrap_or_else(|e| e.into_inner()) = Some(embedder);
+            self.revision.fetch_add(1, Ordering::Release);
             self.last_query.store(now_ms(), Ordering::Release);
             // Requests that arrived during the load are served now.
             self.wanted.store(false, Ordering::Release);
@@ -265,6 +313,7 @@ impl Semantic {
                 }
                 *self.index.write().unwrap_or_else(|e| e.into_inner()) = index;
                 self.ready.store(true, Ordering::Release);
+                self.revision.fetch_add(1, Ordering::Release);
                 rebuilt = Instant::now();
             }
             let loaded = self
@@ -318,6 +367,7 @@ impl Semantic {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id, workspace, project, vector);
+                self.revision.fetch_add(1, Ordering::Release);
             }
         }
     }
@@ -445,6 +495,13 @@ fn handle(
         let _ = request.respond(response);
         return false;
     }
+    if request.method() == &Method::Get && path == format!("{token}/live.js") {
+        let response = Response::from_string(include_str!("viewer.js")).with_header(
+            Header::from_bytes("Content-Type", "text/javascript; charset=utf-8").unwrap(),
+        );
+        let _ = request.respond(response);
+        return false;
+    }
     if request.method() != &Method::Get || path != token {
         let _ = request.respond(Response::from_string("Not found").with_status_code(404));
         return false;
@@ -453,18 +510,15 @@ fn handle(
         .find(|(key, _)| key == "q")
         .map(|(_, value)| value.into_owned())
         .unwrap_or_default();
-    let page = viewer(store, semantic, token, &query);
-    let mut response = match page {
-        Ok(html) => Response::from_string(html),
-        Err(_) => Response::from_string("Unable to load memory").with_status_code(500),
-    };
+    let mut response = viewer_response(store, semantic, token, &query, &request)
+        .unwrap_or_else(|_| Response::from_string("Unable to load memory").with_status_code(500));
     for (name, value) in [
         ("Content-Type", "text/html; charset=utf-8"),
         ("Cache-Control", "no-store"),
         ("Referrer-Policy", "no-referrer"),
         (
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         ),
     ] {
         if let Ok(header) = Header::from_bytes(name, value) {
@@ -473,6 +527,29 @@ fn handle(
     }
     let _ = request.respond(response);
     false
+}
+
+fn viewer_response(
+    store: &Store,
+    semantic: &Semantic,
+    token: &str,
+    query: &str,
+    request: &Request,
+) -> Result<Response<io::Cursor<Vec<u8>>>> {
+    // Read the version before rendering so a concurrent commit triggers the next refresh.
+    let data = store.data_version()?;
+    let embeddings = semantic.revision.load(Ordering::Acquire);
+    let tag = format!(r#""{data}-{embeddings}""#);
+    let unchanged = request
+        .headers()
+        .iter()
+        .any(|header| header.field.equiv("If-None-Match") && header.value.as_str() == tag);
+    let response = if unchanged {
+        Response::from_string("").with_status_code(304)
+    } else {
+        Response::from_string(viewer(store, semantic, token, query)?)
+    };
+    Ok(response.with_header(Header::from_bytes("ETag", tag).unwrap()))
 }
 
 fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Result<String> {
@@ -486,10 +563,19 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
     let rows = mcp::search(store, Some(query), None, 40, Some(&find))?;
     let mut html = format!(
         r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mem in Black</title>
+<script src="{token}/live.js" defer></script>
 <style>
-:root{{color-scheme:dark;--bg:#15171a;--panel:#1c2024;--line:#343b42;--ink:#f0f1f2;--muted:#afb9c3;--accent:#a4dac2}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}}main{{max-width:940px;margin:0 auto;padding:48px 22px}}h1{{margin:0 0 24px;letter-spacing:-.035em;font-size:36px}}form{{display:flex;gap:10px;margin-bottom:30px}}input,button{{border:1px solid var(--line);border-radius:8px;font:inherit;padding:12px;background:var(--panel);color:var(--ink)}}input{{flex:1;min-width:0}}button{{color:var(--accent);cursor:pointer}}details{{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;padding:16px}}summary{{cursor:pointer;overflow-wrap:anywhere}}small{{display:block;color:var(--muted);margin:8px 0 0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,monospace;margin:16px 0 0}}p{{color:var(--muted)}}:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}
+:root{{color-scheme:dark;--bg:#15171a;--panel:#1c2024;--line:#343b42;--ink:#f0f1f2;--muted:#afb9c3;--accent:#a4dac2}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:16px system-ui,sans-serif}}main{{max-width:940px;margin:0 auto;padding:48px 22px}}h1{{margin:0;letter-spacing:-.035em;font-size:36px}}form{{display:flex;gap:10px;margin-bottom:30px}}input,button{{border:1px solid var(--line);border-radius:8px;font:inherit;padding:12px;background:var(--panel);color:var(--ink)}}input{{flex:1;min-width:0}}button{{color:var(--accent);cursor:pointer}}details{{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;padding:16px}}summary{{cursor:pointer;overflow-wrap:anywhere}}small{{display:block;color:var(--muted);margin:8px 0 0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.55 ui-monospace,monospace;margin:16px 0 0}}p{{color:var(--muted)}}:focus-visible{{outline:2px solid var(--accent);outline-offset:3px}}
+.viewer-heading{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;margin:0 0 24px}}#viewer-status{{font-size:13px;color:var(--muted)}}#viewer-status[data-connected="true"]{{color:var(--accent)}}time{{display:block;margin-top:4px;color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}}
+#viewer-activity details{{background:hsl(var(--project-hue) 36% 17%);border-color:hsl(var(--project-hue) 32% 33%)}}
+#viewer-activity summary{{position:relative;list-style:none;padding-inline-start:1.15em}}
+#viewer-activity summary::-webkit-details-marker{{display:none}}
+#viewer-activity summary::before{{content:"";position:absolute;inset-inline-start:.1em;inset-block-start:.43em;border-block:.28em solid transparent;border-inline-start:.42em solid var(--muted)}}
+#viewer-activity details[open]>summary::before{{transform:rotate(90deg)}}
+.record-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px 16px}}
+.record-title{{min-width:0}}.project-label{{flex:none;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:5px;padding:3px 7px;background:hsl(var(--project-hue) 35% 26%);color:hsl(var(--project-hue) 72% 87%);font-size:12px;font-weight:600;line-height:1.3}}
 .stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:0 0 28px}}.stat{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}}.stat b{{display:block;font-size:24px;letter-spacing:-.02em;margin:4px 0 6px;font-variant-numeric:tabular-nums}}.stat small{{display:inline;margin:0;font-size:13px;font-weight:500;letter-spacing:0;color:var(--muted)}}.stat span,.stat em{{color:var(--muted);font-size:13px;font-style:normal}}.note{{font-size:13px;margin:-16px 0 28px}}
-</style><main><h1>Mem in Black</h1>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form>"#,
+</style><main><header class="viewer-heading"><h1>Mem in Black</h1><span id="viewer-status" role="status" hidden></span></header>{stats}<form action="{token}" method="get"><input aria-label="Search memory" placeholder="Search memory" name="q" value="{}"><button>Search</button></form><div id="viewer-activity">"#,
         escape(query),
         stats = stat_cards(store)?,
     );
@@ -499,23 +585,52 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, query: &str) -> Resul
         } else {
             "No observations match this search."
         };
-        html.push_str(&format!("<p>{message}</p>"));
+        html.push_str(&format!(r#"<p id="activity-empty">{message}</p>"#));
     }
     for item in rows {
         let heading = item.body.lines().next().unwrap_or_default();
+        let project = if item.project.is_empty() {
+            &item.workspace
+        } else {
+            &item.project
+        };
+        let name = escape(project_name(project));
+        let hue = project_hue(project);
+        let time = DateTime::from_timestamp(item.created_at, 0)
+            .map(|date| date.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .map(|date| format!(r#"<time datetime="{date}" title="{date}">{date}</time>"#))
+            .unwrap_or_default();
         html.push_str(&format!(
-            "<details><summary>{}</summary><small>#{} · {} · {} · {}</small><pre>{}</pre></details>",
-            escape(crate::hooks::cut(heading, 165)), item.id, escape(&item.source),
-            escape(&item.kind), escape(&item.workspace), escape(&item.body)
+            r#"<details id="record-{id}" style="--project-hue:{hue:.6}"><summary><span class="record-heading"><span class="record-title">{}</span><span class="project-label" title="{name}">{name}</span></span>{time}</summary><small>#{id} · {} · {} · {}</small><pre>{}</pre></details>"#,
+            escape(crate::hooks::cut(heading, 165)), escape(&item.source),
+            escape(&item.kind), escape(&item.workspace), escape(&item.body), id = item.id
         ));
     }
-    html.push_str("</main></html>");
+    html.push_str("</div></main></html>");
     Ok(html)
+}
+
+fn project_name(project: &str) -> &str {
+    let path = Path::new(project.strip_prefix("claude-mem:").unwrap_or(project));
+    let path = if path.ends_with(".git") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("No project")
+}
+
+fn project_hue(project: &str) -> f64 {
+    let hash = Sha256::digest(project.as_bytes());
+    let seed = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    f64::from(seed) * 360.0 / (f64::from(u32::MAX) + 1.0)
 }
 
 fn stat_cards(store: &Store) -> Result<String> {
     let stats = store.stats(None)?;
-    let mut html = String::from(r#"<section class="stats" aria-label="Usage">"#);
+    let mut html = String::from(r#"<section id="viewer-stats" class="stats" aria-label="Usage">"#);
     for line in crate::stats::lines(&stats) {
         html.push_str(&format!(
             "<div class=\"stat\"><span>{}</span><b>{} <small>{}</small></b><em>{}</em></div>",

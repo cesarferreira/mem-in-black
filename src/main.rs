@@ -51,6 +51,8 @@ enum Command {
     Stop,
     /// Inspect the daemon, viewer URL and stored observation counts.
     Status,
+    /// Open the local viewer in your default browser.
+    Open,
     /// Process pending observations once.
     Observe,
     /// Import observations and summaries from a Claude Mem SQLite database.
@@ -175,6 +177,7 @@ fn main() -> Result<()> {
         Command::Serve => daemon::run(&data)?,
         Command::Stop => daemon::stop(&data)?,
         Command::Status => println!("{}", serde_json::to_string_pretty(&daemon::status(&data)?)?),
+        Command::Open => daemon::open_viewer(&data)?,
         Command::Observe => daemon::observe_once(&data)?,
         Command::Import {
             database,

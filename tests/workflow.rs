@@ -446,6 +446,105 @@ fn worker_viewer_serves_history_only_at_its_private_url() {
 }
 
 #[test]
+fn viewer_refreshes_after_capture_and_shows_record_timestamps() {
+    let workspace = Workspace::new();
+    let mut worker = workspace
+        .command()
+        .arg("serve")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(worker.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = line.trim();
+    let response = (|| -> anyhow::Result<_> {
+        let initial = ureq::get(url).call()?;
+        let etag = initial
+            .headers()
+            .get("etag")
+            .ok_or_else(|| anyhow::anyhow!("viewer did not send a revision"))?
+            .to_str()?;
+        let status = ureq::get(url)
+            .header("If-None-Match", etag)
+            .call()?
+            .status();
+        workspace.hook(
+            "codex",
+            "live-test",
+            "UserPromptSubmit",
+            json!({"prompt":"Capture an observation while the viewer is open"}),
+        );
+        let body = ureq::get(url)
+            .header("If-None-Match", etag)
+            .call()?
+            .body_mut()
+            .read_to_string()?;
+        Ok((status, body))
+    })();
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+
+    let (status, body) = response.unwrap();
+    assert_eq!(status, 304);
+    assert!(body.contains("Capture an observation while the viewer is open"));
+    assert!(body.contains("<time datetime=\""));
+    assert!(body.contains("class=\"project-label\" title=\"repo\">repo</span>"));
+    assert!(body.contains("style=\"--project-hue:"));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn open_starts_the_worker_and_launches_its_current_viewer_url() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let workspace = Workspace::new();
+    let data = workspace.temp.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let stale_url = "http://127.0.0.1:1/0123456789abcdef0123456789abcdef";
+    fs::write(data.join("viewer-url"), stale_url).unwrap();
+
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let opener = workspace.temp.path().join(opener);
+    let browser_args = workspace.temp.path().join("browser-args");
+    fs::write(
+        &opener,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BROWSER_ARGS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = workspace
+        .command()
+        .env_remove("MIB_NO_AUTOSTART")
+        .env("PATH", workspace.temp.path())
+        .env("BROWSER_ARGS", &browser_args)
+        .arg("open")
+        .output()
+        .unwrap();
+    let status = workspace.run(&["status"], None);
+    workspace.run(&["stop"], None);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_str(&status).unwrap();
+    let viewer_url = status["viewer_url"].as_str().unwrap();
+    assert_ne!(viewer_url, stale_url);
+    assert_eq!(
+        fs::read_to_string(browser_args).unwrap(),
+        format!("{viewer_url}\n")
+    );
+}
+
+#[test]
 fn keep_going_inside_an_active_thread_does_not_switch_to_another_task() {
     let workspace = Workspace::new();
     workspace.seed();

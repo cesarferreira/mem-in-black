@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 libc = "0.2"
