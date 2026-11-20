@@ -3,7 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/cesarferreira/mem-in-black/main/install.sh | sh
 #
-# MIB_VERSION      release tag to install, such as v0.1.0 (default: latest)
+# MIB_VERSION      release tag to install, such as v0.1.1 (default: latest)
+#
+# When a plain download fails, as it does for a private repository, the
+# script downloads through the GitHub CLI if `gh` is installed and signed in.
 # MIB_INSTALL_DIR  where to put mib (default: ~/.local/bin)
 set -eu
 
@@ -52,12 +55,23 @@ else
 fi
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 
+# Downloads one release file into the work folder.
+fetch() {
+	curl -fsSL "$base/$1" -o "$work/$1" 2>/dev/null && return 0
+	command -v gh >/dev/null 2>&1 || return 1
+	if [ "$version" = "latest" ]; then
+		gh release download --repo "$repo" --pattern "$1" --dir "$work" --clobber
+	else
+		gh release download "$version" --repo "$repo" --pattern "$1" --dir "$work" --clobber
+	fi
+}
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 
 echo "Downloading $asset ($version)"
-curl -fsSL "$base/$asset" -o "$work/$asset" || fail "could not download $base/$asset"
-curl -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" || fail "could not download $base/SHA256SUMS"
+fetch "$asset" || fail "could not download $base/$asset"
+fetch SHA256SUMS || fail "could not download $base/SHA256SUMS"
 
 expected="$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1 }' "$work/SHA256SUMS")"
 [ -n "$expected" ] || fail "SHA256SUMS has no entry for $asset"
