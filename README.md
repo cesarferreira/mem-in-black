@@ -81,7 +81,7 @@ Work as usual. Mem in Black stays quiet until it has something relevant:
 - **Handoff.** Ask to continue work from Claude, Codex, OpenCode, Pi, or Oh My Pi in the same worktree.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
-- **Startup preview.** A new session shows recent activity for the worktree. `MIB_STARTUP_PREVIEW=0` hides it.
+- **Startup preview.** A new session shows the latest work summaries for the worktree, with their commits. Before the first summary exists, it shows recent activity. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
 
 Agents can also call the MCP tools `search`, `timeline`, `get_observations`,

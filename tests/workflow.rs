@@ -2368,4 +2368,13 @@ fn summaries_list_turn_commits_and_recall_names_files_changed_since() {
     assert_eq!(stats["recall_followed"], 1, "{stats}");
     let text = workspace.run(&["stats"], None);
     assert!(text.contains("Recall used   50%"), "{text}");
+
+    // The preview lists work outcomes, not the tool calls and prompts behind them.
+    let preview = workspace.run(&["preview", "--color", "never"], None);
+    assert!(
+        preview.contains("Summary  Bugfix: Fix the websocket retry regression · "),
+        "{preview}"
+    );
+    assert!(!preview.contains("· Tool"), "{preview}");
+    assert!(!preview.contains("· Task"), "{preview}");
 }

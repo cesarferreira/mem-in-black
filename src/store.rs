@@ -520,14 +520,23 @@ impl Store {
         }
     }
 
+    /// Recent work in a worktree from the last 30 days. Work summaries, notes
+    /// and imported observations come first; individual prompts and tool calls
+    /// are shown only when the worktree has none of those yet.
     pub fn recent_activity(&self, workspace: &str, limit: u8) -> Result<Vec<RecentActivity>> {
         let _guard = self.read_guard()?;
         let mut statement = self.db.prepare(
-            "SELECT id, source, kind, body,
+            "WITH recent AS (
+               SELECT * FROM events WHERE workspace = ?1 AND created_at >= unixepoch() - 2592000
+                 AND superseded_by IS NULL
+             ), outcomes AS (
+               SELECT * FROM recent WHERE kind IN ('summary', 'note', 'observation')
+             )
+             SELECT id, source, kind, body,
                     strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime'),
                     strftime('%H:%M', created_at, 'unixepoch', 'localtime')
-             FROM events
-             WHERE workspace = ?1 AND created_at >= unixepoch() - 2592000
+             FROM (SELECT * FROM outcomes UNION ALL
+                   SELECT * FROM recent WHERE NOT EXISTS (SELECT 1 FROM outcomes))
              ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![workspace, limit], |row| {

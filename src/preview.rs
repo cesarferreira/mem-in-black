@@ -87,14 +87,28 @@ pub fn render(
             paint(&format!("#{}", row.id), "2", color),
             paint(source, source_style, color),
             paint(kind, kind_style, color),
-            display_line(headline(row), 78),
+            display_line(&headline(row), 78),
         ));
     }
     message.push_str(&paint("Viewer · mib status", "2", color));
     Ok(Some(message))
 }
 
-fn headline(row: &RecentActivity) -> &str {
+fn headline(row: &RecentActivity) -> String {
+    let first = summary_headline(row);
+    if row.kind != "summary" {
+        return first.to_owned();
+    }
+    // Name the first commit, so the work can be found in the history.
+    match crate::distill::summary_fact(&row.body, "Commits: ")
+        .and_then(|commits| commits.split_whitespace().next())
+    {
+        Some(hash) => format!("{} · {hash}", display_line(first, 68)),
+        None => first.to_owned(),
+    }
+}
+
+fn summary_headline(row: &RecentActivity) -> &str {
     let mut lines = row
         .body
         .lines()
