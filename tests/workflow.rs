@@ -2287,3 +2287,85 @@ fn claude_shell_results_store_printed_text_and_edited_files() {
         "{export}"
     );
 }
+
+#[test]
+fn summaries_list_turn_commits_and_recall_names_files_changed_since() {
+    let workspace = Workspace::new();
+    let commit = |file: &str, text: &str, message: &str| {
+        std::fs::create_dir_all(workspace.repo.join("src")).unwrap();
+        std::fs::write(workspace.repo.join(file), text).unwrap();
+        git(&workspace.repo, &["add", "-A"]);
+        git(
+            &workspace.repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+    };
+    workspace.hook(
+        "claude",
+        "first",
+        "UserPromptSubmit",
+        json!({"prompt":"Fix the websocket retry regression"}),
+    );
+    commit(
+        "src/ws.rs",
+        "reset after handshake",
+        "fix: reset the retry counter later",
+    );
+    workspace.hook(
+        "claude",
+        "first",
+        "Stop",
+        json!({"last_assistant_message":"The retry counter now resets after the handshake."}),
+    );
+    workspace.run(&["observe"], None);
+    let export = workspace.run(&["export"], None);
+    assert!(
+        export
+            .contains("Bugfix: Fix the websocket retry regression\\nFiles: src/ws.rs\\nCommits: "),
+        "{export}"
+    );
+    assert!(
+        export.contains(" fix: reset the retry counter later"),
+        "{export}"
+    );
+
+    let recall = |session: &str| {
+        let result = workspace.hook(
+            "codex",
+            session,
+            "UserPromptSubmit",
+            json!({"prompt":"Revisit the websocket retry regression"}),
+        );
+        serde_json::from_str::<Value>(&result).unwrap()["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    commit("src/other.rs", "unrelated", "chore: unrelated change");
+    let text = recall("second");
+    assert!(text.contains("• its files are unchanged since]"), "{text}");
+    commit("src/ws.rs", "reset before handshake", "revert the fix");
+    let text = recall("third");
+    assert!(text.contains("• changed since: src/ws.rs]"), "{text}");
+
+    // Only the second session went on to open the recalled file.
+    workspace.hook(
+        "codex",
+        "second",
+        "PostToolUse",
+        json!({"tool_name":"Read","tool_input":{"file_path": workspace.repo.join("src/ws.rs")}}),
+    );
+    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    assert_eq!(stats["recall_checked"], 2, "{stats}");
+    assert_eq!(stats["recall_followed"], 1, "{stats}");
+    let text = workspace.run(&["stats"], None);
+    assert!(text.contains("Recall used   50%"), "{text}");
+}

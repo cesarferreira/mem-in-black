@@ -78,6 +78,11 @@ pub struct Stats {
     pub mcp_bytes: i64,
     pub mcp_source_bytes: i64,
     pub observer_tokens: i64,
+    /// Recalled summaries that named files or commits, so their use can be seen.
+    pub recall_checked: i64,
+    /// Of those, the ones after which the agent touched a recalled file or
+    /// mentioned a recalled commit in the same session.
+    pub recall_followed: i64,
 }
 
 pub struct RecentDelivery {
@@ -1017,6 +1022,60 @@ impl Store {
         Ok(total)
     }
 
+    /// Counts recalled summaries whose files or commits the agent went on to
+    /// use in the same session, within its next 60 records. A file counts
+    /// when a later tool call names its path; a commit counts when a later
+    /// tool call or reply mentions its hash. The caller holds the read guard.
+    fn recall_follow_up(&self, workspace: Option<&str>) -> Result<(i64, i64)> {
+        let deliveries: Vec<(String, String, i64, String)> = self
+            .db
+            .prepare(
+                "SELECT d.source, d.session, d.delivered_at, e.body
+                 FROM deliveries d JOIN events e ON e.id = d.event_id
+                 WHERE d.shown AND d.delivered_at IS NOT NULL AND e.kind = 'summary'
+                   AND (?1 IS NULL OR e.workspace = ?1)",
+            )?
+            .query_map(params![workspace], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut later = self.db.prepare_cached(
+            "SELECT kind, body FROM events WHERE source = ?1 AND session = ?2
+               AND kind IN ('tool', 'assistant') AND created_at >= ?3
+             ORDER BY id LIMIT 60",
+        )?;
+        let (mut checked, mut followed) = (0, 0);
+        for (source, session, delivered_at, body) in deliveries {
+            let files: Vec<String> = crate::distill::summary_fact(&body, "Files: ")
+                .into_iter()
+                .flat_map(|files| files.split(", "))
+                .filter(|file| file.len() > 2)
+                .map(str::to_owned)
+                .collect();
+            let commits: Vec<&str> = crate::distill::summary_fact(&body, "Commits: ")
+                .into_iter()
+                .flat_map(|commits| commits.split("; "))
+                .filter_map(|commit| commit.split_whitespace().next())
+                .filter(|hash| hash.len() >= 7)
+                .collect();
+            if files.is_empty() && commits.is_empty() {
+                continue;
+            }
+            checked += 1;
+            let used = later
+                .query_map(params![source, session, delivered_at], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(Result::ok)
+                .any(|(kind, text)| {
+                    (kind == "tool" && files.iter().any(|file| text.contains(file.as_str())))
+                        || commits.iter().any(|hash| text.contains(hash))
+                });
+            followed += i64::from(used);
+        }
+        Ok((checked, followed))
+    }
+
     pub fn stats(&self, workspace: Option<&str>) -> Result<Stats> {
         let _guard = self.read_guard()?;
         let scalar = |sql: &str| -> Result<i64> {
@@ -1035,7 +1094,10 @@ impl Store {
                 .optional()?
                 .unwrap_or(0))
         };
+        let (recall_checked, recall_followed) = self.recall_follow_up(workspace)?;
         Ok(Stats {
+            recall_checked,
+            recall_followed,
             workspace: workspace.map(str::to_owned),
             records: scalar("SELECT count(*) FROM events WHERE ?1 IS NULL OR workspace = ?1")?,
             memories: scalar(&format!("SELECT count(*) FROM events e WHERE (?1 IS NULL OR e.workspace = ?1)

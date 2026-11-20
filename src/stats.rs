@@ -40,6 +40,23 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
             ),
         },
         Line {
+            label: "Recall used",
+            value: match stats.recall_checked {
+                0 => "–".to_owned(),
+                checked => format!("{}%", stats.recall_followed * 100 / checked),
+            },
+            unit: if stats.recall_checked == 0 {
+                "no recalls to check yet"
+            } else {
+                "of checkable recalls"
+            },
+            detail: format!(
+                "The agent opened a recalled file or cited a recalled commit after {} of {} recalled summaries",
+                compact(stats.recall_followed),
+                compact(stats.recall_checked),
+            ),
+        },
+        Line {
             label: "MCP lookups",
             value: compact(stats.mcp_searches),
             unit: plural(stats.mcp_searches, "search", "searches"),

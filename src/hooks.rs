@@ -1018,9 +1018,11 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
             record.head.as_ref(),
             workspace.head.as_ref(),
         ) {
-            (false, _, _) => " • different worktree",
-            (true, Some(old), Some(current)) if old != current => " • different Git revision",
-            _ => "",
+            (false, _, _) => " • different worktree".to_owned(),
+            (true, Some(old), Some(current)) if old != current => {
+                revision_state(&workspace.root, old, record)
+            }
+            _ => String::new(),
         };
         result.push_str(&format!(
             "\n\n[{} #{} • {}{}]\n{}",
@@ -1038,6 +1040,43 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
         ));
     }
     Some(result)
+}
+
+/// How a summary from an earlier revision relates to the checkout: whether
+/// the files it changed are the same now, or which ones changed since.
+fn revision_state(root: &str, old: &str, record: &Record) -> String {
+    const GENERIC: &str = " • different Git revision";
+    let files: Vec<&str> = (record.kind == "summary")
+        .then(|| crate::distill::summary_fact(&record.body, "Files: "))
+        .flatten()
+        .map(|files| files.split(", ").filter(|file| !file.is_empty()).collect())
+        .unwrap_or_default();
+    if files.is_empty() {
+        return GENERIC.to_owned();
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--name-only", old, "--"])
+        .args(&files)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let changed: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .take(4)
+                .map(str::to_owned)
+                .collect();
+            if changed.is_empty() {
+                " • its files are unchanged since".to_owned()
+            } else {
+                format!(" • changed since: {}", changed.join(", "))
+            }
+        }
+        _ => GENERIC.to_owned(),
+    }
 }
 
 fn summary_excerpt(body: &str) -> String {

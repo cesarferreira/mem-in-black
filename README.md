@@ -78,7 +78,8 @@ for a custom T3 location.
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
-- **Handoff.** Ask to continue work from Claude, Codex, OpenCode, Pi, or Oh My Pi in the same worktree. Evidence from a different Git revision is flagged.
+- **Handoff.** Ask to continue work from Claude, Codex, OpenCode, Pi, or Oh My Pi in the same worktree.
+- **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
 - **Startup preview.** A new session shows recent activity for the worktree. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
@@ -139,6 +140,11 @@ fetched on demand.
 
 `mib stats` includes an upper bound for tokens saved. It assumes each delivered
 record replaced re-reading its full original output.
+
+**Recall used** in `mib stats` shows how often recall mattered: the share of
+recalled work summaries after which the agent, in the same session, opened one
+of the summary's files or mentioned one of its commits. An agent may open a
+file for other reasons, so treat it as an upper bound too.
 
 **What gets captured:** prompts, agent replies, shell commands with a trimmed
 result, edited paths with line counts, read paths, search patterns with matching
