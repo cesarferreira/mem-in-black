@@ -46,7 +46,18 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 
 ## Install
 
-Linux or macOS with [Rust](https://rustup.rs) 1.99 or newer:
+On Linux or macOS (x86_64 or ARM64), install the latest release binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cesarferreira/mem-in-black/main/install.sh | sh
+mib install
+```
+
+The script checks the download against the release's SHA-256 checksums and
+puts `mib` in `~/.local/bin`. Set `MIB_INSTALL_DIR` for another folder, or
+`MIB_VERSION=v0.1.0` for a specific release.
+
+To build from source instead, use [Rust](https://rustup.rs) 1.99 or newer:
 
 ```bash
 git clone https://github.com/cesarferreira/mem-in-black.git
