@@ -11,6 +11,7 @@ mod observer;
 mod preview;
 mod stats;
 mod store;
+mod summaries;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -89,6 +90,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Configure the model that writes work summaries.
+    Summaries {
+        #[command(subcommand)]
+        action: SummariesAction,
+    },
     /// Manage local semantic search.
     Embeddings {
         #[command(subcommand)]
@@ -107,6 +113,34 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         limit: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum SummariesAction {
+    /// Write summaries with a model. Options change the model or provider.
+    Enable {
+        /// Model name, passed as is, such as `haiku` or `bifrost/haiku5.5`.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, value_enum)]
+        provider: Option<summaries::Provider>,
+        /// Chat completions URL for the openai provider.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Environment variable that holds the endpoint's API key.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Claude Code executable for the claude provider.
+        #[arg(long)]
+        command: Option<String>,
+        /// Seconds to wait for the model before writing the local summary.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Write local summaries only. Nothing is sent to a model.
+    Disable,
+    /// Show the summary settings and the result of the latest model call.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -137,6 +171,8 @@ fn main() -> Result<()> {
                 "Registered Mem in Black. Restart the configured harnesses and review the Mem in Black hooks if Codex asks."
             );
         }
+        // The summary model's own session must not be recorded.
+        Command::Hook { .. } if std::env::var_os(summaries::CHILD_MARKER).is_some() => {}
         Command::Hook { host } => {
             let _ = daemon::start_background(&data);
             let model = embed::configured(&data.directory).ok().flatten();
@@ -275,6 +311,59 @@ fn main() -> Result<()> {
                         "embedded": embedded,
                     }))?
                 );
+            }
+        },
+        Command::Summaries { action } => match action {
+            SummariesAction::Enable {
+                model,
+                provider,
+                endpoint,
+                api_key_env,
+                command,
+                timeout,
+            } => {
+                store::prepare_dir(&data.directory)?;
+                let mut settings = summaries::load(&data.directory)?;
+                settings.enabled = true;
+                settings.model = model.unwrap_or(settings.model);
+                settings.provider = provider.unwrap_or(settings.provider);
+                settings.endpoint = endpoint.or(settings.endpoint);
+                settings.api_key_env = api_key_env.or(settings.api_key_env);
+                settings.command = command.unwrap_or(settings.command);
+                settings.timeout_secs = timeout.unwrap_or(settings.timeout_secs);
+                summaries::save(&data.directory, &settings)?;
+                let _ = daemon::stop(&data);
+                println!(
+                    "Summaries are written by {} through {}. A failed or slow call falls back to the local summary.",
+                    settings.model,
+                    match settings.provider {
+                        summaries::Provider::Claude => settings.command.as_str(),
+                        summaries::Provider::Openai =>
+                            settings.endpoint.as_deref().unwrap_or_default(),
+                    }
+                );
+            }
+            SummariesAction::Disable => {
+                store::prepare_dir(&data.directory)?;
+                let mut settings = summaries::load(&data.directory)?;
+                settings.enabled = false;
+                summaries::save(&data.directory, &settings)?;
+                let _ = daemon::stop(&data);
+                println!("Summaries are built locally. Nothing is sent to a model.");
+            }
+            SummariesAction::Status => {
+                let settings = summaries::load(&data.directory)?;
+                let found = settings.provider != summaries::Provider::Claude
+                    || std::process::Command::new(&settings.command)
+                        .arg("--version")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success());
+                let mut value = serde_json::to_value(&settings)?;
+                value["command_available"] = found.into();
+                value["latest_call"] = summaries::last_status(&data.directory);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             }
         },
         Command::Forget { ids } => {

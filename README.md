@@ -23,7 +23,9 @@
 
 Mem in Black (`mib`) is a local memory service for coding agents. It remembers
 what your agents did and hands the relevant parts to the next session.
-Everything runs on your machine: no account, no hosted service, no telemetry.
+Memory, search and recall run on your machine, with no account, hosted service
+or telemetry. By default, Claude Haiku writes each work summary through your
+Claude Code login; `mib summaries disable` keeps everything local.
 
 ## At a glance
 
@@ -31,7 +33,7 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 | --- | --- |
 | New sessions know past work | Claude Code, Codex, OpenCode, Pi, and Oh My Pi get a brief when earlier project work matches the prompt |
 | Switch agents mid-task | Ask an agent to continue the work started in another agent |
-| Model tokens spent on memory | **0**: summaries are built locally |
+| Readable summaries | Claude Haiku writes each turn's title, outcome, decision and next step, in the background. Files, commits and checks come straight from the tool records |
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
 | Local storage and retrieval | Recalled context travels with the agent’s normal model request |
 | Fix wrong memories | `forget` deletes; `save_memory` with `replaces` corrects |
@@ -169,13 +171,40 @@ shell commands), commits made during the turn, the checks that ran and their
 result, errors seen, decisions and the next step. When this format improves,
 the worker rebuilds earlier local summaries in place.
 
+<a id="model-summaries"></a>
+## Summaries
+
+By default, the worker asks Claude Haiku to write each summary's title,
+outcome, decision and next step. It runs `claude -p --model haiku` in the
+background, with hooks, tools and MCP servers off, so the call is not recorded
+and the agent never waits for it. The model gets the request, the extracted
+facts and the agent's final reply; turns marked `<private>` are never captured
+and never sent. Files, commits, checks and errors always come from the tool
+records, not from the model.
+
+If the call fails or takes longer than the timeout (60 s), the turn gets the
+local summary instead, and the worker writes local summaries for the next 10
+minutes before it tries the model again. `mib stats` reports the model's tokens.
+
+| Command | Effect |
+| --- | --- |
+| `mib summaries status` | Settings, whether the CLI is available, and the result of the latest call |
+| `mib summaries disable` | Local summaries only. Nothing is sent to a model |
+| `mib summaries enable` | Turn model summaries back on |
+| `mib summaries enable --model sonnet` | Any model name the Claude CLI accepts |
+| `mib summaries enable --timeout 30` | Seconds to wait before falling back |
+| `mib summaries enable --provider openai --endpoint https://gateway.example/v1/chat/completions --model bifrost/haiku5.5 --api-key-env GATEWAY_KEY` | Use an OpenAI-compatible endpoint, such as a gateway |
+
+Settings live in `summaries.json` in the data directory. `MIB_SUMMARIES=off`
+turns model summaries off for one process.
+
 ## Configuration
 
 | Setting | Effect |
 | --- | --- |
 | `MIB_DATA_DIR` or `--data-dir` | Data directory. Default `~/.local/share/mem-in-black` |
 | `database_path` in `~/.config/mem-in-black/config.toml` | Put the database on a specific disk. Run `mib stop` first |
-| `observer.json` in the data directory | Use an OpenAI-compatible model for summaries ([example](#model-summaries)) |
+| `summaries.json` in the data directory | Summary model settings, written by `mib summaries` ([details](#model-summaries)) |
 | `MIB_MODEL_IDLE_SECS` | Seconds before an idle model unloads. Default 1800 |
 | `RAYON_NUM_THREADS` | Threads for semantic search. Default 2 |
 | `MIB_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
@@ -184,19 +213,6 @@ the worker rebuilds earlier local summaries in place.
 
 Mem in Black uses WAL journaling on local disks and switches to rollback
 journaling on NFS and SMB mounts.
-
-<a id="model-summaries"></a>
-Summaries are built locally from each turn. To use a model instead, create
-`observer.json` and restart the worker. The endpoint receives a bounded excerpt
-of each turn, and the local summary is used if it fails.
-
-```json
-{
-  "endpoint": "https://provider.example/v1/chat/completions",
-  "model": "your-model",
-  "api_key_env": "MIB_OBSERVER_KEY"
-}
-```
 
 ## License
 

@@ -38,6 +38,8 @@ impl Workspace {
         command
             .env("MIB_DATA_DIR", self.temp.path().join("data"))
             .env("MIB_NO_AUTOSTART", "1")
+            // Tests never call a real summary model unless they opt in.
+            .env("MIB_SUMMARIES", "off")
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
             .env_remove("MIB_STARTUP_PREVIEW")
@@ -963,7 +965,7 @@ fn ordinary_recall_is_relevant_and_does_not_repeat_the_same_evidence() {
 }
 
 #[test]
-fn opt_in_observer_summarizes_evidence_via_configured_endpoint() {
+fn legacy_observer_endpoint_writes_the_summary_narrative() {
     let workspace = Workspace::new();
     workspace.seed();
     let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
@@ -983,15 +985,23 @@ fn opt_in_observer_summarizes_evidence_via_configured_endpoint() {
         let mut body = String::new();
         request.as_reader().read_to_string(&mut body).unwrap();
         assert!(body.contains("cargo test websocket_retry"));
-        request.respond(tiny_http::Response::from_string(r#"{"choices":[{"message":{"content":"Preserve handshake ordering."}}],"usage":{"prompt_tokens":218,"completion_tokens":12}}"#)).unwrap();
+        request.respond(tiny_http::Response::from_string(r#"{"choices":[{"message":{"content":"{\"title\":\"Kept the handshake ordering\",\"outcome\":\"Preserve handshake ordering.\",\"decision\":null,\"next\":null}"}}],"usage":{"prompt_tokens":218,"completion_tokens":12}}"#)).unwrap();
     });
-    workspace.run(&["observe"], None);
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
     handler.join().unwrap();
     let results: Value =
         serde_json::from_str(&workspace.run(&["search", "Preserve handshake ordering"], None))
             .unwrap();
     assert_eq!(results[0]["kind"], "summary");
-    assert!(results[0]["body"].as_str().unwrap().contains("[#"));
+    let body = results[0]["body"].as_str().unwrap();
+    assert!(
+        body.starts_with("Investigation: Kept the handshake ordering\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("\nSummarized by: fixture\nEvidence [#"),
+        "{body}"
+    );
     let status: Value = serde_json::from_str(&workspace.run(&["status"], None)).unwrap();
     assert_eq!(status["observer_tokens"], 230);
 }
@@ -2377,4 +2387,208 @@ fn summaries_list_turn_commits_and_recall_names_files_changed_since() {
     );
     assert!(!preview.contains("· Tool"), "{preview}");
     assert!(!preview.contains("· Task"), "{preview}");
+}
+
+/// Writes an executable stand-in for the Claude Code CLI and points the
+/// summary settings at it.
+fn fake_claude(workspace: &Workspace, script: &str, settings: Value) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = workspace.temp.path().join("fake-claude");
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = settings;
+    settings["command"] = json!(path);
+    std::fs::create_dir_all(workspace.temp.path().join("data")).unwrap();
+    std::fs::write(
+        workspace.temp.path().join("data/summaries.json"),
+        settings.to_string(),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn haiku_writes_the_narrative_and_extracted_facts_stay() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    let calls = workspace.temp.path().join("calls");
+    std::fs::create_dir(&calls).unwrap();
+    let dir = calls.display();
+    fake_claude(
+        &workspace,
+        &format!(
+            r#"printf '%s\n' "$@" > "{dir}/args"; echo "$MIB_SUMMARIZER" > "{dir}/marker"; cat > "{dir}/stdin"
+echo '{{"type":"result","is_error":false,"result":"{{\"title\":\"Moved the retry reset after the handshake\",\"outcome\":\"Retries now reset after the handshake.\",\"decision\":null,\"next\":\"Add a soak test.\"}}","usage":{{"input_tokens":900,"output_tokens":40}}}}'"#
+        ),
+        json!({}),
+    );
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+
+    let export = workspace.run(&["export"], None);
+    let summary: Value = export
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|record| record["kind"] == "summary")
+        .unwrap();
+    let body = summary["body"].as_str().unwrap();
+    assert!(
+        body.starts_with("Investigation: Moved the retry reset after the handshake\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("\nChecks: `cargo test websocket_retry` → failed"),
+        "{body}"
+    );
+    assert!(body.contains("\nNext: Add a soak test."), "{body}");
+    assert!(
+        body.contains(
+            "\nOutcome: Retries now reset after the handshake.\nThe retry counter resets too soon."
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("\nSummarized by: haiku\nEvidence [#"),
+        "{body}"
+    );
+
+    let args = std::fs::read_to_string(calls.join("args")).unwrap();
+    assert!(args.contains("--model\nhaiku\n"), "{args}");
+    assert!(args.contains(r#"{"disableAllHooks":true}"#), "{args}");
+    assert_eq!(
+        std::fs::read_to_string(calls.join("marker"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    let stdin = std::fs::read_to_string(calls.join("stdin")).unwrap();
+    assert!(
+        stdin.contains("Request:\nFix the websocket retry regression"),
+        "{stdin}"
+    );
+    assert!(
+        stdin.contains("Checks: `cargo test websocket_retry` → failed"),
+        "{stdin}"
+    );
+
+    let status: Value = serde_json::from_str(&workspace.run(&["status"], None)).unwrap();
+    assert_eq!(status["observer_tokens"], 940);
+    let summaries: Value = serde_json::from_str(&workspace.run_with_env(
+        &["summaries", "status"],
+        None,
+        &[("MIB_SUMMARIES", "on")],
+    ))
+    .unwrap();
+    assert!(
+        summaries["latest_call"]["last_success_at"].is_u64(),
+        "{summaries}"
+    );
+}
+
+#[test]
+fn a_failed_or_slow_model_falls_back_to_the_local_summary() {
+    for (script, timeout, error) in [
+        ("echo 'not signed in' >&2; exit 1", 60, "not signed in"),
+        ("sleep 10", 1, "did not answer within 1 s"),
+    ] {
+        let workspace = Workspace::new();
+        workspace.seed();
+        fake_claude(&workspace, script, json!({"timeout_secs": timeout}));
+        let started = std::time::Instant::now();
+        workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(6),
+            "{script}"
+        );
+        let export = workspace.run(&["export"], None);
+        assert!(
+            export.contains("Investigation: Fix the websocket retry regression"),
+            "{export}"
+        );
+        assert!(!export.contains("Summarized by"), "{export}");
+        let summaries: Value = serde_json::from_str(&workspace.run_with_env(
+            &["summaries", "status"],
+            None,
+            &[("MIB_SUMMARIES", "on")],
+        ))
+        .unwrap();
+        let last = summaries["latest_call"]["last_error"].as_str().unwrap();
+        assert!(last.contains(error), "{last}");
+    }
+}
+
+#[test]
+fn summary_settings_can_change_model_and_turn_off() {
+    let workspace = Workspace::new();
+    let status = |workspace: &Workspace| -> Value {
+        serde_json::from_str(&workspace.run_with_env(
+            &["summaries", "status"],
+            None,
+            &[("MIB_SUMMARIES", "on")],
+        ))
+        .unwrap()
+    };
+    let defaults = status(&workspace);
+    assert_eq!(defaults["enabled"], true);
+    assert_eq!(defaults["provider"], "claude");
+    assert_eq!(defaults["model"], "haiku");
+
+    workspace.run(
+        &[
+            "summaries",
+            "enable",
+            "--model",
+            "bifrost/haiku5.5",
+            "--timeout",
+            "30",
+        ],
+        None,
+    );
+    let changed = status(&workspace);
+    assert_eq!(changed["model"], "bifrost/haiku5.5");
+    assert_eq!(changed["timeout_secs"], 30);
+    assert_eq!(changed["enabled"], true);
+
+    workspace.run(&["summaries", "disable"], None);
+    let off = status(&workspace);
+    assert_eq!(off["enabled"], false);
+    assert_eq!(
+        off["model"], "bifrost/haiku5.5",
+        "disabling keeps the chosen model"
+    );
+
+    workspace.run(
+        &[
+            "summaries",
+            "enable",
+            "--provider",
+            "openai",
+            "--endpoint",
+            "https://gateway.example/v1/chat/completions",
+            "--api-key-env",
+            "GATEWAY_KEY",
+        ],
+        None,
+    );
+    let gateway = status(&workspace);
+    assert_eq!(gateway["provider"], "openai");
+    assert_eq!(
+        gateway["endpoint"],
+        "https://gateway.example/v1/chat/completions"
+    );
+}
+
+#[test]
+fn the_summary_model_session_is_not_recorded() {
+    let workspace = Workspace::new();
+    workspace.run_with_env(
+        &["hook", "claude"],
+        Some(json!({"cwd": workspace.repo, "hook_event_name":"UserPromptSubmit","session_id":"summarizer","prompt":"Request: summarize this turn"})),
+        &[("MIB_SUMMARIZER", "1")],
+    );
+    assert_eq!(
+        workspace
+            .run(&["search", "summarize this turn"], None)
+            .trim(),
+        "[]"
+    );
 }

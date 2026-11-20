@@ -79,7 +79,10 @@ pub fn status(data: &Storage) -> Result<Value> {
         "journal_mode": store.journal_mode()?,
         "records": store.counts().context("reading Mem in Black records")?,
         "observer_tokens": store.metric("observer_tokens")?,
-        "observer_config_error": observer::settings(&data.directory).err().map(|error| error.to_string()),
+        "summaries": match crate::summaries::load(&data.directory) {
+            Ok(settings) => json!({"enabled": settings.enabled, "provider": settings.provider, "model": settings.model}),
+            Err(error) => json!({"config_error": format!("{error:#}")}),
+        },
         "context_injections": store.metric("context_injections")?,
         "context_bytes": store.metric("context_bytes")?
     }))
@@ -153,9 +156,9 @@ pub fn observe_once(data: &Storage) -> Result<()> {
         "background worker is already processing observations"
     );
     let store = Store::open_worker(data)?;
-    let config = observer::settings(&data.directory)?;
+    let settings = crate::summaries::load(&data.directory)?;
     let refresh = store.summary_refresh_bound()?;
-    while observer::process_one(&store, config.as_ref(), refresh)? {}
+    while observer::process_one(&store, &data.directory, &settings, refresh)? {}
     Ok(())
 }
 
@@ -189,9 +192,13 @@ pub fn run(data: &Storage) -> Result<()> {
     let store = Store::open_worker(data)?;
     // Start any summary rebuild before the viewer serves its first revision.
     let refresh = store.summary_refresh_bound()?;
-    let config = observer::settings(&data.directory).unwrap_or_else(|error| {
-        eprintln!("Mem in Black observer configuration: {error:#}");
-        None
+    // Invalid summary settings fall back to local summaries.
+    let settings = crate::summaries::load(&data.directory).unwrap_or_else(|error| {
+        eprintln!("Mem in Black summary settings: {error:#}");
+        crate::summaries::Settings {
+            enabled: false,
+            ..Default::default()
+        }
     });
     let server = Server::http("127.0.0.1:0").map_err(|error| anyhow!(error))?;
     let address = server
@@ -210,7 +217,7 @@ pub fn run(data: &Storage) -> Result<()> {
             return;
         };
         loop {
-            match observer::process_one(&store, config.as_ref(), refresh) {
+            match observer::process_one(&store, &worker_data.directory, &settings, refresh) {
                 Ok(true) => {}
                 Ok(false) => thread::sleep(Duration::from_secs(2)),
                 Err(_) => thread::sleep(Duration::from_secs(5)),

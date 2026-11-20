@@ -74,7 +74,7 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
             detail: if stats.observer_tokens == 0 {
                 "Summaries are built locally".to_owned()
             } else {
-                "Reported by the opt-in summary model".to_owned()
+                "Reported by the summary model".to_owned()
             },
         },
         Line {

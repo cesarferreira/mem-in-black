@@ -13,6 +13,10 @@ pub struct Facts {
     pub errors: Vec<String>,
     pub decision: Option<String>,
     pub next: Option<String>,
+    /// A model-written outcome, shown before the reply excerpt.
+    pub outcome: Option<String>,
+    /// The model that wrote the title, outcome, decision and next step.
+    pub narrated_by: Option<String>,
 }
 
 /// `tools` are stored tool bodies in chronological order.
@@ -196,17 +200,27 @@ impl Facts {
         self.kind = kind(prompt, !self.files.is_empty());
     }
 
-    /// Render the facts as the searchable summary text, with `detail` as the narrative.
-    pub fn render(&self, detail_label: &str, detail: &str, references: &str) -> String {
-        let mut text = format!("{}: {}", self.kind, self.title);
+    /// Replaces the title, decision and next step with a model's narrative.
+    /// The files, commits, checks and errors stay as extracted.
+    pub fn narrate(&mut self, narrative: crate::summaries::Narrative, model: &str) {
+        self.title = narrative.title;
+        self.outcome = Some(narrative.outcome);
+        self.decision = narrative.decision;
+        self.next = narrative.next;
+        self.narrated_by = Some(cut(model, 80).to_owned());
+    }
+
+    /// The extracted facts, one labelled line each.
+    pub fn facts_text(&self) -> String {
+        let mut lines = Vec::new();
         if !self.files.is_empty() {
-            text.push_str(&format!("\nFiles: {}", self.files.join(", ")));
+            lines.push(format!("Files: {}", self.files.join(", ")));
         }
         if !self.commits.is_empty() {
-            text.push_str(&format!("\nCommits: {}", self.commits.join("; ")));
+            lines.push(format!("Commits: {}", self.commits.join("; ")));
         }
         if !self.explored.is_empty() {
-            text.push_str(&format!("\nExplored: {}", self.explored.join(", ")));
+            lines.push(format!("Explored: {}", self.explored.join(", ")));
         }
         if !self.checks.is_empty() {
             let checks = self
@@ -215,10 +229,20 @@ impl Facts {
                 .map(|(command, status)| format!("`{command}` → {status}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            text.push_str(&format!("\nChecks: {checks}"));
+            lines.push(format!("Checks: {checks}"));
         }
         if !self.errors.is_empty() {
-            text.push_str(&format!("\nErrors seen: {}", self.errors.join(" | ")));
+            lines.push(format!("Errors seen: {}", self.errors.join(" | ")));
+        }
+        lines.join("\n")
+    }
+
+    /// Render the facts as the searchable summary text, with `detail` as the narrative.
+    pub fn render(&self, detail_label: &str, detail: &str, references: &str) -> String {
+        let mut text = format!("{}: {}", self.kind, self.title);
+        let facts = self.facts_text();
+        if !facts.is_empty() {
+            text.push_str(&format!("\n{facts}"));
         }
         if let Some(decision) = &self.decision {
             text.push_str(&format!("\nDecision: {decision}"));
@@ -227,8 +251,20 @@ impl Facts {
             text.push_str(&format!("\nNext: {next}"));
         }
         let detail = clean(detail, 2000);
-        if !detail.is_empty() {
-            text.push_str(&format!("\n{detail_label}: {}", excerpt(&detail, 480)));
+        match &self.outcome {
+            Some(outcome) => {
+                text.push_str(&format!("\n{detail_label}: {outcome}"));
+                if !detail.is_empty() {
+                    text.push_str(&format!("\n{}", excerpt(&detail, 480)));
+                }
+            }
+            None if !detail.is_empty() => {
+                text.push_str(&format!("\n{detail_label}: {}", excerpt(&detail, 480)));
+            }
+            None => {}
+        }
+        if let Some(model) = &self.narrated_by {
+            text.push_str(&format!("\nSummarized by: {model}"));
         }
         text.push_str(&format!("\nEvidence {references}"));
         text
@@ -261,7 +297,7 @@ pub fn summary_fact<'a>(body: &'a str, prefix: &str) -> Option<&'a str> {
 fn edited_paths(body: &str, root: &str, files: &mut Vec<String>) {
     let mut push = |path: &str| {
         let path = relative(path, root);
-        if !path.is_empty() && !files.iter().any(|seen| seen == path) {
+        if !path.is_empty() && !scratch_path(path) && !files.iter().any(|seen| seen == path) {
             files.push(path.to_owned());
         }
     };
@@ -834,12 +870,14 @@ mod tests {
     #[test]
     fn scratch_and_harness_files_are_not_explored_files() {
         let tools = [
+            "Write /tmp/claude-1/x/scratchpad/page.html\nLines: +40 -0",
             "Read /tmp/claude-1/x/scratchpad/cap.png",
             "Read /home/me/.claude/projects/p/tool-results/b.txt",
             "Read /repo/src/ui.rs",
         ];
         let facts = distill("/repo", "Why is the tile not centered", &tools, "");
         assert_eq!(facts.explored, ["src/ui.rs"]);
+        assert!(facts.files.is_empty());
     }
 
     #[test]
