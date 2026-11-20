@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-11-20
+
+### 💼 Other
+
+- Stop building release binaries for Intel Macs
 ## [0.1.0] - 2026-11-20
 
 ### 🚀 Features

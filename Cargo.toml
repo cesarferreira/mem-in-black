@@ -1,6 +1,6 @@
 [package]
 name = "mem-in-black"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 description = "We remember so your agents don't have to. Local memory for coding agents."
