@@ -187,6 +187,8 @@ pub fn run(data: &Storage) -> Result<()> {
     }
     run_in_background();
     let store = Store::open_worker(data)?;
+    // Start any summary rebuild before the viewer serves its first revision.
+    let refresh = store.summary_refresh_bound()?;
     let config = observer::settings(&data.directory).unwrap_or_else(|error| {
         eprintln!("Mem in Black observer configuration: {error:#}");
         None
@@ -207,7 +209,6 @@ pub fn run(data: &Storage) -> Result<()> {
         let Ok(store) = Store::open(&worker_data) else {
             return;
         };
-        let refresh = store.summary_refresh_bound().unwrap_or_default();
         loop {
             match observer::process_one(&store, config.as_ref(), refresh) {
                 Ok(true) => {}
