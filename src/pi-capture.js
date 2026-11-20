@@ -16,7 +16,7 @@ export default function (pi) {
     sessions.set(id, state);
   }
 
-  if (meminblack.host === "omp") {
+  if (mib.host === "omp") {
     // OMP prepares outbound context before notifying extensions of message_start.
     pi.on("before_agent_start", ({ reason, prompt }, ctx) => {
       if (reason === "revive" || typeof prompt !== "string" || !prompt.trim()) return;

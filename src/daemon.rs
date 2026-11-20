@@ -146,20 +146,6 @@ pub fn stop(data: &Storage) -> Result<()> {
     Ok(())
 }
 
-/// Stops the worker and waits until it releases the data directory.
-/// Returns false if the worker is still running after `timeout`.
-pub fn stop_and_wait(data: &Storage, timeout: Duration) -> bool {
-    let _ = stop(data);
-    let deadline = Instant::now() + timeout;
-    loop {
-        match lock_file(data).and_then(|lock| try_lock(&lock)) {
-            Ok(true) => return true,
-            Ok(false) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            _ => return false,
-        }
-    }
-}
-
 pub fn observe_once(data: &Storage) -> Result<()> {
     let lock = lock_file(data)?;
     anyhow::ensure!(

@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 
 const memoryArgs = [
-  ...(meminblack.dataDirectory ? ["--data-dir", meminblack.dataDirectory] : []),
-  "hook", meminblack.host,
+  ...(mib.dataDirectory ? ["--data-dir", mib.dataDirectory] : []),
+  "hook", mib.host,
 ];
 const maxCaptureChars = 128 * 1024;
 
@@ -18,7 +18,7 @@ function sendMemory(turn, name, fields) {
         cwd: turn.cwd, session_id: turn.session, turn_id: turn.id,
         hook_event_name: name, ...fields,
       });
-      const child = spawn(meminblack.binary, memoryArgs, {
+      const child = spawn(mib.binary, memoryArgs, {
         stdio: ["pipe", wantsRecall ? "pipe" : "ignore", process.env.MIB_DEBUG ? "inherit" : "ignore"],
         timeout: 2500,
         killSignal: "SIGKILL",

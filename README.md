@@ -73,12 +73,6 @@ T3 Code support configures the home of each enabled provider in
 `~/.t3/userdata/settings.json`, including custom `homePath`s. Set `T3CODE_HOME`
 for a custom T3 location.
 
-**Upgrading from an earlier name:** run `cargo uninstall meminblack` or
-`cargo uninstall quietmem`, install `mib`, then run `mib install`. The first
-`mib` run moves your memory and settings from `meminblack` or `quietmem` to the
-`mem-in-black` directories. `mib install` replaces the old hooks, MCP entries
-and plugin files. Rename any `QUIETMEM_*` environment variables to `MIB_*`.
-
 ## Use it
 
 Work as usual. Mem in Black stays quiet until it has something relevant:

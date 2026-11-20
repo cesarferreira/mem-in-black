@@ -1,6 +1,6 @@
-# QuietMem design
+# Mem in Black design
 
-QuietMem is a local Rust service for persistent coding-agent memory. It captures useful work automatically, restores it across harnesses, and stays silent when it has no relevant evidence. Agent APIs and the MCP server share the same SQLite store.
+Mem in Black is a local Rust service for persistent coding-agent memory. It captures useful work automatically, restores it across harnesses, and stays silent when it has no relevant evidence. Agent APIs and the MCP server share the same SQLite store.
 
 The initial supported hosts are Claude Code and Codex on macOS and Linux. Hooks capture completed turns and selected tool results. The prompt hook retrieves narrowly scoped context. An explicit cross-harness resume can retrieve a recent task from the same worktree. Each record keeps source, time, worktree and Git revision. A result from a different revision is historical evidence.
 
@@ -10,7 +10,7 @@ Raw observations are produced locally. Model-based compression, when configured,
 
 The upstream baseline is [Claude Mem 16.0.0 at cc4dbf5](https://github.com/thedotmack/claude-mem/tree/cc4dbf5beb4bd98623e0b842e6617115f4e74631). A category counts as delivered after verifying its advertised workflows.
 
-| Upstream capability | QuietMem coverage |
+| Upstream capability | Mem in Black coverage |
 | --- | --- |
 | Tool and session capture, project and harness filtering | Claude Code and Codex first, wider documented adapter coverage next |
 | Observer providers, modes, observations, summaries | Local observations and summaries with an opt-in model provider first, provider and mode coverage next |
