@@ -21,18 +21,25 @@
 
 ---
 
-Mem in Black (`mib`) is a local memory service for coding agents. It remembers
-what your agents did and hands the relevant parts to the next session.
-Memory, search and recall run on your machine, with no account, hosted service
-or telemetry. By default, Claude Haiku writes each work summary through your
-Claude Code login; `mib summaries disable` keeps everything local.
+Start a task in Claude Code, continue it in Codex, then switch back. Mem in
+Black (`mib`) gives supported coding agents a shared, searchable memory of
+your project, including past fixes, decisions, commits, and test results.
+
+When earlier work matches your prompt, `mib` adds a short brief to the agent's
+context. Agents can search older captured sessions and fetch individual records
+when they need more detail.
+
+Storage, search, and recall run on your machine without an account or
+telemetry. By default, Claude Haiku writes each work summary through your
+Claude Code login. Run `mib summaries disable` to generate summaries locally
+as well.
 
 ## At a glance
 
 | What you get | |
 | --- | --- |
-| New sessions know past work | Claude Code, Codex, OpenCode, Pi, and Oh My Pi get a brief when earlier project work matches the prompt |
-| Switch agents mid-task | Ask an agent to continue the work started in another agent |
+| Switch agents mid-task | Continue the same task in Claude Code, Codex, OpenCode, Pi, or Oh My Pi |
+| Recall past work on demand | Get a short brief when earlier work matches, or search captured sessions and open the records you need |
 | Readable summaries | Claude Haiku writes each turn's title, outcome, decision and next step, in the background. Files, commits and checks come straight from the tool records |
 | Finds work by meaning | Hybrid search ranks the right record first more often than keywords alone ([benchmark](#semantic-search)) |
 | Local storage and retrieval | Recalled context travels with the agent’s normal model request |
@@ -41,6 +48,7 @@ Claude Code login; `mib summaries disable` keeps everything local.
 
 | What it costs | |
 | --- | --- |
+| Context per automatic recall | ~300 tokens on average across 12 recalls in this project, estimated with `mib stats` |
 | Time per prompt | ~30 ms keyword-only, ~130 ms with semantic search |
 | Memory | ~7 MB keyword-only. With semantic search: 277 MB while in use, 17 MB after 30 idle minutes |
 | CPU | 0% at rest. At most 2 cores, at low priority, while embedding new records |
@@ -92,7 +100,7 @@ for a custom T3 location.
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
-- **Handoff.** Ask to continue work from Claude, Codex, OpenCode, Pi, or Oh My Pi in the same worktree.
+- **Handoff.** Open another supported agent in the same worktree and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.”
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
 - **Startup preview.** A new session shows the latest work summaries for the worktree, with their commits. Before the first summary exists, it shows recent activity. `MIB_STARTUP_PREVIEW=0` hides it.
