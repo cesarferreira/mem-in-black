@@ -56,13 +56,7 @@ mib install
 
 The script checks the download against the release's SHA-256 checksums and
 puts `mib` in `~/.local/bin`. Set `MIB_INSTALL_DIR` for another folder, or
-`MIB_VERSION=v0.1.1` for a specific release. If a plain download fails, the
-script downloads through the GitHub CLI when `gh` is installed and signed in.
-While the repository is private, fetch the script with `gh` as well:
-
-```bash
-gh api repos/cesarferreira/mem-in-black/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
-```
+`MIB_VERSION=v0.1.1` for a specific release.
 
 To build from source instead, use [Rust](https://rustup.rs) 1.99 or newer:
 
