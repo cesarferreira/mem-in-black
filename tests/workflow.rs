@@ -1889,7 +1889,9 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
                PRIMARY KEY(source, session, tool_id));
              INSERT INTO events(source, session, kind, body, workspace, project)
                VALUES ('claude', 'old', 'tool', 'cargo test websocket_retry: expected three retries', '/w', 'p'),
-                      ('claude', 'old', 'assistant', 'Retrying after the handshake fixed it', '/w', 'p');
+                      ('claude', 'old', 'assistant', 'Retrying after the handshake fixed it', '/w', 'p'),
+                      ('claude', 'old', 'tool', 'Bash command: gh pr view 1' || char(10) || 'Result:' || char(10)
+                        || '{\"interrupted\":false,\"stderr\":\"\",\"stdout\":\"' || char(27) || '[32mMERGED' || char(27) || '[0m\"}', '/w', 'p');
              INSERT INTO deliveries VALUES ('codex', 'later', 2);
              PRAGMA user_version=3;",
         )
@@ -1914,7 +1916,12 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
+    let export = workspace.run(&["export"], None);
+    assert!(
+        export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
+        "raw JSON shell results and escape codes are repaired: {export}"
+    );
 }
 
 #[test]
@@ -2261,4 +2268,22 @@ fn chat_turns_and_common_words_do_not_trigger_recall() {
         ));
         assert!(recalled.is_empty(), "{prompt}: {recalled}");
     }
+}
+
+#[test]
+fn claude_shell_results_store_printed_text_and_edited_files() {
+    let workspace = Workspace::new();
+    workspace.hook(
+        "claude",
+        "objects",
+        "PostToolUse",
+        json!({"tool_name":"Bash","tool_use_id":"edit","tool_input":{"command":"python3 fix.py"},
+            "tool_response":{"interrupted":false,"isImage":false,"stderr":"","stdout":"\u{1b}[32mfixed 2 files\u{1b}[0m\n",
+                "bashEditDiff":{"changedFiles":["/repo/src/lib.rs"]}}}),
+    );
+    let export = workspace.run(&["export"], None);
+    assert!(
+        export.contains(r#""body":"Bash command: python3 fix.py\nChanged files: /repo/src/lib.rs\nResult:\nfixed 2 files""#),
+        "{export}"
+    );
 }

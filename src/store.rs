@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 8;
+const SCHEMA: i64 = 9;
+/// Version of the local summary format. When it increases, the worker
+/// rebuilds the local summaries of earlier turns in place.
+const SUMMARY_FORMAT: i64 = 2;
 
 /// (record id, workspace, project, little-endian f32 vector)
 pub type VectorRow = (i64, String, String, Vec<u8>);
@@ -24,7 +27,7 @@ const MEMORY_FILTER: &str = "(
     e.kind IN ('note', 'observation') OR (e.kind = 'summary' AND (
         e.source = 'claude-mem' OR EXISTS (
             SELECT 1 FROM (
-                SELECT 'Files: ' AS label UNION ALL SELECT 'Explored: ' UNION ALL SELECT 'Checks: '
+                SELECT 'Files: ' AS label UNION ALL SELECT 'Commits: ' UNION ALL SELECT 'Explored: ' UNION ALL SELECT 'Checks: '
                 UNION ALL SELECT 'Errors seen: ' UNION ALL SELECT 'Decision: ' UNION ALL SELECT 'Next: '
             ) AS fact
             WHERE instr(e.body, char(10) || fact.label) BETWEEN 1 AND min(
@@ -101,6 +104,7 @@ pub struct RecentActivity {
     pub time: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct Observation<'a> {
     pub source: &'a str,
     pub session: &'a str,
@@ -305,12 +309,32 @@ impl Store {
                      ALTER TABLE deliveries ADD COLUMN shown INTEGER NOT NULL DEFAULT 1;",
                 )?;
             }
-            migration.execute_batch(
-                "ALTER TABLE deliveries ADD COLUMN delivered_at INTEGER;
-                 CREATE INDEX deliveries_recent ON deliveries(delivered_at DESC)
-                    WHERE delivered_at IS NOT NULL AND shown;
-                 PRAGMA user_version=8;",
-            )?;
+            if version < 8 {
+                migration.execute_batch(
+                    "ALTER TABLE deliveries ADD COLUMN delivered_at INTEGER;
+                     CREATE INDEX deliveries_recent ON deliveries(delivered_at DESC)
+                        WHERE delivered_at IS NOT NULL AND shown;",
+                )?;
+            }
+            // Earlier versions stored Claude Code shell results as raw JSON
+            // and kept terminal escape codes.
+            let rows: Vec<(i64, String, String)> = migration
+                .prepare("SELECT id, kind, body FROM events")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, kind, body) in rows {
+                let repaired = (kind == "tool")
+                    .then(|| crate::hooks::repair_shell_record(&body))
+                    .flatten()
+                    .unwrap_or_else(|| crate::hooks::strip_terminal_codes(&body).into_owned());
+                if repaired != body {
+                    migration.execute(
+                        "UPDATE events SET body = ?1 WHERE id = ?2",
+                        params![repaired, id],
+                    )?;
+                }
+            }
+            migration.execute_batch("PRAGMA user_version=9;")?;
             migration.commit()?;
         }
         Ok(Self {
@@ -1077,6 +1101,49 @@ impl Store {
             })?)
     }
 
+    /// Starts a rebuild of earlier local summaries when their format is out
+    /// of date. Returns the last reply id whose summary is being rebuilt.
+    pub fn summary_refresh_bound(&self) -> Result<i64> {
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        let meta = |key: &str| -> rusqlite::Result<i64> {
+            transaction
+                .query_row(
+                    "SELECT value FROM memory_meta WHERE key = ?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map(Option::unwrap_or_default)
+        };
+        if meta("summary_format")? < SUMMARY_FORMAT {
+            transaction.execute(
+                "INSERT INTO memory_meta VALUES ('summary_refresh', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+                [meta("observe_cursor")?],
+            )?;
+            transaction.execute_batch(&format!(
+                "INSERT INTO memory_meta VALUES ('summary_format', {SUMMARY_FORMAT})
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                 UPDATE memory_meta SET value = 0 WHERE key = 'observe_cursor';"
+            ))?;
+        }
+        let bound = meta("summary_refresh")?;
+        transaction.commit()?;
+        Ok(bound)
+    }
+
+    /// Moves the observation cursor past `anchor` without writing a summary.
+    pub fn skip_observation(&self, anchor: &Record) -> Result<()> {
+        let _guard = self.write_guard()?;
+        self.db.execute(
+            "INSERT INTO memory_meta VALUES ('observe_cursor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+            [anchor.id],
+        )?;
+        Ok(())
+    }
+
     pub fn observe_next(&self) -> Result<Option<Record>> {
         let _guard = self.read_guard()?;
         Ok(self
@@ -1098,11 +1165,18 @@ impl Store {
         anchor: &Record,
         summary: Observation<'_>,
         reported_tokens: i64,
+        replace: bool,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
         if self.insert(summary, Some(anchor.created_at))? {
             self.add_metric("observer_tokens", reported_tokens)?;
+        } else if replace {
+            transaction.execute(
+                "UPDATE events SET body = ?1
+                 WHERE source = ?2 AND session = ?3 AND event_key = ?4 AND body != ?1",
+                params![summary.body, summary.source, summary.session, summary.key],
+            )?;
         }
         transaction.execute(
             "INSERT INTO memory_meta VALUES ('observe_cursor', ?1)

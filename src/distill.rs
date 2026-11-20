@@ -7,6 +7,7 @@ pub struct Facts {
     pub kind: &'static str,
     pub title: String,
     pub files: Vec<String>,
+    pub commits: Vec<String>,
     pub explored: Vec<String>,
     pub checks: Vec<(String, &'static str)>,
     pub errors: Vec<String>,
@@ -22,7 +23,9 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         let first = body.lines().next().unwrap_or_default();
         let explored = first
             .strip_prefix("Read ")
-            .map(|path| relative(path, root).to_owned())
+            .map(|path| relative(path, root))
+            .filter(|path| !scratch_path(path))
+            .map(str::to_owned)
             .or_else(|| {
                 ["Grep ", "Glob "]
                     .iter()
@@ -41,6 +44,19 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         let Some((command, output, failed)) = shell(body) else {
             continue;
         };
+        let reported = body
+            .lines()
+            .take_while(|line| *line != "Result:")
+            .find_map(|line| line.strip_prefix("Changed files: "))
+            .map(|files| files.split(", ").map(str::to_owned).collect::<Vec<_>>());
+        if reported.is_some() || !failed {
+            for path in reported.unwrap_or_else(|| shell_edits(command)) {
+                let path = relative(&path, root).to_owned();
+                if !scratch_path(&path) && !facts.files.contains(&path) {
+                    facts.files.push(path);
+                }
+            }
+        }
         let Some(check) = named_check(command, failed) else {
             if !failed
                 && !output.trim().is_empty()
@@ -72,13 +88,35 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
     let checks = facts.checks.len();
     facts.checks.drain(..checks.saturating_sub(4));
     facts.errors.truncate(3);
-    facts.title = prompt
+    let request = prompt
         .lines()
-        .chain(reply.lines())
         .map(strip_attachments)
         .find(|line| !line.is_empty())
-        .map(|line| cut(&line, 100).to_owned())
         .unwrap_or_default();
+    // A reply such as "yes" or "do it" names no task; the reply's opening
+    // sentence describes the work better.
+    let vague = request
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| {
+            word.len() > 2
+                && ![
+                    "yes", "yeah", "yep", "sure", "okay", "please", "this", "that", "all", "and",
+                    "then", "now", "ahead", "the", "continue", "thanks",
+                ]
+                .contains(&word.to_lowercase().as_str())
+        })
+        .count()
+        < 2;
+    facts.title = if vague {
+        sentences(reply)
+            .into_iter()
+            .next()
+            .filter(|sentence| !sentence.ends_with(':'))
+            .unwrap_or(request)
+    } else {
+        request
+    };
+    facts.title = cut(&facts.title, 100).to_owned();
     facts.kind = kind(prompt, !facts.files.is_empty());
     let sentences = sentences(reply);
     facts.decision = sentences
@@ -125,11 +163,8 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
 /// Keep only the part of a compound shell command that runs a check.
 fn check_segment(command: &str) -> Option<String> {
     let first = command.lines().next().unwrap_or_default();
-    first
-        .split("&&")
-        .flat_map(|part| part.split(';'))
-        .flat_map(|part| part.split("||"))
-        .map(|part| part.split('|').next().unwrap_or_default())
+    shell_segments(first)
+        .iter()
         .map(|part| part.split(" 2>").next().unwrap_or_default().trim())
         .find(|part| is_check(part))
         .map(|part| cut(part, 80).to_owned())
@@ -147,11 +182,28 @@ fn strip_attachments(line: &str) -> String {
 }
 
 impl Facts {
+    /// Adds the commits made during the turn. Their files count as edited
+    /// when the tool records showed no edits, such as edits made by scripts.
+    pub fn add_commits(&mut self, prompt: &str, commits: Vec<String>, files: Vec<String>) {
+        for file in files {
+            if self.files.len() < 8 && !self.files.contains(&file) {
+                self.files.push(file);
+            }
+        }
+        self.explored.retain(|item| !self.files.contains(item));
+        self.commits = commits;
+        self.commits.truncate(5);
+        self.kind = kind(prompt, !self.files.is_empty());
+    }
+
     /// Render the facts as the searchable summary text, with `detail` as the narrative.
     pub fn render(&self, detail_label: &str, detail: &str, references: &str) -> String {
         let mut text = format!("{}: {}", self.kind, self.title);
         if !self.files.is_empty() {
             text.push_str(&format!("\nFiles: {}", self.files.join(", ")));
+        }
+        if !self.commits.is_empty() {
+            text.push_str(&format!("\nCommits: {}", self.commits.join("; ")));
         }
         if !self.explored.is_empty() {
             text.push_str(&format!("\nExplored: {}", self.explored.join(", ")));
@@ -254,34 +306,260 @@ fn shell(body: &str) -> Option<(&str, &str, bool)> {
         Some(command) => (command, true),
         None => (command, false),
     };
+    let command = command.split("\nChanged files: ").next().unwrap_or(command);
     Some((command.trim(), output, failed))
 }
 
+/// Whether a single shell command runs tests, a build, a linter or a type
+/// checker. Only the program and its subcommand count, so a path such as
+/// `tests/workflow.rs` in `sed -n 1,9p tests/workflow.rs` does not.
 fn is_check(command: &str) -> bool {
-    command
-        .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-        .any(|word| {
-            matches!(
-                word,
-                "test"
-                    | "tests"
-                    | "check"
-                    | "build"
-                    | "lint"
-                    | "clippy"
-                    | "pytest"
-                    | "jest"
-                    | "vitest"
-                    | "nextest"
-                    | "tsc"
-                    | "mypy"
-                    | "ruff"
-                    | "eslint"
-                    | "typecheck"
-                    | "gradlew"
-                    | "rspec"
-            )
+    let mut words = command
+        .split_whitespace()
+        .skip_while(|word| word.contains('=') && !word.starts_with('-'))
+        .peekable();
+    let program = loop {
+        let Some(word) = words.next() else {
+            return false;
+        };
+        match basename(word) {
+            "sudo" | "env" | "time" | "nice" | "command" | "exec" | "npx" | "bunx" | "pnpx"
+            | "xvfb-run" => {}
+            "timeout" => {
+                words.next_if(|word| word.starts_with(|c: char| c.is_ascii_digit()));
+            }
+            "uv" | "poetry" | "pipenv" | "rye" | "hatch" | "pdm"
+                if words.peek() == Some(&"run") =>
+            {
+                words.next();
+            }
+            "python" | "python3" if words.peek() == Some(&"-m") => {
+                words.next();
+            }
+            name => break name,
+        }
+    };
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    const TOOLS: &[&str] = &[
+        "pytest",
+        "jest",
+        "vitest",
+        "mocha",
+        "ava",
+        "tsc",
+        "mypy",
+        "pyright",
+        "ruff",
+        "flake8",
+        "pylint",
+        "eslint",
+        "biome",
+        "rspec",
+        "phpunit",
+        "ktlint",
+        "detekt",
+        "swiftlint",
+        "golangci-lint",
+        "shellcheck",
+        "tox",
+        "nox",
+        "ctest",
+        "cargo-nextest",
+        "unittest",
+        "clippy-driver",
+        "typecheck",
+        "bats",
+    ];
+    if TOOLS.contains(&program) {
+        return true;
+    }
+    let args: Vec<&str> = words.filter(|word| !word.starts_with('-')).collect();
+    let verb = |word: &str| {
+        let lower = word.to_ascii_lowercase();
+        [
+            "test",
+            "check",
+            "build",
+            "lint",
+            "clippy",
+            "nextest",
+            "typecheck",
+            "vet",
+            "assemble",
+            "verify",
+        ]
+        .iter()
+        .any(|verb| {
+            lower.starts_with(verb) || lower.ends_with(verb) || lower.contains(&format!(":{verb}"))
         })
+    };
+    match program {
+        "cargo" | "go" | "make" | "just" | "mvn" | "mvnw" | "dotnet" | "swift" | "mix"
+        | "bazel" | "bazelisk" | "nx" | "turbo" | "xcodebuild" | "flutter" | "dart" | "sbt"
+        | "zig" | "deno" | "meson" | "ninja" => args.first().is_some_and(|arg| verb(arg)),
+        "npm" | "pnpm" | "yarn" | "bun" => match args.first() {
+            Some(&"run" | &"run-script") => args.get(1).is_some_and(|arg| verb(arg)),
+            Some(arg) => verb(arg),
+            None => false,
+        },
+        "gradle" | "gradlew" => args
+            .iter()
+            .any(|arg| verb(arg.rsplit(':').next().unwrap_or(arg))),
+        "node" => command.split_whitespace().any(|word| word == "--test"),
+        _ => false,
+    }
+}
+
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// Files that a successful shell command edited in place or moved.
+fn shell_edits(command: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for segment in shell_segments(command.lines().next().unwrap_or_default()) {
+        let words = shell_words(&segment);
+        let Some((program, _)) = words.first() else {
+            continue;
+        };
+        // Globs and variables are not file names.
+        let literal =
+            |(word, quoted): &(String, bool)| *quoted || !word.contains(['$', '*', '?', '{', '`']);
+        let mut operands: Vec<&(String, bool)> = Vec::new();
+        let mut value = false;
+        for word in &words[1..] {
+            if std::mem::take(&mut value) {
+                continue;
+            }
+            if word.0.starts_with('-') {
+                value = matches!(word.0.as_str(), "-e" | "-f" | "--expression" | "--file");
+            } else {
+                operands.push(word);
+            }
+        }
+        match basename(program) {
+            "sed" | "perl"
+                if words.iter().any(|(word, _)| {
+                    word.starts_with("-i") || word.starts_with("-pi") || word == "--in-place"
+                }) =>
+            {
+                // With -e the scripts are option values; otherwise the first
+                // operand is the script.
+                let script = !words.iter().any(|(word, _)| word == "-e");
+                found.extend(
+                    operands
+                        .into_iter()
+                        .skip(usize::from(script))
+                        .filter(|word| literal(word))
+                        .map(|(word, _)| word.clone()),
+                );
+            }
+            "git" => match operands.first().map(|(word, _)| word.as_str()) {
+                Some("mv") => found.extend(
+                    operands
+                        .last()
+                        .filter(|word| literal(word))
+                        .map(|(word, _)| word.clone()),
+                ),
+                Some("rm") => found.extend(
+                    operands[1..]
+                        .iter()
+                        .filter(|word| literal(word))
+                        .map(|(word, _)| word.clone()),
+                ),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Splits a command line at `&&`, `||`, `;` and `|` outside quotes.
+fn shell_segments(line: &str) -> Vec<String> {
+    let mut segments = vec![String::new()];
+    let mut quote = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                segments.last_mut().unwrap().push(c);
+            }
+            (Some(_), c) => segments.last_mut().unwrap().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                segments.last_mut().unwrap().push(c);
+            }
+            (None, ';' | '|' | '&') => {
+                chars.next_if(|next| *next == c);
+                if c != '&'
+                    || segments
+                        .last()
+                        .is_some_and(|segment| !segment.ends_with(['>', '<']))
+                {
+                    segments.push(String::new());
+                }
+            }
+            (None, c) => segments.last_mut().unwrap().push(c),
+        }
+    }
+    segments.retain(|segment| !segment.trim().is_empty());
+    segments
+}
+
+/// Shell words with their quotes removed. `true` marks a word that was
+/// quoted, so it holds no glob or variable.
+fn shell_words(segment: &str) -> Vec<(String, bool)> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut quote = None;
+    for c in segment.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                quoted = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if !word.is_empty() || quoted {
+                    words.push((std::mem::take(&mut word), quoted));
+                }
+                quoted = false;
+            }
+            (None, c) => word.push(c),
+        }
+    }
+    if !word.is_empty() || quoted {
+        words.push((word, quoted));
+    }
+    // A redirection and its target are not operands.
+    let mut kept = Vec::new();
+    let mut skip = false;
+    for (word, quoted) in words {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if !quoted && word.starts_with(['>', '<']) || word.starts_with("2>") {
+            skip = !word.contains('&') && word.trim_start_matches(['2', '>', '<', '&']).is_empty();
+            continue;
+        }
+        kept.push((word, quoted));
+    }
+    kept
+}
+
+/// Temporary and harness files that say nothing about the project.
+fn scratch_path(path: &str) -> bool {
+    path.starts_with("/tmp/")
+        || path.starts_with("/var/folders/")
+        || path.starts_with("/private/var/folders/")
+        || ["/scratchpad/", "/tool-results/", "/.claude/projects/"]
+            .iter()
+            .any(|marker| path.contains(marker))
 }
 
 fn status(output: &str) -> &'static str {
@@ -485,6 +763,113 @@ mod tests {
         assert_eq!(
             facts.next.as_deref(),
             Some("Add a coverage test for the ls alias.")
+        );
+    }
+
+    #[test]
+    fn only_the_program_and_subcommand_make_a_check() {
+        for command in [
+            "cargo test --locked",
+            "cargo clippy --all-targets",
+            "RUST_LOG=1 timeout 60 cargo nextest run",
+            "uv run pytest -q tests/",
+            "python3 -m pytest",
+            "npm test",
+            "pnpm run test:unit",
+            "yarn lint",
+            "./gradlew :app:testDebugUnitTest",
+            "go vet ./...",
+            "MIB_TEST_BINARY=target/debug/mib node --test tests/capture-hooks.mjs",
+            "npx tsc --noEmit",
+            "make check",
+        ] {
+            assert!(is_check(command), "{command}");
+        }
+        for command in [
+            "sed -n 2255,2275p tests/workflow.rs",
+            "find src tests -name '*.rs'",
+            "cp tests/workflow.rs README.md /tmp/x",
+            "rg -n test src",
+            "cat build.rs",
+            "cargo fmt",
+            "npm install",
+            "git commit -m 'test: add a check'",
+        ] {
+            assert!(!is_check(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn shell_edits_name_in_place_edits_and_moves() {
+        assert_eq!(
+            shell_edits("cd /r && sed -i 's/a/b/g; s/c/d/' README.md docs/a.md && git status"),
+            ["README.md", "docs/a.md"]
+        );
+        assert_eq!(
+            shell_edits("sed -i -e 's/a/b/' -e 's/c/d/' src/x.rs"),
+            ["src/x.rs"]
+        );
+        assert_eq!(
+            shell_edits("git mv docs/old.md docs/new.md"),
+            ["docs/new.md"]
+        );
+        assert_eq!(shell_edits("git rm -q src/gone.rs"), ["src/gone.rs"]);
+        assert!(shell_edits("sed -i 's/a/b/' docs/*.md").is_empty());
+        assert!(shell_edits("sed -n 1,9p src/x.rs").is_empty());
+    }
+
+    #[test]
+    fn edits_made_by_shell_commands_count_as_files() {
+        let tools = [
+            "Bash command: sed -i 's/old/new/' src/config.rs 2>&1 | tail -1\nResult:\n",
+            "Bash command: git mv /repo/a.md /repo/b.md\nResult:\n",
+            "Bash command: python3 fix.py\nChanged files: /repo/src/lib.rs\nResult:\nok",
+            "Bash command: sed -i 's/x/y/' missing.rs\nTool status: failed\nResult:\nno such file",
+        ];
+        let facts = distill("/repo", "Rename the old option", &tools, "Done.");
+        assert_eq!(facts.files, ["src/config.rs", "b.md", "src/lib.rs"]);
+        assert_eq!(facts.kind, "Refactor");
+    }
+
+    #[test]
+    fn scratch_and_harness_files_are_not_explored_files() {
+        let tools = [
+            "Read /tmp/claude-1/x/scratchpad/cap.png",
+            "Read /home/me/.claude/projects/p/tool-results/b.txt",
+            "Read /repo/src/ui.rs",
+        ];
+        let facts = distill("/repo", "Why is the tile not centered", &tools, "");
+        assert_eq!(facts.explored, ["src/ui.rs"]);
+    }
+
+    #[test]
+    fn a_vague_request_takes_its_title_from_the_reply() {
+        let facts = distill(
+            "/r",
+            "yes do it",
+            &[],
+            "Committed as `7252dce` on main. Not pushed.",
+        );
+        assert_eq!(facts.title, "Committed as `7252dce` on main.");
+        let facts = distill("/r", "Fix the retry counter reset", &[], "Fixed.");
+        assert_eq!(facts.title, "Fix the retry counter reset");
+    }
+
+    #[test]
+    fn commits_add_their_files_and_make_the_turn_a_change() {
+        let mut facts = distill("/r", "clean up the old names", &[], "Done.");
+        assert_eq!(facts.kind, "Investigation");
+        facts.add_commits(
+            "clean up the old names",
+            vec!["7252dce refactor: drop old names".into()],
+            vec!["src/config.rs".into()],
+        );
+        assert_eq!(facts.kind, "Refactor");
+        assert_eq!(facts.files, ["src/config.rs"]);
+        let text = facts.render("Outcome", "Done.", "[#1]");
+        assert!(
+            text.contains("\nCommits: 7252dce refactor: drop old names"),
+            "{text}"
         );
     }
 

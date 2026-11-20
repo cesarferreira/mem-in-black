@@ -142,8 +142,14 @@ record replaced re-reading its full original output.
 
 **What gets captured:** prompts, agent replies, shell commands with a trimmed
 result, edited paths with line counts, read paths, search patterns with matching
-file names, and short web excerpts. File contents, MCP tool results, and lines
-that look like credentials are not stored.
+file names, and short web excerpts. File contents, MCP tool results, terminal
+escape codes, and lines that look like credentials are not stored.
+
+**What a work summary holds:** after each turn, the worker writes a summary
+with the request, the outcome, the files changed (including edits made by
+shell commands), commits made during the turn, the checks that ran and their
+result, errors seen, decisions and the next step. When this format improves,
+the worker rebuilds earlier local summaries in place.
 
 ## Configuration
 

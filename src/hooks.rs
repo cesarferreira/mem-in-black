@@ -293,11 +293,10 @@ fn tool_record(event: &Input) -> Option<String> {
     ) && let Some(command) = command
     {
         let command = clean(command, 350);
-        let result = match &event.tool_response {
-            Value::String(text) => clean(text, 128 * 1024),
-            Value::Null => clean(event.error.as_deref().unwrap_or(""), 128 * 1024),
-            value => clean(&value.to_string(), 128 * 1024),
-        };
+        let result = clean(
+            &shell_output(&event.tool_response, event.error.as_deref()),
+            128 * 1024,
+        );
         let status = if failed
             || event
                 .tool_response
@@ -309,12 +308,200 @@ fn tool_record(event: &Input) -> Option<String> {
         } else {
             ""
         };
+        let changed = changed_files(
+            event
+                .tool_response
+                .pointer("/bashEditDiff/changedFiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
         return Some(format!(
-            "{name} command: {command}{status}\nResult:\n{}",
+            "{name} command: {command}{changed}{status}\nResult:\n{}",
             excerpt(&result, 1150)
         ));
     }
     None
+}
+
+/// The text a shell tool printed. Claude Code reports Bash results as an
+/// object with separate `stdout` and `stderr` fields.
+fn shell_output(response: &Value, error: Option<&str>) -> String {
+    match response {
+        Value::String(text) => text.clone(),
+        Value::Null => error.unwrap_or_default().to_owned(),
+        Value::Object(fields)
+            if ["stdout", "stderr", "output"]
+                .iter()
+                .any(|key| fields.contains_key(*key)) =>
+        {
+            let mut parts: Vec<&str> = ["stdout", "output", "stderr"]
+                .iter()
+                .filter_map(|key| fields.get(*key).and_then(Value::as_str))
+                .map(str::trim_end)
+                .filter(|text| !text.is_empty())
+                .collect();
+            if fields.get("interrupted") == Some(&Value::Bool(true)) {
+                parts.push("[interrupted]");
+            }
+            parts.join("\n")
+        }
+        value => value.to_string(),
+    }
+}
+
+/// The line naming files a shell command edited, as Claude Code reports
+/// them, or nothing.
+fn changed_files<'a>(files: impl Iterator<Item = &'a str>) -> String {
+    let files: Vec<_> = files.take(10).map(|file| cut(file, 200)).collect();
+    if files.is_empty() {
+        String::new()
+    } else {
+        format!("\nChanged files: {}", files.join(", "))
+    }
+}
+
+/// Rewrites a stored shell record whose result is a raw JSON response
+/// object, as earlier versions stored them, into the printed text.
+pub fn repair_shell_record(body: &str) -> Option<String> {
+    let (head, result) = body.split_once("\nResult:\n")?;
+    if !head.contains(" command: ") || !result.starts_with('{') {
+        return None;
+    }
+    let changed = match serde_json::from_str::<Value>(result) {
+        Ok(value) => changed_files(
+            value
+                .pointer("/bashEditDiff/changedFiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        ),
+        Err(_) => {
+            let list = result
+                .split_once("\"changedFiles\":[")
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map_or("", |(list, _)| list);
+            changed_files(
+                list.split(',')
+                    .map(|item| item.trim().trim_matches('"'))
+                    .filter(|item| !item.is_empty()),
+            )
+        }
+    };
+    let text = match serde_json::from_str::<Value>(result) {
+        Ok(value @ Value::Object(_)) => {
+            if !["stdout", "stderr", "output"]
+                .iter()
+                .any(|key| value.get(key).is_some())
+            {
+                return None;
+            }
+            shell_output(&value, None)
+        }
+        // An excerpt cuts the JSON, so read the string fields directly.
+        _ => {
+            let fields: Vec<String> = ["stdout", "stderr"]
+                .iter()
+                .filter_map(|key| json_string_field(result, key))
+                .filter(|text| !text.trim().is_empty())
+                .collect();
+            if fields.is_empty() && !result.contains("\"stdout\":") && changed.is_empty() {
+                return None;
+            }
+            fields.join("\n")
+        }
+    };
+    let (command, status) = match head.strip_suffix("\nTool status: failed") {
+        Some(command) => (command, "\nTool status: failed"),
+        None => (head, ""),
+    };
+    Some(format!(
+        "{command}{changed}{status}\nResult:\n{}",
+        excerpt(&clean(&text, 128 * 1024), 1150)
+    ))
+}
+
+/// Decodes the string value of `"key":"…"` in possibly truncated JSON. The
+/// value ends at its closing quote or at the end of the text.
+fn json_string_field(json: &str, key: &str) -> Option<String> {
+    let start = json.find(&format!("\"{key}\":\""))? + key.len() + 4;
+    let mut output = String::new();
+    let mut chars = json[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('t') => output.push('\t'),
+                Some('r') => output.push('\r'),
+                Some('u') => {
+                    let code: String = chars.by_ref().take(4).collect();
+                    if let Some(c) = u32::from_str_radix(&code, 16).ok().and_then(char::from_u32) {
+                        output.push(c);
+                    }
+                }
+                Some(other) => output.push(other),
+                None => break,
+            },
+            c => output.push(c),
+        }
+    }
+    Some(output)
+}
+
+/// Removes terminal escape sequences and keeps only the final state of a
+/// line that a carriage return redrew, such as a progress bar.
+pub fn strip_terminal_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\u{1b}', '\r']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            output.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then one final byte in @..~.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ends at BEL or ESC \.
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            // Character set selection such as ESC ( B.
+            Some('(' | ')' | '*' | '+') => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    let lines: Vec<&str> = output
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.rsplit('\r')
+                .find(|part| !part.is_empty())
+                .unwrap_or("")
+        })
+        .collect();
+    std::borrow::Cow::Owned(lines.join("\n"))
 }
 
 fn line_changes(name: &str, input: &Value) -> (usize, usize) {
@@ -381,7 +568,8 @@ pub fn excerpt(text: &str, limit: usize) -> String {
 }
 
 pub fn clean(text: &str, limit: usize) -> String {
-    let text = cut(text, limit.saturating_mul(4));
+    let text = strip_terminal_codes(cut(text, limit.saturating_mul(4)));
+    let text = text.as_ref();
     let mut output = String::new();
     let lower = text.to_ascii_lowercase();
     let mut pos = 0;
@@ -762,7 +950,7 @@ fn stem(word: &str) -> String {
     word
 }
 
-fn is_local_summary(body: &str) -> bool {
+pub fn is_local_summary(body: &str) -> bool {
     [
         "Investigation: ",
         "Bugfix: ",
@@ -865,6 +1053,7 @@ fn summary_excerpt(body: &str) -> String {
         "Errors seen: ",
         "Decision: ",
         "Next: ",
+        "Commits: ",
         "Files: ",
         "Explored: ",
     ] {
@@ -878,6 +1067,56 @@ fn summary_excerpt(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_codes_and_redrawn_lines_are_removed() {
+        let text = "\u{1b}[32m+ added\u{1b}(B\u{1b}[m\n\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}\n10%\r50%\r100% done\r\n";
+        assert_eq!(strip_terminal_codes(text), "+ added\nlink\n100% done\n");
+        assert!(matches!(
+            strip_terminal_codes("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn edited_files_survive_a_repair_of_a_cut_response() {
+        let edit = "Bash command: sed -i 's/a/b/' /r/x.rs\nResult:\n{\"bashEditDiff\":{\"changedFiles\":[\"/r/x.rs\"],\"files\":[{\"hunks\n…\n\"}";
+        assert_eq!(
+            repair_shell_record(edit).as_deref(),
+            Some("Bash command: sed -i 's/a/b/' /r/x.rs\nChanged files: /r/x.rs\nResult:\n")
+        );
+    }
+
+    #[test]
+    fn claude_shell_responses_keep_only_the_printed_text() {
+        let response = json!({"interrupted": false, "isImage": false, "stderr": "warn: x\n", "stdout": "ok\n"});
+        assert_eq!(shell_output(&response, None), "ok\nwarn: x");
+        assert_eq!(shell_output(&json!("plain"), None), "plain");
+        assert_eq!(shell_output(&Value::Null, Some("boom")), "boom");
+    }
+
+    #[test]
+    fn stored_json_shell_results_are_repaired() {
+        let whole = r#"Bash command: gh pr view 11
+Result:
+{"interrupted":false,"isImage":false,"noOutputExpected":false,"stderr":"","stdout":"{\"state\":\"CLOSED\"}"}"#;
+        assert_eq!(
+            repair_shell_record(whole).as_deref(),
+            Some("Bash command: gh pr view 11\nResult:\n{\"state\":\"CLOSED\"}")
+        );
+        let cut = "Bash command: cargo test\nResult:\n{\"interrupted\":false,\"stderr\":\"\",\"stdout\":\"running 3 tests\\ntest a ... ok\n…\ntest result: ok\"}";
+        assert_eq!(
+            repair_shell_record(cut).as_deref(),
+            Some(
+                "Bash command: cargo test\nResult:\nrunning 3 tests\ntest a ... ok\n…\ntest result: ok"
+            )
+        );
+        assert_eq!(
+            repair_shell_record("Bash command: jq .\nResult:\n{\"a\":1}"),
+            None
+        );
+        assert_eq!(repair_shell_record("Read src/x.rs"), None);
+    }
     use crate::config::Storage;
 
     fn send(

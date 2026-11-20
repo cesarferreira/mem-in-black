@@ -154,7 +154,8 @@ pub fn observe_once(data: &Storage) -> Result<()> {
     );
     let store = Store::open_worker(data)?;
     let config = observer::settings(&data.directory)?;
-    while observer::process_one(&store, config.as_ref())? {}
+    let refresh = store.summary_refresh_bound()?;
+    while observer::process_one(&store, config.as_ref(), refresh)? {}
     Ok(())
 }
 
@@ -206,8 +207,9 @@ pub fn run(data: &Storage) -> Result<()> {
         let Ok(store) = Store::open(&worker_data) else {
             return;
         };
+        let refresh = store.summary_refresh_bound().unwrap_or_default();
         loop {
-            match observer::process_one(&store, config.as_ref()) {
+            match observer::process_one(&store, config.as_ref(), refresh) {
                 Ok(true) => {}
                 Ok(false) => thread::sleep(Duration::from_secs(2)),
                 Err(_) => thread::sleep(Duration::from_secs(5)),
