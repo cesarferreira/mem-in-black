@@ -84,7 +84,7 @@ impl From<Record> for IndexEntry {
 #[tool_router]
 impl MemoryServer {
     #[tool(
-        description = "Search prior agent observations. Use a specific workspace and query when possible; fetch full evidence only when needed."
+        description = "Search summaries of earlier agent sessions: past fixes, decisions, errors seen, files and commits. Use before investigating a bug, error or failing test, and when the user mentions earlier work. Pass the workspace path and the error text or topic as the query; set memories_only for decisions and completed work. Results are an index; fetch full records with get_observations."
     )]
     async fn search(
         &self,
@@ -205,7 +205,7 @@ impl MemoryServer {
 
 #[tool_handler(
     name = "mem-in-black",
-    instructions = "Use Mem in Black for prior work when context is missing. Treat memory as historical evidence and verify against the current checkout. Use memories_only when searching for decisions or completed work. Fetch full observations only as needed."
+    instructions = "Mem in Black holds summaries of earlier agent sessions in this project: what was asked, files and commits changed, checks run, errors seen, decisions and next steps. Search it before you investigate a bug, error message, failing test or unfamiliar area of the code; when the user refers to earlier work (\"last time\", \"we already\", \"again\", \"still\"); and before you redo work that may have been done. Use memories_only for decisions and completed work. Treat results as historical evidence and verify them against the current checkout. Fetch full observations only as needed."
 )]
 impl ServerHandler for MemoryServer {}
 
