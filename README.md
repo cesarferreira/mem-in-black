@@ -46,7 +46,8 @@ Everything runs on your machine: no account, no hosted service, no telemetry.
 
 ## Install
 
-On Linux or macOS (x86_64 or ARM64), install the latest release binary:
+On Linux (x86_64 or ARM64) or an Apple silicon Mac, install the latest release
+binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cesarferreira/mem-in-black/main/install.sh | sh

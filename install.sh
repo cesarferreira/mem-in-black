@@ -26,10 +26,14 @@ x86_64 | amd64) arch="x86_64" ;;
 aarch64 | arm64) arch="aarch64" ;;
 *) fail "unsupported CPU $(uname -m); build from source with cargo instead" ;;
 esac
-# A shell running under Rosetta reports x86_64 on Apple silicon.
-if [ "$os" = "apple-darwin" ] && [ "$arch" = "x86_64" ] &&
-	[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
-	arch="aarch64"
+# Releases include Apple silicon Macs only. A shell running under Rosetta
+# reports x86_64 on Apple silicon.
+if [ "$os" = "apple-darwin" ] && [ "$arch" = "x86_64" ]; then
+	if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+		arch="aarch64"
+	else
+		fail "Intel Macs have no release binary; build from source with cargo instead"
+	fi
 fi
 asset="mem-in-black-$arch-$os.tar.gz"
 
