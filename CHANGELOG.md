@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-11-21
+
+### 🚀 Features
+
+- Download through the GitHub CLI when a plain download fails
+- Write summary titles and outcomes with Claude Haiku
+- Scope handoffs to the current Git branch and worktree
+
+### 📚 Documentation
+
+- Explain installing from the private repository
+- Drop the private repository install note
+- Highlight cross-agent handoffs and recall costs
+
+### 🧪 Testing
+
+- Keep capture fixtures independent of Claude login
 ## [0.1.1] - 2026-11-20
 
 ### 💼 Other
