@@ -11,7 +11,7 @@ async function setupOpenCode(ctx) {
       if (session.parentID) return;
       const turn = await startMemoryTurn(session.location.directory, sessionID, messageID, prompt.text ?? "");
       if (!turn) return;
-      const state = sessions.get(sessionID) ?? { turns: new Map(), tools: new Map() };
+      const state = sessions.get(sessionID) ?? { turns: new Map(), tools: new Map(), briefs: new Map() };
       state.turns.set(messageID, turn);
       sessions.set(sessionID, state);
       event.metadata = { ...event.metadata, [turnMetadataKey]: messageID };
@@ -44,10 +44,14 @@ async function setupOpenCode(ctx) {
     }
   });
 
-  await ctx.tool.hook("execute.before", ({ sessionID, messageID, id, tool }) => {
+  await ctx.tool.hook("execute.before", ({ sessionID, messageID, id, tool, input }) => {
     const state = sessions.get(sessionID);
     if (state?.turn && memoryToolNames.has(tool.toLowerCase())) {
-      state.tools.set(messageID + ":" + id, state.turn);
+      const key = messageID + ":" + id;
+      state.tools.set(key, state.turn);
+      // The brief is not awaited: the tool runs meanwhile, and `execute.after`
+      // is where a plugin can add to what the model receives.
+      state.briefs.set(key, recallForTool(state.turn, key, tool, input));
     }
   });
 
@@ -55,9 +59,13 @@ async function setupOpenCode(ctx) {
     const state = sessions.get(event.sessionID);
     const id = event.messageID + ":" + event.id;
     const turn = state?.tools.get(id);
+    const brief = await state?.briefs.get(id);
     state?.tools.delete(id);
+    state?.briefs.delete(id);
     await captureTool(turn, id, event.tool, event.input,
       event.result?.content ?? event.error?.message, event.status === "error", event.result?.metadata);
+    const content = brief && event.status !== "error" ? withToolRecall(event.result?.content, brief) : undefined;
+    if (content !== undefined) event.result = { ...event.result, content };
   });
 
   await ctx.session.hook("experimental.idle", async ({ sessionID }) => {
@@ -89,6 +97,7 @@ async function setupOpenCode(ctx) {
     }
     state.turn = undefined;
     state.tools.clear();
+    state.briefs.clear();
     if (state.turns.size === 0) sessions.delete(sessionID);
   }
 
@@ -115,7 +124,21 @@ async function setupOpenCode(ctx) {
 
 async function legacyOpenCode({ client, directory }) {
   const sessions = new Map();
+  const briefs = new Map();
   return {
+    "tool.execute.before": async ({ tool, sessionID, callID }, { args }) => {
+      const turns = sessions.get(sessionID);
+      const turn = turns && [...turns.values()].at(-1);
+      const key = `${sessionID}:${callID}`;
+      if (turn) briefs.set(key, recallForTool(turn, key, tool, args));
+    },
+    "tool.execute.after": async ({ sessionID, callID }, output) => {
+      const key = `${sessionID}:${callID}`;
+      const brief = await briefs.get(key);
+      briefs.delete(key);
+      const text = brief && withToolRecall(output.output, brief);
+      if (text !== undefined) output.output = text;
+    },
     "chat.message": async ({ sessionID }, { message, parts }) => {
       try {
         const { data: session } = await client.session.get({ path: { id: sessionID } });
@@ -157,7 +180,7 @@ async function legacyOpenCode({ client, directory }) {
             const state = part.state;
             if (state.status === "completed" || state.status === "error") {
               await captureTool(turn, `${info.id}:${part.callID}`, part.tool, state.input,
-                state.output ?? state.error, state.status === "error", state.metadata);
+                withoutToolRecall(state.output ?? state.error), state.status === "error", state.metadata);
             }
           }
           const text = contentText(parts.filter((part) => !part.synthetic && !part.ignored));

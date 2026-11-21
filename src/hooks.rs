@@ -96,12 +96,17 @@ pub fn handle(
     let source = host.name();
     let session = &event.session_id;
     if event.hook_event_name == "PreToolUse" {
-        if let Some(id) = &event.tool_use_id
-            && store.is_private(source, session, turn_id)?
-        {
-            store.mark_private_tool(source, session, id)?;
+        if store.is_private(source, session, turn_id)? {
+            if let Some(id) = &event.tool_use_id {
+                store.mark_private_tool(source, session, id)?;
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        if !action_recall_enabled() {
+            return Ok(None);
+        }
+        return Ok(action_recall(store, source, session, &event)?
+            .map(|context| recall_response("PreToolUse", context)));
     }
     let workspace = Workspace::read(&event.cwd);
     let write = |kind, body: &str, key: Option<&str>, raw: usize| -> Result<()> {
@@ -129,7 +134,10 @@ pub fn handle(
             let Some(prompt) = store.captured_prompt(source, session, &workspace, turn)? else {
                 return Ok(None);
             };
-            Ok(recall(store, &workspace, source, session, &prompt, semantic)?.map(recall_response))
+            Ok(
+                recall(store, &workspace, source, session, &prompt, semantic)?
+                    .map(|context| recall_response("UserPromptSubmit", context)),
+            )
         }
         "UserPromptSubmit" => {
             let private = event
@@ -153,7 +161,7 @@ pub fn handle(
             let key = turn_id.map(|turn| format!("prompt:{turn}"));
             write("prompt", &prompt, key.as_deref(), event.prompt.len())
                 .context("storing prompt")?;
-            Ok(context.map(recall_response))
+            Ok(context.map(|context| recall_response("UserPromptSubmit", context)))
         }
         "Stop" if !store.is_private(source, session, turn_id)? => {
             if let Some(message) = &event.last_assistant_message {
@@ -181,9 +189,11 @@ pub fn handle(
     }
 }
 
-fn recall_response(additional_context: String) -> Value {
+/// The hook output that adds `additional_context` to the model's context. The
+/// host matches `hookEventName` to the event it sent.
+fn recall_response(event_name: &str, additional_context: String) -> Value {
     json!({"hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit", "additionalContext": additional_context,
+        "hookEventName": event_name, "additionalContext": additional_context,
     }})
 }
 
@@ -236,40 +246,56 @@ pub(crate) fn project_path(root: &str, path: &str) -> String {
     }
 }
 
+const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "apply_patch"];
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "Bash" | "Shell" | "shell" | "exec_command" | "shell_command" | "run_shell_command"
+    )
+}
+
+/// The file an edit tool names directly.
+fn edit_path(input: &Value) -> Option<&str> {
+    input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(Value::as_str)
+}
+
+/// The file headers of a patch, as a label such as `*** Update File` and its path.
+fn patch_headers(input: &Value) -> impl Iterator<Item = (&str, &str)> {
+    input
+        .get("patch")
+        .or_else(|| input.get("input"))
+        .or_else(|| input.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            [
+                "*** Update File:",
+                "*** Add File:",
+                "*** Delete File:",
+                "*** Move to:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+        .map(|line| {
+            let (label, path) = line.split_once(':').unwrap_or((line, ""));
+            (label, path.trim())
+        })
+}
+
 fn tool_record(event: &Input, root: &str) -> Option<String> {
     let name = event.tool_name.as_str();
     let failed = event.hook_event_name == "PostToolUseFailure" || event.tool_response_is_error;
-    if matches!(name, "Edit" | "Write" | "MultiEdit" | "apply_patch") {
-        let path = event
-            .tool_input
-            .get("file_path")
-            .or_else(|| event.tool_input.get("path"))
-            .and_then(Value::as_str)
-            .map(|path| project_path(root, path));
-        let patch = event
-            .tool_input
-            .get("patch")
-            .or_else(|| event.tool_input.get("input"))
-            .or_else(|| event.tool_input.get("command"));
-        let paths = patch
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| {
-                [
-                    "*** Update File:",
-                    "*** Add File:",
-                    "*** Delete File:",
-                    "*** Move to:",
-                ]
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-            })
+    if EDIT_TOOLS.contains(&name) {
+        let path = edit_path(&event.tool_input).map(|path| project_path(root, path));
+        let paths = patch_headers(&event.tool_input)
             .take(10)
-            .map(|line| {
-                let (label, path) = line.split_once(':').unwrap_or((line, ""));
-                format!("{label}: {}", project_path(root, path.trim()))
-            })
+            .map(|(label, path)| format!("{label}: {}", project_path(root, path)))
             .collect::<Vec<_>>()
             .join("\n");
         let detail = path.as_deref().unwrap_or(&paths);
@@ -326,10 +352,8 @@ fn tool_record(event: &Input, root: &str) -> Option<String> {
         _ => {}
     }
     let command = event.tool_input.get("command").and_then(Value::as_str);
-    if matches!(
-        name,
-        "Bash" | "Shell" | "shell" | "exec_command" | "shell_command" | "run_shell_command"
-    ) && let Some(command) = command
+    if is_shell_tool(name)
+        && let Some(command) = command
     {
         let command = clean(command, 350);
         let result = clean(
@@ -709,6 +733,155 @@ pub fn fts_query(words: &[String], conjunction: &str) -> String {
         .join(conjunction)
 }
 
+fn action_recall_enabled() -> bool {
+    !matches!(
+        std::env::var("MIB_ACTION_RECALL").as_deref(),
+        Ok("0" | "false" | "off")
+    )
+}
+
+/// Action recalls one session may receive.
+const ACTION_LIMIT: i64 = 5;
+
+/// Recall when the agent is about to edit a file or run a check that has
+/// history. An edit recalls up to two summaries from other sessions that
+/// touched the file and carry a decision, an error or a failed check. A check
+/// recalls the newest summary from another session that ran the same command,
+/// when it shows the command failing, so a failure that a later run fixed is
+/// not recalled. Each summary is delivered once per session, and a session gets
+/// [`ACTION_LIMIT`] such recalls. This runs before every edit and shell call,
+/// so it reads the session's checkout from its stored records and does one
+/// indexed lookup; git runs only to render a hit.
+fn action_recall(
+    store: &Store,
+    source: &str,
+    session: &str,
+    event: &Input,
+) -> Result<Option<String>> {
+    let name = event.tool_name.as_str();
+    let command = event
+        .tool_input
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|_| is_shell_tool(name));
+    let editing = EDIT_TOOLS.contains(&name);
+    if !editing && command.is_none() {
+        return Ok(None);
+    }
+    let Some((root, project)) = store.session_checkout(source, session)? else {
+        return Ok(None);
+    };
+    let debug = std::env::var_os("MIB_DEBUG").is_some();
+    if store.action_recalls(source, session)? >= ACTION_LIMIT {
+        if debug {
+            eprintln!("Mem in Black action recall: session limit of {ACTION_LIMIT} reached");
+        }
+        return Ok(None);
+    }
+    // Why a candidate is dropped, or nothing when it is kept.
+    let verdict = |record: &Record, qualifies: bool| -> Result<Option<&'static str>> {
+        let dropped = if record.source == source && record.session == session {
+            Some("same session")
+        } else if !qualifies {
+            Some("no decision, error or failed check")
+        } else if store.was_delivered(source, session, record.id)? {
+            Some("already delivered")
+        } else {
+            None
+        };
+        if debug {
+            eprintln!(
+                "Mem in Black action recall: #{} {}",
+                record.id,
+                dropped.map_or("kept".to_owned(), |why| format!("dropped: {why}"))
+            );
+        }
+        Ok(dropped)
+    };
+    let mut kept: Vec<Record> = Vec::new();
+    if editing {
+        let mut targets: Vec<String> = Vec::new();
+        for path in edit_path(&event.tool_input)
+            .into_iter()
+            .chain(patch_headers(&event.tool_input).map(|(_, path)| path))
+        {
+            let path = project_path(&root, path);
+            let relative = path
+                .strip_prefix(&root)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map_or(path.clone(), str::to_owned);
+            if !targets.contains(&relative) && targets.len() < 10 {
+                targets.push(relative);
+            }
+        }
+        for path in &targets {
+            let found = store.summaries_touching(&project, path, 10)?;
+            if debug {
+                eprintln!(
+                    "Mem in Black action recall: edit {path}, {} candidates",
+                    found.len()
+                );
+            }
+            for record in found {
+                let qualifies = ["Decision: ", "Errors seen: "]
+                    .iter()
+                    .any(|fact| crate::distill::summary_fact(&record.body, fact).is_some())
+                    || crate::distill::summary_fact(&record.body, "Checks: ")
+                        .is_some_and(|checks| checks.contains("→ failed"));
+                if verdict(&record, qualifies)?.is_none()
+                    && kept.iter().all(|seen| seen.id != record.id)
+                {
+                    kept.push(record);
+                }
+            }
+        }
+        kept.sort_by_key(|record| std::cmp::Reverse((record.created_at, record.id)));
+        kept.truncate(2);
+    } else if let Some(command) = command {
+        let body = format!("{name} command: {command}");
+        // A failed command is recorded whole, a passing one as the check segment.
+        let mut checks: Vec<String> = [
+            crate::distill::check_command(&body),
+            crate::distill::check_command(&format!("{body}\nTool status: failed")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        checks.dedup();
+        let mut found = Vec::new();
+        for check in &checks {
+            found.extend(store.summaries_running_check(&project, check, source, session, 1)?);
+        }
+        if debug {
+            eprintln!(
+                "Mem in Black action recall: check {command}, {} candidates",
+                found.len()
+            );
+        }
+        found.sort_by_key(|record| std::cmp::Reverse((record.created_at, record.id)));
+        // Only the newest run counts: an older failure may have been fixed since.
+        if let Some(record) = found.into_iter().next() {
+            let failed =
+                crate::distill::summary_fact(&record.body, "Checks: ").is_some_and(|line| {
+                    checks
+                        .iter()
+                        .any(|check| line.contains(&format!("`{check}` → failed")))
+                });
+            if verdict(&record, failed)?.is_none() {
+                kept.push(record);
+            }
+        }
+    }
+    if kept.is_empty() {
+        return Ok(None);
+    }
+    let workspace = Workspace::read(&event.cwd);
+    let shown: Vec<&Record> = kept.iter().collect();
+    store.record_delivery(source, session, "action", &shown, &[], |records| {
+        render(&workspace, records)
+    })
+}
+
 fn recall(
     store: &Store,
     workspace: &Workspace,
@@ -841,7 +1014,7 @@ fn recall(
         }
     }
     let shown: Vec<_> = evidence.iter().collect();
-    store.record_delivery(source, session, &shown, &matched, |records| {
+    store.record_delivery(source, session, "prompt", &shown, &matched, |records| {
         render(workspace, records)
     })
 }
@@ -1077,7 +1250,7 @@ fn record_context(
     session: &str,
     records: &[&Record],
 ) -> Result<Option<String>> {
-    store.record_delivery(source, session, records, &[], |records| {
+    store.record_delivery(source, session, "handoff", records, &[], |records| {
         render(workspace, records)
     })
 }
