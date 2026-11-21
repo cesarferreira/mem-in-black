@@ -10,6 +10,7 @@ const run = promisify(execFile);
 const binary = resolve(process.env.MIB_TEST_BINARY ?? "target/debug/mib");
 const content = (text) => [{ type: "text", text }];
 process.env.MIB_NO_AUTOSTART = "1";
+process.env.MIB_SUMMARIES = "off";
 
 async function fixture(test, host, path) {
   const home = await mkdtemp(join(tmpdir(), "mib-capture-"));
