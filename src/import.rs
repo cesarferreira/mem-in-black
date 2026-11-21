@@ -117,12 +117,14 @@ pub fn claude_mem(
                 .clone()
                 .map(|mut workspace| {
                     workspace.head = None;
+                    workspace.git_ref = None;
                     workspace
                 })
                 .unwrap_or_else(|| Workspace {
                     root: format!("claude-mem:{original_project}"),
                     project: format!("claude-mem:{original_project}"),
                     head: None,
+                    git_ref: None,
                 });
             let mut body = String::new();
             for (index, field) in selected.iter().enumerate() {

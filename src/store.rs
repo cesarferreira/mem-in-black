@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 9;
+const SCHEMA: i64 = 10;
 /// Version of the local summary format. When it increases, the worker
 /// rebuilds the local summaries of earlier turns in place.
 const SUMMARY_FORMAT: i64 = 2;
@@ -22,7 +22,7 @@ pub type VectorRow = (i64, String, String, Vec<u8>);
 /// (record id, workspace, project, body)
 pub type PendingText = (i64, String, String, String);
 
-const RECORD_COLUMNS: &str = "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id, e.project";
+const RECORD_COLUMNS: &str = "e.id, e.source, e.session, e.kind, e.body, e.workspace, e.head, e.created_at, e.turn_id, e.project, e.git_ref";
 const MEMORY_FILTER: &str = "(
     e.kind IN ('note', 'observation') OR (e.kind = 'summary' AND (
         e.source = 'claude-mem' OR EXISTS (
@@ -58,6 +58,8 @@ pub struct Record {
     pub turn_id: Option<String>,
     #[serde(skip_serializing)]
     pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
 }
 
 /// Usage figures. Byte counts are measured; token figures divide by four.
@@ -321,25 +323,33 @@ impl Store {
                         WHERE delivered_at IS NOT NULL AND shown;",
                 )?;
             }
-            // Earlier versions stored Claude Code shell results as raw JSON
-            // and kept terminal escape codes.
-            let rows: Vec<(i64, String, String)> = migration
-                .prepare("SELECT id, kind, body FROM events")?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (id, kind, body) in rows {
-                let repaired = (kind == "tool")
-                    .then(|| crate::hooks::repair_shell_record(&body))
-                    .flatten()
-                    .unwrap_or_else(|| crate::hooks::strip_terminal_codes(&body).into_owned());
-                if repaired != body {
-                    migration.execute(
-                        "UPDATE events SET body = ?1 WHERE id = ?2",
-                        params![repaired, id],
-                    )?;
+            if version < 9 {
+                // Earlier versions stored Claude Code shell results as raw JSON
+                // and kept terminal escape codes.
+                let rows: Vec<(i64, String, String)> = migration
+                    .prepare("SELECT id, kind, body FROM events")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (id, kind, body) in rows {
+                    let repaired = (kind == "tool")
+                        .then(|| crate::hooks::repair_shell_record(&body))
+                        .flatten()
+                        .unwrap_or_else(|| crate::hooks::strip_terminal_codes(&body).into_owned());
+                    if repaired != body {
+                        migration.execute(
+                            "UPDATE events SET body = ?1 WHERE id = ?2",
+                            params![repaired, id],
+                        )?;
+                    }
                 }
             }
-            migration.execute_batch("PRAGMA user_version=9;")?;
+            if version < 10 {
+                migration.execute_batch(
+                    "ALTER TABLE events ADD COLUMN git_ref TEXT;
+                     CREATE INDEX events_checkout ON events(workspace, git_ref, id DESC);",
+                )?;
+            }
+            migration.pragma_update(None, "user_version", SCHEMA)?;
             migration.commit()?;
         }
         Ok(Self {
@@ -418,12 +428,12 @@ impl Store {
 
     fn insert(&self, event: Observation<'_>, created_at: Option<i64>) -> Result<bool> {
         let changes = self.db.execute(
-            "INSERT INTO events(source, session, event_key, kind, body, workspace, project, head, created_at, turn_id, source_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, coalesce(?9, unixepoch()), ?10, ?11)
+            "INSERT INTO events(source, session, event_key, kind, body, workspace, project, head, created_at, turn_id, source_bytes, git_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, coalesce(?9, unixepoch()), ?10, ?11, ?12)
              ON CONFLICT(source, session, event_key) DO NOTHING",
             params![event.source, event.session, event.key, event.kind, event.body,
                 event.workspace.root, event.workspace.project, event.workspace.head, created_at, event.turn_id,
-                event.source_bytes.map(|bytes| bytes as i64)],
+                event.source_bytes.map(|bytes| bytes as i64), event.workspace.git_ref],
         )?;
         Ok(changes > 0)
     }
@@ -643,29 +653,41 @@ impl Store {
         let _guard = self.read_guard()?;
         Ok(self.db.query_row(
             "SELECT EXISTS (SELECT 1 FROM events e
-               WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3 AND e.kind = 'tool'
+               WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3 AND e.kind = 'tool' AND e.git_ref IS ?5
                  AND e.id < ?4
                  AND e.id > coalesce((SELECT max(p.id) FROM events p
                      WHERE p.source = ?1 AND p.session = ?2 AND p.workspace = ?3
                        AND p.kind = 'prompt' AND p.id < ?4), 0))",
-            params![reply.source, reply.session, reply.workspace, reply.id],
+            params![reply.source, reply.session, reply.workspace, reply.id, reply.git_ref],
             |row| row.get(0),
         )?)
     }
 
-    pub fn has_work(&self, source: &str, session: &str) -> Result<bool> {
+    pub fn latest_work_matches(
+        &self,
+        workspace: &Workspace,
+        source: &str,
+        session: &str,
+    ) -> Result<bool> {
         let _guard = self.read_guard()?;
-        Ok(self.db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM events WHERE source = ?1 AND session = ?2 AND kind IN ('assistant', 'tool'))",
-            params![source, session], |row| row.get(0),
-        )?)
+        Ok(self
+            .db
+            .query_row(
+                "SELECT workspace = ?3 AND git_ref IS ?4 AND (?4 IS NOT NULL OR project = workspace)
+                 FROM events WHERE source = ?1 AND session = ?2 AND kind IN ('assistant', 'tool')
+                   AND superseded_by IS NULL ORDER BY id DESC LIMIT 1",
+                params![source, session, workspace.root, workspace.git_ref],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     pub fn captured_prompt(
         &self,
         source: &str,
         session: &str,
-        workspace: &str,
+        workspace: &Workspace,
         turn: &str,
     ) -> Result<Option<String>> {
         let _guard = self.read_guard()?;
@@ -673,29 +695,47 @@ impl Store {
             .db
             .query_row(
                 "SELECT body FROM events WHERE source = ?1 AND session = ?2 AND workspace = ?3
-               AND event_key = 'prompt:' || ?4 AND kind = 'prompt' AND superseded_by IS NULL",
-                params![source, session, workspace, turn],
+               AND event_key = 'prompt:' || ?4 AND kind = 'prompt' AND superseded_by IS NULL
+               AND git_ref IS ?5",
+                params![source, session, workspace.root, turn, workspace.git_ref],
                 |row| row.get(0),
             )
             .optional()?)
     }
 
-    pub fn latest_other(
+    pub fn latest_handoff(
         &self,
-        root: &str,
+        workspace: &Workspace,
         source: &str,
         session: &str,
         wanted: Option<&str>,
+        before: Option<i64>,
     ) -> Result<Option<Record>> {
         let _guard = self.read_guard()?;
+        // A missing ref is usable only for non-Git history. A captured scope
+        // change since the turn's prompt disqualifies later events as anchors.
         Ok(self.db.query_row(&format!(
             "SELECT {RECORD_COLUMNS} FROM events e
              WHERE e.workspace = ?1 AND (e.source != ?2 OR e.session != ?3) AND (?4 IS NULL OR e.source = ?4)
+               AND e.git_ref IS ?5 AND (?5 IS NOT NULL OR e.project = e.workspace)
+               AND (?6 IS NULL OR e.id < ?6)
                AND e.superseded_by IS NULL
                AND e.kind IN ('assistant', 'tool', 'prompt') AND e.created_at > unixepoch() - 1209600
                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source = e.source AND s.session = e.session AND s.private)
+               AND NOT EXISTS (
+                   SELECT 1 FROM events prior WHERE prior.source = e.source AND prior.session = e.session
+                     AND prior.id < e.id AND prior.kind IN ('prompt', 'tool', 'assistant')
+                     AND (e.turn_id IS NULL OR prior.turn_id = e.turn_id)
+                     AND (prior.workspace != e.workspace OR prior.git_ref IS NOT e.git_ref)
+                     AND prior.id >= coalesce((
+                         SELECT max(request.id) FROM events request
+                         WHERE request.source = e.source AND request.session = e.session
+                           AND request.kind = 'prompt' AND request.id <= e.id
+                           AND (e.turn_id IS NULL OR request.turn_id = e.turn_id)
+                     ), 0)
+               )
              ORDER BY e.id DESC LIMIT 1"
-        ), params![root, source, session, wanted], row_record).optional()?)
+        ), params![workspace.root, source, session, wanted, workspace.git_ref, before], row_record).optional()?)
     }
 
     pub fn related(
@@ -711,7 +751,11 @@ impl Store {
                 "SELECT {RECORD_COLUMNS} FROM events e
              WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3 AND e.id <= ?4
                AND (?5 IS NULL OR e.kind = ?5) AND (?6 IS NULL OR e.turn_id = ?6)
-             ORDER BY e.id DESC LIMIT ?7"
+               AND (NOT ?7 OR (e.git_ref IS ?8 AND e.id >= coalesce((
+                   SELECT max(p.id) FROM events p WHERE p.source = ?1 AND p.session = ?2 AND p.workspace = ?3
+                     AND p.kind = 'prompt' AND p.id <= ?4 AND (?6 IS NULL OR p.turn_id = ?6)
+               ), 0)))
+             ORDER BY e.id DESC LIMIT ?9"
             ),
             params![
                 anchor.source,
@@ -720,6 +764,8 @@ impl Store {
                 anchor.id,
                 kind,
                 turn,
+                same_turn,
+                anchor.git_ref,
                 limit.clamp(1, 100) as i64
             ],
         )
@@ -734,13 +780,19 @@ impl Store {
                 &format!(
                     "SELECT {RECORD_COLUMNS} FROM events e
                      WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3
-                       AND e.kind = 'assistant' AND e.id > ?4
+                       AND e.kind = 'assistant' AND e.id > ?4 AND e.git_ref IS ?5
                        AND e.id < coalesce((SELECT min(n.id) FROM events n
                            WHERE n.source = ?1 AND n.session = ?2 AND n.workspace = ?3
                              AND n.kind = 'prompt' AND n.id > ?4), 9223372036854775807)
                      ORDER BY e.id DESC LIMIT 1"
                 ),
-                params![prompt.source, prompt.session, prompt.workspace, prompt.id],
+                params![
+                    prompt.source,
+                    prompt.session,
+                    prompt.workspace,
+                    prompt.id,
+                    prompt.git_ref
+                ],
                 row_record,
             )
             .optional()?)
@@ -754,9 +806,16 @@ impl Store {
             .query_row(
                 &format!(
                     "SELECT {RECORD_COLUMNS} FROM events e
-                     WHERE e.source = ?1 AND e.session = ?2 AND e.event_key = ?3"
+                     WHERE e.source = ?1 AND e.session = ?2 AND e.event_key = ?3
+                       AND e.workspace = ?4 AND e.git_ref IS ?5"
                 ),
-                params![reply.source, reply.session, format!("summary:{}", reply.id)],
+                params![
+                    reply.source,
+                    reply.session,
+                    format!("summary:{}", reply.id),
+                    reply.workspace,
+                    reply.git_ref
+                ],
                 row_record,
             )
             .optional()?)
@@ -1006,8 +1065,8 @@ impl Store {
         let rows = statement.query_map([], |row| {
             Ok(RecentDelivery {
                 record: row_record(row)?,
-                recipient: row.get(10)?,
-                delivered_at: row.get(11)?,
+                recipient: row.get(11)?,
+                delivered_at: row.get(12)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1357,6 +1416,7 @@ fn row_record(row: &Row<'_>) -> rusqlite::Result<Record> {
         created_at: row.get(7)?,
         turn_id: row.get(8)?,
         project: row.get(9)?,
+        git_ref: row.get(10)?,
     })
 }
 

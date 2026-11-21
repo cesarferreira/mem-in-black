@@ -318,6 +318,279 @@ fn changed_revision_is_flagged_and_other_worktrees_cannot_take_over_resume() {
 }
 
 #[test]
+fn handoff_uses_the_current_branch_even_when_branches_share_a_commit() {
+    let workspace = Workspace::new();
+    git(&workspace.repo, &["branch", "-m", "retry-fix"]);
+    workspace.seed();
+    git(&workspace.repo, &["switch", "-qc", "schema-experiment"]);
+    workspace.run(&["observe"], None);
+
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue where I left off"}),
+    );
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("websocket retry"), "{result}");
+    assert!(
+        workspace
+            .run(&["search", "websocket_retry"], None)
+            .contains("websocket_retry")
+    );
+    let recall = workspace.hook(
+        "codex",
+        "historical-search",
+        "UserPromptSubmit",
+        json!({"prompt":"What fixed the websocket retry regression?"}),
+    );
+    assert!(recall.contains("different branch: retry-fix"), "{recall}");
+
+    workspace.hook(
+        "claude",
+        "claude-thread",
+        "UserPromptSubmit",
+        json!({"prompt":"Rewrite the database schema"}),
+    );
+    git(&workspace.repo, &["switch", "-q", "retry-fix"]);
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(
+        result.contains("move the reset after handshake"),
+        "{result}"
+    );
+    assert!(!result.contains("Rewrite the database schema"), "{result}");
+}
+
+#[test]
+fn detached_handoff_requires_work_captured_at_the_same_detached_commit() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    git(&workspace.repo, &["switch", "-q", "--detach"]);
+    let resume = |session| {
+        workspace.hook(
+            "codex",
+            session,
+            "UserPromptSubmit",
+            json!({"prompt":"Continue the Claude task"}),
+        )
+    };
+    let result = resume("before-detached-work");
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("websocket retry"), "{result}");
+
+    workspace.hook(
+        "claude",
+        "detached-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Investigate detached checkout"}),
+    );
+    let result = resume("same-detached-commit");
+    assert!(result.contains("Investigate detached checkout"), "{result}");
+    git(
+        &workspace.repo,
+        &[
+            "-c",
+            "user.name=Mem in Black",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "Next detached commit",
+        ],
+    );
+    let result = resume("different-detached-commit");
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(
+        !result.contains("Investigate detached checkout"),
+        "{result}"
+    );
+}
+
+#[test]
+fn handoff_does_not_resume_a_turn_started_on_another_branch() {
+    let workspace = Workspace::new();
+    git(&workspace.repo, &["branch", "-m", "schema-experiment"]);
+    git(&workspace.repo, &["branch", "retry-fix"]);
+    workspace.hook(
+        "claude",
+        "moving",
+        "UserPromptSubmit",
+        json!({"prompt":"Rewrite the database schema"}),
+    );
+    git(&workspace.repo, &["switch", "-q", "retry-fix"]);
+    workspace.hook(
+        "claude",
+        "moving",
+        "Stop",
+        json!({"last_assistant_message":"Next, rebuild the schema indexes."}),
+    );
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("schema"), "{result}");
+}
+
+#[test]
+fn handoff_uses_only_work_before_a_turn_switches_away_and_back() {
+    let workspace = Workspace::new();
+    git(&workspace.repo, &["branch", "-m", "retry-fix"]);
+    workspace.hook(
+        "claude",
+        "moving",
+        "UserPromptSubmit",
+        json!({
+            "turn_id":"t1", "prompt":"Fix the websocket retry regression"
+        }),
+    );
+    git(&workspace.repo, &["switch", "-qc", "schema-experiment"]);
+    workspace.hook(
+        "claude",
+        "moving",
+        "PostToolUse",
+        json!({
+            "turn_id":"t1", "tool_name":"Bash", "tool_input":{"command":"cargo test schema"},
+            "tool_response":"The schema needs a new index"
+        }),
+    );
+    git(&workspace.repo, &["switch", "-q", "retry-fix"]);
+    workspace.hook(
+        "claude",
+        "moving",
+        "Stop",
+        json!({
+            "turn_id":"t1", "last_assistant_message":"Next, rebuild the schema indexes."
+        }),
+    );
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(
+        result.contains("Fix the websocket retry regression"),
+        "{result}"
+    );
+    assert!(!result.contains("schema"), "{result}");
+}
+
+#[test]
+fn continue_does_not_use_a_sessions_newer_work_from_another_branch() {
+    let workspace = Workspace::new();
+    git(&workspace.repo, &["branch", "-m", "retry-fix"]);
+    workspace.hook(
+        "codex",
+        "moving",
+        "Stop",
+        json!({
+            "turn_id":"retry", "last_assistant_message":"Investigated the retry bug."
+        }),
+    );
+    git(&workspace.repo, &["switch", "-qc", "schema-experiment"]);
+    workspace.hook(
+        "codex",
+        "moving",
+        "Stop",
+        json!({
+            "turn_id":"schema", "last_assistant_message":"Next, rebuild the schema indexes."
+        }),
+    );
+    git(&workspace.repo, &["switch", "-q", "retry-fix"]);
+    let result = workspace.hook(
+        "codex",
+        "moving",
+        "UserPromptSubmit",
+        json!({
+            "turn_id":"resume", "prompt":"Continue where I left off"
+        }),
+    );
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("schema"), "{result}");
+}
+
+#[test]
+fn handoff_ignores_summaries_with_unknown_checkout_scope() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    let database = workspace.temp.path().join("data/memory.sqlite3");
+    rusqlite::Connection::open(database).unwrap().execute(
+        "UPDATE events SET git_ref = NULL, body = ?1 WHERE kind = 'summary'",
+        ["Change: Rewrite the database schema\nFiles: src/schema.rs\nNext: Rebuild the schema indexes\nOutcome: Moved to another branch"],
+    ).unwrap();
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(
+        result.contains("move the reset after handshake"),
+        "{result}"
+    );
+    assert!(!result.contains("schema"), "{result}");
+}
+
+#[test]
+fn handoff_distinguishes_non_utf8_branch_names() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let workspace = Workspace::new();
+    let switch = |name| {
+        assert!(
+            Command::new("git")
+                .current_dir(&workspace.repo)
+                .args(["switch", "-qc"])
+                .arg(OsStr::from_bytes(name))
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    switch(b"experiment-\xff");
+    workspace.seed();
+    switch(b"experiment-\xfe");
+    let result = workspace.hook(
+        "codex",
+        "fresh-session",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("websocket retry"), "{result}");
+}
+
+#[test]
+fn a_handoff_request_on_an_empty_checkout_cannot_be_handed_back() {
+    let workspace = Workspace::new();
+    let first = workspace.hook(
+        "codex",
+        "fresh-codex",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(first.contains("no handoff for this checkout"), "{first}");
+    let second = workspace.hook(
+        "claude",
+        "fresh-claude",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Codex task"}),
+    );
+    assert!(second.contains("no handoff for this checkout"), "{second}");
+    assert!(!second.contains("Continue the Claude task"), "{second}");
+}
+
+#[test]
 fn duplicate_tool_event_is_stored_once() {
     let workspace = Workspace::new();
     workspace.seed();
@@ -1055,7 +1328,9 @@ fn handoff_and_worker_do_not_link_evidence_across_worktrees_in_one_session() {
         "UserPromptSubmit",
         json!({"prompt":"Resume Claude work"}),
     );
-    assert!(!result.contains("bicycle gearshift"));
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(!result.contains("bicycle gearshift"), "{result}");
+    assert!(!result.contains("Consider reducing friction"), "{result}");
     workspace.run(&["observe"], None);
     assert_eq!(
         workspace
@@ -1906,6 +2181,14 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
              PRAGMA user_version=3;",
         )
         .unwrap();
+    let root = workspace.repo.canonicalize().unwrap();
+    legacy
+        .execute(
+            "INSERT INTO events(source, session, kind, body, workspace, project)
+         VALUES ('claude', 'old-checkout', 'prompt', 'Investigate the old schema', ?1, ?2)",
+            [root.to_str().unwrap(), root.join(".git").to_str().unwrap()],
+        )
+        .unwrap();
     drop(legacy);
     let hits: Value =
         serde_json::from_str(&workspace.run(&["search", "expected three retries"], None)).unwrap();
@@ -1926,11 +2209,23 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let export = workspace.run(&["export"], None);
     assert!(
         export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
         "raw JSON shell results and escape codes are repaired: {export}"
+    );
+    let result = workspace.hook(
+        "codex",
+        "new-thread",
+        "UserPromptSubmit",
+        json!({"prompt":"Continue the Claude task"}),
+    );
+    assert!(result.contains("no handoff for this checkout"), "{result}");
+    assert!(
+        workspace
+            .run(&["search", "old schema"], None)
+            .contains("Investigate the old schema")
     );
 }
 

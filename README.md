@@ -56,8 +56,9 @@ as well.
 
 ## Install
 
-On Linux (x86_64 or ARM64) or an Apple silicon Mac, install the latest release
-binary:
+If you're upgrading an existing install, run `mib stop` first to stop the old
+worker. On Linux (x86_64 or ARM64) or an Apple silicon Mac, install the latest
+release binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cesarferreira/mem-in-black/main/install.sh | sh
@@ -100,7 +101,7 @@ for a custom T3 location.
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
-- **Handoff.** Open another supported agent in the same worktree and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.”
+- **Handoff.** Open another supported agent in the same worktree and branch and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.” A detached HEAD uses an exact commit match. Earlier records without branch information are still searchable.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
 - **Startup preview.** A new session shows the latest work summaries for the worktree, with their commits. Before the first summary exists, it shows recent activity. `MIB_STARTUP_PREVIEW=0` hides it.

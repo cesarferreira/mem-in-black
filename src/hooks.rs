@@ -126,8 +126,7 @@ pub fn handle(
             if store.is_private(source, session, Some(turn))? {
                 return Ok(None);
             }
-            let Some(prompt) = store.captured_prompt(source, session, &workspace.root, turn)?
-            else {
+            let Some(prompt) = store.captured_prompt(source, session, &workspace, turn)? else {
                 return Ok(None);
             };
             Ok(recall(store, &workspace, source, session, &prompt, semantic)?.map(recall_response))
@@ -678,28 +677,29 @@ fn recall(
     prompt: &str,
     semantic: Option<Semantic<'_>>,
 ) -> Result<Option<String>> {
-    let lower = prompt.trim().to_ascii_lowercase();
-    let directive = ["please ", "can you ", "could you "]
-        .iter()
-        .find_map(|prefix| lower.strip_prefix(prefix))
-        .unwrap_or(&lower);
-    let directive = directive.trim_end_matches(['.', '!', '?']);
-    let requested = ["continue", "resume", "pick up", "keep going", "carry on"]
-        .iter()
-        .any(|phrase| {
-            directive == *phrase
-                || directive
-                    .strip_prefix(phrase)
-                    .is_some_and(|suffix| suffix.starts_with(' '))
-        });
-    let wanted = requested.then(|| handoff_source(directive)).flatten();
-    let implicit = ["continue", "resume", "keep going", "carry on"].contains(&directive)
-        || ["previous task", "last task", "where we left off"]
-            .iter()
-            .any(|phrase| directive.contains(phrase));
-    if requested && (wanted.is_some() || (implicit && !store.has_work(source, session)?)) {
-        let Some(anchor) = store.latest_other(&workspace.root, source, session, wanted)? else {
-            return Ok(None);
+    let handoff = match handoff_request(prompt) {
+        Some(Handoff::Latest) if store.latest_work_matches(workspace, source, session)? => None,
+        handoff => handoff,
+    };
+    if let Some(handoff) = handoff {
+        let wanted = match handoff {
+            Handoff::Named(source) => Some(source),
+            Handoff::Latest => None,
+        };
+        let mut before = None;
+        let anchor = loop {
+            let Some(anchor) = store.latest_handoff(workspace, source, session, wanted, before)?
+            else {
+                return Ok(Some(
+                    "Mem in Black found no handoff for this checkout. Ask which task to continue before acting on earlier work."
+                        .to_owned(),
+                ));
+            };
+            // A handoff request by itself is not work another session can resume.
+            if anchor.kind != "prompt" || handoff_request(&anchor.body).is_none() {
+                break anchor;
+            }
+            before = Some(anchor.id);
         };
         if anchor.kind == "assistant"
             && let Some(summary) = store.summary_of(&anchor)?
@@ -804,6 +804,44 @@ fn recall(
     store.record_delivery(source, session, &shown, &matched, |records| {
         render(workspace, records)
     })
+}
+
+enum Handoff {
+    Named(&'static str),
+    Latest,
+}
+
+fn handoff_request(prompt: &str) -> Option<Handoff> {
+    let lower = prompt.trim().to_ascii_lowercase();
+    let directive = ["please ", "can you ", "could you "]
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix))
+        .unwrap_or(&lower)
+        .trim_end_matches(['.', '!', '?']);
+    let requested = ["continue", "resume", "pick up", "keep going", "carry on"]
+        .iter()
+        .any(|phrase| {
+            directive == *phrase
+                || directive
+                    .strip_prefix(phrase)
+                    .is_some_and(|suffix| suffix.starts_with(' '))
+        });
+    if !requested {
+        return None;
+    }
+    if let Some(source) = handoff_source(directive) {
+        return Some(Handoff::Named(source));
+    }
+    let implicit = ["continue", "resume", "keep going", "carry on"].contains(&directive)
+        || [
+            "previous task",
+            "last task",
+            "where i left off",
+            "where we left off",
+        ]
+        .iter()
+        .any(|phrase| directive.contains(phrase));
+    implicit.then_some(Handoff::Latest)
 }
 
 fn handoff_source(directive: &str) -> Option<&'static str> {
@@ -1025,10 +1063,11 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
             _ => String::new(),
         };
         result.push_str(&format!(
-            "\n\n[{} #{} • {}{}]\n{}",
+            "\n\n[{} #{} • {}{}{}]\n{}",
             record.source,
             record.id,
             record.kind,
+            branch_state(workspace, record),
             state,
             if record.kind == "summary" && is_local_summary(&record.body) {
                 summary_excerpt(&record.body)
@@ -1040,6 +1079,22 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
         ));
     }
     Some(result)
+}
+
+fn branch_state(workspace: &Workspace, record: &Record) -> String {
+    if workspace.root != record.workspace || workspace.git_ref == record.git_ref {
+        return String::new();
+    }
+    match record.git_ref.as_deref() {
+        Some(reference) if Some(reference) == record.head.as_deref() => {
+            " • different detached checkout".to_owned()
+        }
+        Some(reference) => format!(
+            " • different branch: {}",
+            reference.strip_prefix("refs/heads/").unwrap_or(reference)
+        ),
+        None => " • branch unknown".to_owned(),
+    }
 }
 
 /// How a summary from an earlier revision relates to the checkout: whether

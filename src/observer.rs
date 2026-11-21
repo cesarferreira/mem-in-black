@@ -116,6 +116,7 @@ pub fn process_one(
         root: anchor.workspace.clone(),
         project: store.project_of(anchor.id)?,
         head: anchor.head.clone(),
+        git_ref: anchor.git_ref.clone(),
     };
     store.finish_observation(
         &anchor,
