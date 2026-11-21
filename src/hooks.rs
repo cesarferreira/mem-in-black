@@ -166,7 +166,7 @@ pub fn handle(
             if !store.is_private(source, session, turn_id)?
                 && !store.was_private_tool(source, session, event.tool_use_id.as_deref())? =>
         {
-            if let Some(body) = tool_record(&event) {
+            if let Some(body) = tool_record(&event, &workspace.root) {
                 let key = event.tool_use_id.as_ref().map(|id| format!("tool:{id}"));
                 let raw = match &event.tool_response {
                     Value::String(text) => text.len(),
@@ -203,14 +203,49 @@ fn machine_prompt(prompt: &str) -> bool {
     .any(|tag| start.starts_with(tag))
 }
 
-fn tool_record(event: &Input) -> Option<String> {
+/// `path` as the worktree at `root` names it. The root is canonical, but an
+/// agent may write the path through a symlink (`/var` for `/private/var`), which
+/// would leave it absolute and outside the project. A relative path or one
+/// already under `root` is returned unchanged. Otherwise the path is resolved
+/// through its nearest existing ancestor, so files not yet created resolve too,
+/// and the resolved form is returned when it lies under `root`.
+pub(crate) fn project_path(root: &str, path: &str) -> String {
+    let given = std::path::Path::new(path);
+    if !given.is_absolute() || given.starts_with(root) {
+        return path.to_owned();
+    }
+    let mut tail = Vec::new();
+    let mut base = given;
+    let mut resolved = loop {
+        if let Ok(found) = base.canonicalize() {
+            break found;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                base = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    };
+    resolved.extend(tail.iter().rev());
+    if resolved.starts_with(root) {
+        resolved.to_string_lossy().into_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn tool_record(event: &Input, root: &str) -> Option<String> {
     let name = event.tool_name.as_str();
     let failed = event.hook_event_name == "PostToolUseFailure" || event.tool_response_is_error;
     if matches!(name, "Edit" | "Write" | "MultiEdit" | "apply_patch") {
         let path = event
             .tool_input
             .get("file_path")
-            .or_else(|| event.tool_input.get("path"));
+            .or_else(|| event.tool_input.get("path"))
+            .and_then(Value::as_str)
+            .map(|path| project_path(root, path));
         let patch = event
             .tool_input
             .get("patch")
@@ -231,9 +266,13 @@ fn tool_record(event: &Input) -> Option<String> {
                 .any(|prefix| line.starts_with(prefix))
             })
             .take(10)
+            .map(|line| {
+                let (label, path) = line.split_once(':').unwrap_or((line, ""));
+                format!("{label}: {}", project_path(root, path.trim()))
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        let detail = path.and_then(Value::as_str).unwrap_or(&paths);
+        let detail = path.as_deref().unwrap_or(&paths);
         let (added, removed) = line_changes(name, &event.tool_input);
         return Some(if failed {
             format!("Failed {name} {detail}")
@@ -246,11 +285,12 @@ fn tool_record(event: &Input) -> Option<String> {
         "Read" | "NotebookRead" => {
             return input("file_path")
                 .or_else(|| input("notebook_path"))
-                .map(|path| format!("Read {}", cut(path, 300)));
+                .map(|path| format!("Read {}", cut(&project_path(root, path), 300)));
         }
         "Grep" | "Glob" => {
             let pattern = clean(input("pattern")?, 200);
-            let scope = input("path").map(|path| format!(" in {}", cut(path, 200)));
+            let scope =
+                input("path").map(|path| format!(" in {}", cut(&project_path(root, path), 200)));
             let matches = event
                 .tool_response
                 .get("filenames")
@@ -1161,6 +1201,36 @@ fn summary_excerpt(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_through_a_symlinked_checkout_resolve_to_the_canonical_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/lib.rs"), "").unwrap();
+        let link = dir.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = real.to_str().unwrap();
+        let through = |tail: &str| link.join(tail).to_string_lossy().into_owned();
+        let under = |tail: &str| real.join(tail).to_string_lossy().into_owned();
+        assert_eq!(
+            project_path(root, &through("src/lib.rs")),
+            under("src/lib.rs")
+        );
+        // Neither the file nor its directory exists yet.
+        assert_eq!(
+            project_path(root, &through("new/dir/a.rs")),
+            under("new/dir/a.rs")
+        );
+        assert_eq!(
+            project_path(root, &under("src/lib.rs")),
+            under("src/lib.rs")
+        );
+        assert_eq!(project_path(root, "src/lib.rs"), "src/lib.rs");
+        let outside = dir.path().canonicalize().unwrap().join("other/x.rs");
+        let outside = outside.to_string_lossy().into_owned();
+        assert_eq!(project_path(root, &outside), outside);
+    }
 
     #[test]
     fn terminal_codes_and_redrawn_lines_are_removed() {

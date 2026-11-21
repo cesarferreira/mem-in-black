@@ -2,6 +2,15 @@
 
 use crate::hooks::{clean, cut, excerpt};
 
+/// Files and commits a summary lists. `Facts` holds every one; the rendered
+/// text shows only the first of each.
+const FILES_SHOWN: usize = 8;
+const COMMITS_SHOWN: usize = 5;
+
+fn shown(files: &[String]) -> &[String] {
+    &files[..files.len().min(FILES_SHOWN)]
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct Facts {
     pub kind: &'static str,
@@ -86,8 +95,9 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
             }
         }
     }
-    facts.files.truncate(8);
-    facts.explored.retain(|item| !facts.files.contains(item));
+    facts
+        .explored
+        .retain(|item| !shown(&facts.files).contains(item));
     facts.explored.truncate(8);
     let checks = facts.checks.len();
     facts.checks.drain(..checks.saturating_sub(4));
@@ -190,13 +200,13 @@ impl Facts {
     /// when the tool records showed no edits, such as edits made by scripts.
     pub fn add_commits(&mut self, prompt: &str, commits: Vec<String>, files: Vec<String>) {
         for file in files {
-            if self.files.len() < 8 && !self.files.contains(&file) {
+            if !self.files.contains(&file) {
                 self.files.push(file);
             }
         }
-        self.explored.retain(|item| !self.files.contains(item));
+        self.explored
+            .retain(|item| !shown(&self.files).contains(item));
         self.commits = commits;
-        self.commits.truncate(5);
         self.kind = kind(prompt, !self.files.is_empty());
     }
 
@@ -210,14 +220,23 @@ impl Facts {
         self.narrated_by = Some(cut(model, 80).to_owned());
     }
 
+    /// The short hash of each commit made during the turn.
+    pub fn commit_hashes(&self) -> Vec<&str> {
+        self.commits
+            .iter()
+            .filter_map(|commit| commit.split(' ').next())
+            .collect()
+    }
+
     /// The extracted facts, one labelled line each.
     pub fn facts_text(&self) -> String {
         let mut lines = Vec::new();
         if !self.files.is_empty() {
-            lines.push(format!("Files: {}", self.files.join(", ")));
+            lines.push(format!("Files: {}", shown(&self.files).join(", ")));
         }
         if !self.commits.is_empty() {
-            lines.push(format!("Commits: {}", self.commits.join("; ")));
+            let commits = &self.commits[..self.commits.len().min(COMMITS_SHOWN)];
+            lines.push(format!("Commits: {}", commits.join("; ")));
         }
         if !self.explored.is_empty() {
             lines.push(format!("Explored: {}", self.explored.join(", ")));
@@ -292,6 +311,24 @@ pub fn summary_fact<'a>(body: &'a str, prefix: &str) -> Option<&'a str> {
         .skip(1)
         .take_while(|line| !line.starts_with("Outcome: ") && !line.starts_with("Model summary: "))
         .find_map(|line| line.strip_prefix(prefix))
+}
+
+/// The files and commit short hashes a summary body lists, for indexing
+/// summaries written before the index existed. A body shows at most the first
+/// few of each.
+pub fn listed_facts(body: &str) -> (Vec<&str>, Vec<&str>) {
+    let files = summary_fact(body, "Files: ")
+        .map(|line| line.split(", ").collect())
+        .unwrap_or_default();
+    let commits = summary_fact(body, "Commits: ")
+        .map(|line| {
+            line.split("; ")
+                .filter_map(|commit| commit.split(' ').next())
+                .filter(|hash| hash.len() == 7 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (files, commits)
 }
 
 fn edited_paths(body: &str, root: &str, files: &mut Vec<String>) {
