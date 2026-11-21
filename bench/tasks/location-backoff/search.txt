@@ -1,0 +1,1 @@
+CLI wait long before giving up API is down

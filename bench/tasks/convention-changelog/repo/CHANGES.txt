@@ -1,0 +1,7 @@
+# Changes
+
+## Unreleased
+- [cli] add --help flag
+
+## 1.0.0
+- [cli] first release

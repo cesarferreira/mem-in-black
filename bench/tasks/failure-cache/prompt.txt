@@ -1,0 +1,1 @@
+lookup('Cafe') returns null even though the word list has café. Fix lookup so test.js passes.

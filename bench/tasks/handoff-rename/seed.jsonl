@@ -1,0 +1,5 @@
+{"host":"codex","session":"codex-rename","event":"UserPromptSubmit","prompt":"Rename the retries config key to maxRetries across the worker"}
+{"host":"codex","session":"codex-rename","event":"PostToolUse","tool_name":"Read","tool_use_id":"t1","tool_input":{"file_path":"{{repo}}/config.js"},"tool_response":"(file contents)"}
+{"host":"codex","session":"codex-rename","event":"PostToolUse","tool_name":"Edit","tool_use_id":"t2","tool_input":{"file_path":"{{repo}}/config.js","old_string":"exports.load = () => ({ ...raw });","new_string":"exports.load = () => ({ ...raw, maxRetries: raw.maxRetries ?? raw.retries });"},"tool_response":"ok"}
+{"host":"codex","session":"codex-rename","event":"PostToolUse","tool_name":"Bash","tool_use_id":"t3","tool_input":{"command":"node worker.js"},"tool_response":{"stdout":"max attempts: 4","stderr":""}}
+{"host":"codex","session":"codex-rename","event":"Stop","last_assistant_message":"config.js exposes maxRetries and still reads retries. A legacy config must keep working and print `warning: config key \"retries\" is deprecated, use \"maxRetries\"` on stderr. Next: add that warning, switch worker.js and config.json to maxRetries."}

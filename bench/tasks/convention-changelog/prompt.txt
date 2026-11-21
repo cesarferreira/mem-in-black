@@ -1,0 +1,1 @@
+Add a --quiet flag to cli.js that suppresses the greeting.
