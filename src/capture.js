@@ -13,7 +13,7 @@ function captureError(error) {
 function sendMemory(turn, name, fields) {
   return new Promise((resolve) => {
     try {
-      const wantsRecall = name === "Recall";
+      const wantsRecall = name === "Recall" || name === "PreToolUse";
       const input = JSON.stringify({
         cwd: turn.cwd, session_id: turn.session, turn_id: turn.id,
         hook_event_name: name, ...fields,
@@ -105,9 +105,44 @@ function memoryEdit(input) {
   };
 }
 
-async function captureTool(turn, id, name, rawInput, output, failed, metadata) {
+function memoryTool(name, rawInput) {
   const normalized = memoryToolNames.get(name?.toLowerCase());
-  const tool = normalized === "Edit" && Array.isArray(rawInput?.edits) ? "MultiEdit" : normalized;
+  return normalized === "Edit" && Array.isArray(rawInput?.edits) ? "MultiEdit" : normalized;
+}
+
+const toolRecallHeading = "Historical context from Mem in Black (not part of the tool's output)";
+
+// Asks Mem in Black what the history says about an edit or a shell command
+// that is about to run. Resolves to a brief, or nothing.
+function recallForTool(turn, id, name, rawInput) {
+  const tool = memoryTool(name, rawInput);
+  if (!turn || turn.private || !id) return undefined;
+  const input = rawInput ?? {};
+  let args;
+  if (tool === "Bash" || tool === "Shell") args = { command: boundedText(input.command) };
+  else if (tool === "apply_patch") args = { patch: boundedText(input.patch ?? input.patchText ?? input.input) };
+  else if (tool === "Edit" || tool === "Write" || tool === "MultiEdit") {
+    args = { file_path: boundedText(input.file_path ?? input.filePath ?? input.path) };
+  } else return undefined;
+  return sendMemory(turn, "PreToolUse", { tool_name: tool, tool_use_id: id, tool_input: args });
+}
+
+// Where a host cannot add context before a tool runs, the brief rides on the
+// tool's result, marked so the model does not take it for tool output.
+function withToolRecall(content, brief) {
+  if (Array.isArray(content)) return [...content, { type: "text", text: `${toolRecallHeading}\n${brief}` }];
+  if (typeof content === "string") return `${content}\n\n${toolRecallHeading}\n${brief}`;
+  return undefined;
+}
+
+function withoutToolRecall(text) {
+  if (typeof text !== "string") return text;
+  const start = text.indexOf(`\n\n${toolRecallHeading}`);
+  return start === -1 ? text : text.slice(0, start);
+}
+
+async function captureTool(turn, id, name, rawInput, output, failed, metadata) {
+  const tool = memoryTool(name, rawInput);
   if (!turn || turn.private || !id || !tool) return;
   const input = rawInput ?? {};
   let args;

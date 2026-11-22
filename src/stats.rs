@@ -51,9 +51,13 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
                 "of checkable recalls"
             },
             detail: format!(
-                "The agent opened a recalled file or cited a recalled commit after {} of {} recalled summaries",
+                "The agent opened a recalled file or cited a recalled commit after {} of {} recalled summaries; before a prompt: {} of {}, before an action: {} of {}",
                 compact(stats.recall_followed),
                 compact(stats.recall_checked),
+                compact(stats.recall_followed - stats.action_recall_followed),
+                compact(stats.recall_checked - stats.action_recall_checked),
+                compact(stats.action_recall_followed),
+                compact(stats.action_recall_checked),
             ),
         },
         Line {

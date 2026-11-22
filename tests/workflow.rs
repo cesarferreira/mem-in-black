@@ -2209,7 +2209,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     let export = workspace.run(&["export"], None);
     assert!(
         export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
@@ -3029,6 +3029,7 @@ fn a_version_ten_database_gets_its_summary_index_backfilled() {
             "DROP TRIGGER summary_index_delete;
              DROP TABLE summary_files;
              DROP TABLE summary_commits;
+             ALTER TABLE deliveries DROP COLUMN \"trigger\";
              PRAGMA user_version=10;",
         )
         .unwrap();
@@ -3039,4 +3040,414 @@ fn a_version_ten_database_gets_its_summary_index_backfilled() {
         workspace.index_rows("summary_commits", "hash"),
         commits_before
     );
+}
+
+impl Workspace {
+    /// A finished turn that edited `file` and gave a reason, left unsummarized.
+    fn turn_with_reason(&self, session: &str, turn: &str, file: &str, reply: &str) {
+        let path = self.repo.join(file);
+        self.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"turn_id": turn, "prompt": format!("Rework {file}")}),
+        );
+        self.hook(
+            "claude",
+            session,
+            "PostToolUse",
+            json!({"turn_id": turn, "tool_name":"Edit", "tool_use_id": format!("edit-{turn}"),
+                "tool_input":{"file_path": path, "old_string":"a", "new_string":"b"},
+                "tool_response":{}}),
+        );
+        self.hook(
+            "claude",
+            session,
+            "Stop",
+            json!({"turn_id": turn, "last_assistant_message": reply}),
+        );
+    }
+
+    /// Starts a session with a prompt that no earlier work resembles.
+    fn start_session(&self, session: &str) {
+        let output = self.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"turn_id": "start", "prompt": "Update the lockfile"}),
+        );
+        assert!(output.is_empty(), "{output}");
+    }
+
+    /// The `PreToolUse` hook output for a tool call, with its context text.
+    fn before_tool(&self, session: &str, tool: &str, input: Value) -> Option<String> {
+        self.before_tool_with(session, "start", tool, input, &[])
+    }
+
+    fn before_tool_with(
+        &self,
+        session: &str,
+        turn: &str,
+        tool: &str,
+        input: Value,
+        env: &[(&str, &str)],
+    ) -> Option<String> {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let output = self.run_with_env(
+            &["hook", "claude"],
+            Some(
+                json!({"cwd": self.repo, "session_id": session, "turn_id": turn,
+                "hook_event_name": "PreToolUse", "tool_name": tool,
+                "tool_use_id": format!("call-{call}"), "tool_input": input}),
+            ),
+            env,
+        );
+        if output.is_empty() {
+            return None;
+        }
+        let response: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            response["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+            "{output}"
+        );
+        Some(
+            response["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+    }
+}
+
+#[test]
+fn editing_a_file_recalls_the_decision_made_there_in_an_earlier_session() {
+    let workspace = Workspace::new();
+    workspace.turn_with_reason(
+        "earlier",
+        "t1",
+        "src/retry.rs",
+        "Kept the retry counter in src/retry.rs because the handshake resets it.",
+    );
+    workspace.run(&["observe"], None);
+    workspace.start_session("later");
+    let edit = |path: &str| {
+        workspace.before_tool(
+            "later",
+            "Edit",
+            json!({"file_path": workspace.repo.join(path), "old_string": "a", "new_string": "b"}),
+        )
+    };
+    let brief = edit("src/retry.rs").expect("the edit recalled the earlier decision");
+    assert!(
+        brief.contains(
+            "Decision: Kept the retry counter in src/retry.rs because the handshake resets it"
+        ),
+        "{brief}"
+    );
+    assert!(
+        brief.contains("Mem in Black retrieved historical evidence"),
+        "{brief}"
+    );
+    assert!(
+        edit("src/retry.rs").is_none(),
+        "a summary is recalled once per session"
+    );
+
+    // The agent edited the recalled file next, so the recall counts as used.
+    workspace.hook(
+        "claude",
+        "later",
+        "PostToolUse",
+        json!({"turn_id":"start", "tool_name":"Edit", "tool_use_id":"edit-later",
+            "tool_input":{"file_path": workspace.repo.join("src/retry.rs")}, "tool_response":{}}),
+    );
+    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    assert_eq!(stats["action_injections"], 1, "{stats}");
+    assert_eq!(stats["action_recall_checked"], 1, "{stats}");
+    assert_eq!(stats["action_recall_followed"], 1, "{stats}");
+    assert_eq!(stats["context_injections"], 1, "{stats}");
+    let text = workspace.run(&["stats"], None);
+    assert!(text.contains("before an action: 1 of 1"), "{text}");
+}
+
+#[test]
+fn rerunning_a_check_that_failed_before_recalls_the_failure_once() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    workspace.start_session("later");
+    let run = |session: &str, command: &str| {
+        workspace.before_tool(session, "Bash", json!({"command": command}))
+    };
+    assert!(run("later", "cargo test other_thing").is_none());
+    assert!(run("later", "ls src").is_none());
+    let brief = run("later", "cargo test websocket_retry").expect("the failed check was recalled");
+    assert!(
+        brief.contains("`cargo test websocket_retry` → failed"),
+        "{brief}"
+    );
+    assert!(
+        brief.contains("Fix the websocket retry regression"),
+        "{brief}"
+    );
+    assert!(run("later", "cargo test websocket_retry").is_none());
+
+    // A check inside a compound command is the same check.
+    workspace.start_session("compound");
+    let brief = run("compound", "cd src && cargo test websocket_retry 2>&1")
+        .expect("a compound command recalled the failed check");
+    assert!(brief.contains("cargo test websocket_retry"), "{brief}");
+    // The session that failed it needs no reminder.
+    assert!(run("claude-thread", "cargo test websocket_retry").is_none());
+}
+
+#[test]
+fn action_recall_is_silent_for_files_without_history_and_in_private_turns() {
+    let workspace = Workspace::new();
+    workspace.turn_with_reason(
+        "earlier",
+        "t1",
+        "src/retry.rs",
+        "Kept the retry counter in src/retry.rs because the handshake resets it.",
+    );
+    workspace.turn_with_reason("earlier", "t2", "src/plain.rs", "Renamed a helper.");
+    workspace.run(&["observe"], None);
+    let edit = |session: &str, turn: &str, path: &str, env: &[(&str, &str)]| {
+        workspace.before_tool_with(
+            session,
+            turn,
+            "Edit",
+            json!({"file_path": workspace.repo.join(path)}),
+            env,
+        )
+    };
+
+    // A session with no stored record has no known checkout yet.
+    assert!(edit("unknown", "start", "src/retry.rs", &[]).is_none());
+
+    workspace.start_session("later");
+    assert!(
+        edit("later", "start", "src/unknown.rs", &[]).is_none(),
+        "no history"
+    );
+    assert!(
+        edit("later", "start", "src/plain.rs", &[]).is_none(),
+        "no decision or failure"
+    );
+    let read = workspace.before_tool(
+        "later",
+        "Read",
+        json!({"file_path": workspace.repo.join("src/retry.rs")}),
+    );
+    assert!(read.is_none(), "only edits and checks recall");
+    assert!(
+        edit(
+            "later",
+            "start",
+            "src/retry.rs",
+            &[("MIB_ACTION_RECALL", "0")]
+        )
+        .is_none(),
+        "the switch turns the feature off"
+    );
+
+    // The same session did the earlier work: it needs no reminder.
+    assert!(edit("earlier", "t2", "src/retry.rs", &[]).is_none());
+
+    workspace.hook(
+        "claude",
+        "secret",
+        "UserPromptSubmit",
+        json!({"turn_id": "p", "prompt": "<private>Update the lockfile</private>"}),
+    );
+    assert!(
+        edit("secret", "p", "src/retry.rs", &[]).is_none(),
+        "private turn"
+    );
+
+    // None of that used up the recall.
+    assert!(edit("later", "start", "src/retry.rs", &[]).is_some());
+}
+
+#[test]
+fn action_recall_stops_after_its_session_limit() {
+    let workspace = Workspace::new();
+    let files: Vec<String> = (0..7).map(|index| format!("src/part{index}.rs")).collect();
+    for (index, file) in files.iter().enumerate() {
+        workspace.turn_with_reason(
+            "earlier",
+            &format!("t{index}"),
+            file,
+            &format!("Split {file} out because part {index} changes on its own."),
+        );
+    }
+    workspace.run(&["observe"], None);
+    workspace.start_session("later");
+    let recalled: Vec<bool> = files
+        .iter()
+        .map(|file| {
+            workspace
+                .before_tool(
+                    "later",
+                    "Write",
+                    json!({"file_path": workspace.repo.join(file), "content": "x"}),
+                )
+                .is_some()
+        })
+        .collect();
+    assert_eq!(recalled, [true, true, true, true, true, false, false]);
+    workspace.start_session("another");
+    assert!(
+        workspace
+            .before_tool(
+                "another",
+                "Write",
+                json!({"file_path": workspace.repo.join(&files[6]), "content": "x"}),
+            )
+            .is_some(),
+        "the limit is per session"
+    );
+}
+
+#[test]
+fn action_recall_without_a_hit_stays_fast_on_a_large_store_and_never_runs_git() {
+    let workspace = Workspace::new();
+    workspace.start_session("later");
+    let database = workspace.temp.path().join("data/memory.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let (root, project): (String, String) = connection
+            .query_row("SELECT workspace, project FROM events", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        for index in 0..10_000 {
+            let path = format!("src/generated{index}.rs");
+            connection
+                .execute(
+                    "INSERT INTO events(source, session, event_key, kind, body, workspace, project)
+                     VALUES ('claude', 'bulk', ?1, 'summary', ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("summary:{index}"),
+                        format!(
+                            "Change: Rework generated {index}\nFiles: {path}\nChecks: `cargo test case{index}` → failed\nDecision: Kept {path} because of case {index}.\nEvidence #1"
+                        ),
+                        root,
+                        project
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO summary_files(path, event_id) VALUES (?1, last_insert_rowid())",
+                    [&path],
+                )
+                .unwrap();
+        }
+        connection.execute_batch("COMMIT").unwrap();
+        connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    // A `git` that records being run, as the only program on PATH.
+    let shims = workspace.temp.path().join("shims");
+    std::fs::create_dir(&shims).unwrap();
+    let marker = workspace.temp.path().join("git-ran");
+    let git_shim = shims.join("git");
+    std::fs::write(
+        &git_shim,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &git_shim,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let path = shims.to_string_lossy().into_owned();
+
+    // Starting any process costs time on a loaded machine, so the budget is
+    // measured over what a hook that does nothing already takes, and each
+    // figure is the fastest of three runs.
+    let timed = |tool: &str, input: Value| {
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let output = workspace.before_tool_with(
+                    "later",
+                    "start",
+                    tool,
+                    input.clone(),
+                    &[("PATH", &path)],
+                );
+                assert!(output.is_none(), "{output:?}");
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let unread = json!({"file_path": workspace.repo.join("src/untouched.rs")});
+    let baseline = timed("Read", unread.clone());
+    for (tool, input) in [
+        ("Edit", unread),
+        ("Bash", json!({"command": "cargo test never_failed"})),
+    ] {
+        let elapsed = timed(tool, input);
+        assert!(
+            elapsed < baseline + std::time::Duration::from_millis(1000),
+            "{tool} took {elapsed:?} on 10,000 records, a no-op hook {baseline:?}"
+        );
+    }
+    assert!(!marker.exists(), "the no-hit path ran git");
+
+    // The same store does answer when there is a hit, which does need git.
+    let hit = workspace.before_tool(
+        "later",
+        "Edit",
+        json!({"file_path": workspace.repo.join("src/generated42.rs")}),
+    );
+    assert!(hit.unwrap().contains("because of case 42"));
+}
+
+#[test]
+fn a_check_that_failed_and_was_later_fixed_is_not_recalled() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.hook(
+        "claude",
+        "fixer",
+        "UserPromptSubmit",
+        json!({"turn_id": "fix", "prompt": "Make the websocket retry test pass"}),
+    );
+    workspace.hook(
+        "claude",
+        "fixer",
+        "PostToolUse",
+        json!({"turn_id": "fix", "tool_name": "Bash", "tool_use_id": "pass",
+            "tool_input": {"command": "cargo test websocket_retry"},
+            "tool_response": "test result: ok. 3 passed; 0 failed"}),
+    );
+    workspace.hook(
+        "claude",
+        "fixer",
+        "Stop",
+        json!({"turn_id": "fix", "last_assistant_message": "The retry test passes now."}),
+    );
+    workspace.run(&["observe"], None);
+    let export = workspace.run(&["export"], None);
+    assert!(
+        export.contains("`cargo test websocket_retry` → failed")
+            && export.contains("`cargo test websocket_retry` → passed"),
+        "{export}"
+    );
+    workspace.start_session("later");
+    let brief = workspace.before_tool(
+        "later",
+        "Bash",
+        json!({"command": "cargo test websocket_retry"}),
+    );
+    assert!(brief.is_none(), "{brief:?}");
 }

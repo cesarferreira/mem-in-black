@@ -96,11 +96,19 @@ T3 Code support configures the home of each enabled provider in
 `~/.t3/userdata/settings.json`, including custom `homePath`s. Set `T3CODE_HOME`
 for a custom T3 location.
 
+Recall at the point of action needs Claude Code 2.1.9 or newer, which added
+`additionalContext` to `PreToolUse` hooks, or Codex 0.170 or newer. Codex and
+Oh My Pi add the brief to the model's context and leave the tool's output as it
+was. OpenCode and Pi have no such channel, so there the brief is appended to
+the tool's result as a separate part headed “Historical context from Mem in
+Black (not part of the tool's output)”, and it is not recorded as tool output.
+
 ## Use it
 
 Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
+- **Recall at the point of action.** When an agent is about to edit a file or run a check that has history, it is reminded of it first. Editing a file recalls up to two earlier decisions, errors or failed checks from other sessions that touched that file. Running a check recalls the last time another session saw that same command fail. Each summary is shown once per session, a session gets at most five of these reminders, and nothing is recalled in a private turn. `MIB_ACTION_RECALL=0` turns it off.
 - **Handoff.** Open another supported agent in the same worktree and branch and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.” A detached HEAD uses an exact commit match. Earlier records without branch information are still searchable.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
@@ -219,6 +227,7 @@ turns model summaries off for one process.
 | `MIB_STARTUP_PREVIEW=0` | Hide the startup preview. `NO_COLOR=1` for plain text |
 | `MIB_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
 | `MIB_DEBUG=1` | Print hook errors and why each record was or was not recalled |
+| `MIB_ACTION_RECALL=0` | Turn off recall before edits and checks. Prompt recall stays on |
 
 Mem in Black uses WAL journaling on local disks and switches to rollback
 journaling on NFS and SMB mounts.

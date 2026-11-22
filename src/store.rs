@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 11;
+const SCHEMA: i64 = 12;
 /// Version of the local summary format. When it increases, the worker
 /// rebuilds the local summaries of earlier turns in place.
 const SUMMARY_FORMAT: i64 = 2;
@@ -85,6 +85,13 @@ pub struct Stats {
     /// Of those, the ones after which the agent touched a recalled file or
     /// mentioned a recalled commit in the same session.
     pub recall_followed: i64,
+    /// Recalled summaries that were delivered because the agent was about to
+    /// edit a file or run a check, counted like `recall_checked`.
+    pub action_recall_checked: i64,
+    /// Of those, the ones the agent went on to use.
+    pub action_recall_followed: i64,
+    /// Recalls delivered at the point of action.
+    pub action_injections: i64,
 }
 
 pub struct RecentDelivery {
@@ -374,6 +381,12 @@ impl Store {
                     let (files, commits) = crate::distill::listed_facts(&body);
                     index_summary(&migration, id, &files, &commits)?;
                 }
+            }
+            if version < 12 {
+                // Why a delivery happened: `prompt`, `handoff` or `action`.
+                migration.execute_batch(
+                    "ALTER TABLE deliveries ADD COLUMN \"trigger\" TEXT NOT NULL DEFAULT 'prompt';",
+                )?;
             }
             migration.pragma_update(None, "user_version", SCHEMA)?;
             migration.commit()?;
@@ -863,10 +876,6 @@ impl Store {
 
     /// Summaries of `project` that edited `path`, relative to the worktree
     /// root, newest first. Superseded summaries are left out.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first called by recall at the point of action")
-    )]
     pub fn summaries_touching(
         &self,
         project: &str,
@@ -904,6 +913,61 @@ impl Store {
             ),
             params![project, short.to_ascii_lowercase()],
         )
+    }
+
+    /// The worktree root and project of the newest record of a session, or
+    /// nothing for a session with no record yet.
+    pub fn session_checkout(
+        &self,
+        source: &str,
+        session: &str,
+    ) -> Result<Option<(String, String)>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT workspace, project FROM events WHERE source = ?1 AND session = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![source, session],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Recalls delivered to a session at the point of action. The count is a
+    /// metric per session, since several calls can land in the same second.
+    pub fn action_recalls(&self, source: &str, session: &str) -> Result<i64> {
+        self.metric(&action_counter(source, session))
+    }
+
+    /// Summaries of `project` outside the given session whose `Checks:` line
+    /// lists `check` with any status, newest first.
+    pub fn summaries_running_check(
+        &self,
+        project: &str,
+        check: &str,
+        source: &str,
+        session: &str,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        let listed = format!("`{check}` → ");
+        let found = self.query(
+            &format!(
+                "SELECT {RECORD_COLUMNS} FROM events e
+                 WHERE e.kind = 'summary' AND e.project = ?1 AND e.superseded_by IS NULL
+                   AND NOT (e.source = ?3 AND e.session = ?4) AND instr(e.body, ?2) > 0
+                 ORDER BY e.created_at DESC, e.id DESC"
+            ),
+            params![project, listed, source, session],
+        )?;
+        Ok(found
+            .into_iter()
+            .filter(|record| {
+                crate::distill::summary_fact(&record.body, "Checks: ")
+                    .is_some_and(|checks| checks.contains(&listed))
+            })
+            .take(limit)
+            .collect())
     }
 
     /// Delete records, the summaries built from them and their delivery history.
@@ -1073,11 +1137,13 @@ impl Store {
     }
 
     /// Mark `shown` evidence as delivered to a session, plus `matched` records
-    /// that led to it, so neither is offered to that session again.
+    /// that led to it, so neither is offered to that session again. `trigger`
+    /// is why the delivery happened: `prompt`, `handoff` or `action`.
     pub fn record_delivery(
         &self,
         source: &str,
         session: &str,
+        trigger: &str,
         shown: &[&Record],
         matched: &[&Record],
         render: impl FnOnce(&[&Record]) -> Option<String>,
@@ -1101,17 +1167,22 @@ impl Store {
         for (records, flag) in [(fresh.as_slice(), 1), (matched, 0)] {
             for record in records {
                 transaction.execute(
-                    "INSERT INTO deliveries(source, session, event_id, shown, delivered_at)
-                       VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 THEN unixepoch() END)
+                    "INSERT INTO deliveries(source, session, event_id, shown, delivered_at, \"trigger\")
+                       VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 THEN unixepoch() END, ?5)
                      ON CONFLICT(source, session, event_id) DO UPDATE SET
+                       \"trigger\" = CASE WHEN excluded.shown > shown THEN excluded.\"trigger\" ELSE \"trigger\" END,
                        shown = max(shown, excluded.shown),
                        delivered_at = coalesce(excluded.delivered_at, delivered_at)",
-                    params![source, session, record.id, flag],
+                    params![source, session, record.id, flag, trigger],
                 )?;
             }
         }
         self.add_metric("context_injections", 1)?;
         self.add_metric("context_bytes", context.len() as i64)?;
+        if trigger == "action" {
+            self.add_metric("action_injections", 1)?;
+            self.add_metric(&action_counter(source, session), 1)?;
+        }
         transaction.commit()?;
         Ok(Some(context))
     }
@@ -1164,18 +1235,26 @@ impl Store {
     /// Counts recalled summaries whose files or commits the agent went on to
     /// use in the same session, within its next 60 records. A file counts
     /// when a later tool call names its path; a commit counts when a later
-    /// tool call or reply mentions its hash. The caller holds the read guard.
-    fn recall_follow_up(&self, workspace: Option<&str>) -> Result<(i64, i64)> {
-        let deliveries: Vec<(String, String, i64, String)> = self
+    /// tool call or reply mentions its hash. Returns checked and followed
+    /// counts for every recall, then for the ones delivered at the point of
+    /// action. The caller holds the read guard.
+    fn recall_follow_up(&self, workspace: Option<&str>) -> Result<[i64; 4]> {
+        let deliveries: Vec<(String, String, i64, String, bool)> = self
             .db
             .prepare(
-                "SELECT d.source, d.session, d.delivered_at, e.body
+                "SELECT d.source, d.session, d.delivered_at, e.body, d.\"trigger\" = 'action'
                  FROM deliveries d JOIN events e ON e.id = d.event_id
                  WHERE d.shown AND d.delivered_at IS NOT NULL AND e.kind = 'summary'
                    AND (?1 IS NULL OR e.workspace = ?1)",
             )?
             .query_map(params![workspace], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         let mut later = self.db.prepare_cached(
@@ -1183,8 +1262,8 @@ impl Store {
                AND kind IN ('tool', 'assistant') AND created_at >= ?3
              ORDER BY id LIMIT 60",
         )?;
-        let (mut checked, mut followed) = (0, 0);
-        for (source, session, delivered_at, body) in deliveries {
+        let mut counts = [0; 4];
+        for (source, session, delivered_at, body, action) in deliveries {
             let files: Vec<String> = crate::distill::summary_fact(&body, "Files: ")
                 .into_iter()
                 .flat_map(|files| files.split(", "))
@@ -1200,7 +1279,6 @@ impl Store {
             if files.is_empty() && commits.is_empty() {
                 continue;
             }
-            checked += 1;
             let used = later
                 .query_map(params![source, session, delivered_at], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1210,9 +1288,12 @@ impl Store {
                     (kind == "tool" && files.iter().any(|file| text.contains(file.as_str())))
                         || commits.iter().any(|hash| text.contains(hash))
                 });
-            followed += i64::from(used);
+            let kinds = if action { 4 } else { 2 };
+            for (index, count) in counts.iter_mut().enumerate().take(kinds) {
+                *count += if index % 2 == 0 { 1 } else { i64::from(used) };
+            }
         }
-        Ok((checked, followed))
+        Ok(counts)
     }
 
     pub fn stats(&self, workspace: Option<&str>) -> Result<Stats> {
@@ -1233,10 +1314,18 @@ impl Store {
                 .optional()?
                 .unwrap_or(0))
         };
-        let (recall_checked, recall_followed) = self.recall_follow_up(workspace)?;
+        let [
+            recall_checked,
+            recall_followed,
+            action_recall_checked,
+            action_recall_followed,
+        ] = self.recall_follow_up(workspace)?;
         Ok(Stats {
             recall_checked,
             recall_followed,
+            action_recall_checked,
+            action_recall_followed,
+            action_injections: metric("action_injections")?,
             workspace: workspace.map(str::to_owned),
             records: scalar("SELECT count(*) FROM events WHERE ?1 IS NULL OR workspace = ?1")?,
             memories: scalar(&format!("SELECT count(*) FROM events e WHERE (?1 IS NULL OR e.workspace = ?1)
@@ -1434,6 +1523,11 @@ impl Store {
             .query_map(params, row_record)?
             .collect::<rusqlite::Result<_>>()?)
     }
+}
+
+/// The metric that counts a session's recalls at the point of action.
+fn action_counter(source: &str, session: &str) -> String {
+    format!("action:{source}:{session}")
 }
 
 /// Replaces the index rows of summary `id` with `files` and `commits`.

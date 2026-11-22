@@ -179,3 +179,141 @@ test("OpenCode V1 captures tool output and the reply for the active prompt", asy
   assert.match(JSON.stringify(output.messages[0].parts), /completed the retry fix/);
   assert.deepEqual(parts, content(followUp));
 });
+
+const heading = "Historical context from Mem in Black (not part of the tool's output)";
+
+// A finished claude turn that edited src/retry.rs and said why.
+async function earlierDecision(command, home) {
+  const send = async (event, fields) => {
+    const call = command("hook", "claude");
+    call.child.stdin.end(JSON.stringify({
+      cwd: home, session_id: "earlier", turn_id: "t1", hook_event_name: event, ...fields,
+    }));
+    await call;
+  };
+  await send("UserPromptSubmit", { prompt: "Rework the retry counter" });
+  await send("PostToolUse", { tool_name: "Edit", tool_use_id: "e1", tool_response: {},
+    tool_input: { file_path: join(home, "src/retry.rs"), old_string: "a", new_string: "b" } });
+  await send("Stop", { last_assistant_message: "Kept the counter in src/retry.rs because the handshake resets it." });
+  await command("observe");
+}
+
+for (const [host, path] of [
+  ["pi", ".pi/agent/extensions/mem-in-black-capture.js"],
+  ["omp", ".omp/agent/hooks/pre/mem-in-black-capture.js"],
+]) {
+  test(`${host} recalls an earlier decision before an edit, never in a private turn`, async (test) => {
+    const { home, command, plugin } = await fixture(test, host, path);
+    await earlierDecision(command, home);
+    const handlers = new Map();
+    plugin({ on: (name, handler) => handlers.set(name, handler) });
+    let session = "secret";
+    const context = { cwd: home, sessionManager: { getSessionId: () => session } };
+    const emit = (name, event = {}) => handlers.get(name)(event, context);
+    const edit = (id) => ({ toolCallId: id, toolName: "edit", input: {
+      path: join(home, "src/retry.rs"), edits: [{ oldText: "a", newText: "b" }],
+    } });
+    const run = async (event) => {
+      const before = await emit("tool_call", event);
+      const after = await emit("tool_result", { ...event, content: content("edited"), isError: false });
+      return { before, after };
+    };
+
+    await emit("message_start", { message: { role: "user", content: content("<private>Update the lockfile</private>") } });
+    assert.deepEqual(await run(edit("private")), { before: undefined, after: undefined });
+
+    session = "later";
+    await emit("message_start", { message: { role: "user", content: content("Update the lockfile") } });
+    const { before, after } = await run(edit("first"));
+    if (host === "omp") {
+      assert.match(before.additionalContext, /because the handshake resets it/);
+      assert.equal(after, undefined, "the tool's output is never changed");
+    } else {
+      assert.equal(before, undefined);
+      assert.equal(after.content.length, 2);
+      assert.deepEqual(after.content[0], content("edited")[0]);
+      assert.ok(after.content[1].text.startsWith(heading), after.content[1].text);
+      assert.match(after.content[1].text, /because the handshake resets it/);
+    }
+    assert.deepEqual(await run(edit("second")), { before: undefined, after: undefined }, "once per session");
+    const read = { toolCallId: "read", toolName: "read", input: { path: join(home, "src/retry.rs") } };
+    assert.equal(await emit("tool_call", read), undefined, "only edits and checks recall");
+
+    await emit("message_end", { message: { role: "assistant", content: content("Done.") } });
+    await emit("agent_end");
+    const { stdout } = await command("export");
+    assert.doesNotMatch(stdout, /Historical context/, "a brief is never recorded as tool output");
+  });
+}
+
+test("OpenCode V2 appends the brief to an edit's result and records the original", async (test) => {
+  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/mem-in-black-capture.js");
+  await earlierDecision(command, home);
+  const handlers = new Map();
+  const register = (name, handler) => handlers.set(name, handler);
+  const messages = [];
+  const cleanup = await plugin.setup({
+    session: { hook: register, context: async () => messages, get: async () => ({ location: { directory: home } }) },
+    tool: { hook: register },
+    event: { subscribe: async function* () {} },
+  });
+  test.after(() => cleanup());
+
+  const sessionID = "session";
+  const prompt = { sessionID, messageID: "p1", prompt: { text: "Update the lockfile" } };
+  await handlers.get("prompt")(prompt);
+  const stored = { role: "user", type: "user", id: "p1", metadata: prompt.metadata, content: content("Update the lockfile") };
+  messages.push(stored);
+  await handlers.get("context")({ sessionID, messages: [{ ...stored }] });
+
+  const call = { sessionID, messageID: "answer", tool: "edit",
+    input: { filePath: join(home, "src/retry.rs"), oldString: "a", newString: "b" } };
+  const run = async (id) => {
+    await handlers.get("execute.before")({ ...call, id });
+    const event = { ...call, id, status: "completed", result: { content: content("edited") } };
+    await handlers.get("execute.after")(event);
+    return event.result.content;
+  };
+  const first = await run("first");
+  assert.equal(first.length, 2);
+  assert.deepEqual(first[0], content("edited")[0]);
+  assert.ok(first[1].text.startsWith(heading), first[1].text);
+  assert.match(first[1].text, /because the handshake resets it/);
+  assert.deepEqual(await run("second"), content("edited"), "once per session");
+  messages.push({ type: "assistant", content: content("Done.") });
+  await handlers.get("experimental.idle")({ sessionID });
+  const { stdout } = await command("export");
+  assert.doesNotMatch(stdout, /Historical context/);
+  assert.match(stdout, /Edit .*src\/retry\.rs/, "the edit itself is recorded");
+});
+
+test("OpenCode V1 appends the brief to an edit's output and does not record it", async (test) => {
+  const { home, command, plugin } = await fixture(test, "opencode", ".config/opencode/plugins/mem-in-black-capture.js");
+  await earlierDecision(command, home);
+  const sessionID = "session";
+  const args = { filePath: join(home, "src/retry.rs"), oldString: "a", newString: "b" };
+  const output = { title: "edit", output: "edited", metadata: {} };
+  const client = { session: { get: async () => ({ data: {} }), messages: async () => ({ data: [{
+    info: { id: "answer", role: "assistant", parentID: "p1" },
+    parts: [...content("Done."), { type: "tool", callID: "c1", tool: "edit", state: {
+      status: "completed", input: args, output: output.output,
+    } }],
+  }] }) } };
+  const hooks = await plugin.server({ client, directory: home });
+  await hooks["chat.message"]({ sessionID }, { message: { id: "p1" }, parts: content("Update the lockfile") });
+  await hooks["tool.execute.before"]({ tool: "edit", sessionID, callID: "c1" }, { args });
+  await hooks["tool.execute.after"]({ tool: "edit", sessionID, callID: "c1", args }, output);
+  assert.ok(output.output.startsWith(`edited\n\n${heading}\n`), output.output);
+  assert.match(output.output, /because the handshake resets it/);
+  // The recorded result is the tool's own, even when the stored output carries the brief.
+  client.session.messages = async () => ({ data: [{
+    info: { id: "answer", role: "assistant", parentID: "p1" },
+    parts: [...content("Done."), { type: "tool", callID: "c1", tool: "edit", state: {
+      status: "completed", input: args, output: output.output,
+    } }],
+  }] });
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+  const { stdout } = await command("export");
+  assert.doesNotMatch(stdout, /Historical context/);
+  assert.match(stdout, /Edit .*src\/retry\.rs/);
+});

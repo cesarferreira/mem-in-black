@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 export default function (pi) {
   const sessions = new Map();
   const sessionId = (ctx) => ctx.sessionManager.getSessionId();
-  const stateFor = (id) => sessions.get(id) ?? { tools: new Map() };
+  const stateFor = (id) => sessions.get(id) ?? { tools: new Map(), briefs: new Map() };
   const userMessage = (message) => (message.role === "user" && (!message.attribution || message.attribution === "user"))
     || (message.role === "custom" && message.attribution === "user");
   const userText = (message) => message.role === "user" ? contentText(message.content)
@@ -62,16 +62,32 @@ export default function (pi) {
     return { messages: updated };
   });
 
-  pi.on("tool_call", ({ toolCallId }, ctx) => {
+  pi.on("tool_call", async ({ toolCallId, toolName, input }, ctx) => {
     const state = sessions.get(sessionId(ctx));
-    if (state?.turn) state.tools.set(toolCallId, state.turn);
+    if (!state?.turn) return;
+    state.tools.set(toolCallId, state.turn);
+    const brief = recallForTool(state.turn, toolCallId, toolName, input);
+    if (mib.host === "omp") {
+      // OMP adds this as developer context after the tool result, so the
+      // tool's output stays as it was.
+      const additionalContext = await brief;
+      return additionalContext ? { additionalContext } : undefined;
+    }
+    // Pi has no context channel before a tool runs. The brief is not awaited:
+    // the tool runs meanwhile, and `tool_result` appends it to the result.
+    state.briefs.set(toolCallId, brief);
   });
 
   pi.on("tool_result", async (event, ctx) => {
     const state = sessions.get(sessionId(ctx));
     const turn = state?.tools.get(event.toolCallId);
+    const brief = await state?.briefs.get(event.toolCallId);
     state?.tools.delete(event.toolCallId);
+    state?.briefs.delete(event.toolCallId);
     await captureTool(turn, event.toolCallId, event.toolName, event.input, event.content, event.isError, event.details);
+    if (brief && !event.isError && Array.isArray(event.content)) {
+      return { content: withToolRecall(event.content, brief) };
+    }
   });
 
   pi.on("message_end", ({ message }, ctx) => {
