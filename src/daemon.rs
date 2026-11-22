@@ -712,10 +712,15 @@ a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{pad
         let agent = escape(agent_name(&item.source));
         let time = timestamp(item.created_at);
         let open = if view.record.is_some() { " open" } else { "" };
+        let badges = if view.activity {
+            String::new()
+        } else {
+            status_badges(store, &item)?
+        };
         html.push_str(&format!(
             r#"<details id="record-{id}" style="--project-hue:{hue:.6}"{open}>
 <summary><span class="record-heading"><span class="record-title">{heading}</span><span class="record-tags">
-<span class="project-label" title="{name}">{name}</span><span class="agent-label" title="{agent}">{agent}</span>
+<span class="project-label" title="{name}">{name}</span><span class="agent-label" title="{agent}">{agent}</span>{badges}
 </span></span>{preview}{time}</summary>
 <small>#{id} · {kind} · {workspace}</small>{body}{source_link}</details>"#,
             id = item.id,
@@ -732,6 +737,29 @@ a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{pad
     }
     html.push_str("</div></main></html>");
     Ok(html)
+}
+
+/// Badges for a summary that records an abandoned approach or was later
+/// reverted or disputed.
+fn status_badges(store: &Store, record: &crate::store::Record) -> Result<String> {
+    if record.kind != "summary" {
+        return Ok(String::new());
+    }
+    let mut labels = Vec::new();
+    if crate::distill::summary_fact(&record.body, "Abandoned: ").is_some() {
+        labels.push("abandoned");
+    }
+    if let Some((status, _)) = store.summary_statuses(&[record.id])?.get(&record.id) {
+        labels.push(if status == "reverted" {
+            "reverted"
+        } else {
+            "disputed"
+        });
+    }
+    Ok(labels
+        .into_iter()
+        .map(|label| format!(r#"<span class="agent-label status-label">{label}</span>"#))
+        .collect())
 }
 
 fn memory_preview(record: &crate::store::Record) -> String {
@@ -756,6 +784,10 @@ fn memory_preview(record: &crate::store::Record) -> String {
     let mut html = String::new();
     for (label, value) in [
         ("", Some(preview)),
+        (
+            "Abandoned: ",
+            crate::distill::summary_fact(&record.body, "Abandoned: "),
+        ),
         (
             "Checks: ",
             crate::distill::summary_fact(&record.body, "Checks: "),

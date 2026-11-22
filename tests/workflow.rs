@@ -3949,3 +3949,334 @@ fn a_recall_is_judged_after_sixty_later_records_or_thirty_quiet_minutes() {
     assert_eq!(stats["recall_checked"], 2, "{stats}");
     assert_eq!(stats["recall_followed"], 1, "{stats}");
 }
+
+impl Workspace {
+    /// A finished turn that edits `file`, runs `command` and replies, left unsummarized.
+    fn turn_that_runs(&self, session: &str, turn: &str, file: &str, commands: &[(&str, bool)]) {
+        self.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"turn_id": turn, "prompt": format!("Rework {file}")}),
+        );
+        self.hook(
+            "claude",
+            session,
+            "PostToolUse",
+            json!({"turn_id": turn, "tool_name":"Edit", "tool_use_id": format!("edit-{turn}"),
+                "tool_input":{"file_path": self.repo.join(file), "old_string":"a", "new_string":"b"},
+                "tool_response":{}}),
+        );
+        for (index, (command, failed)) in commands.iter().enumerate() {
+            self.hook(
+                "claude",
+                session,
+                "PostToolUse",
+                json!({"turn_id": turn, "tool_name":"Bash", "tool_use_id": format!("run-{turn}-{index}"),
+                    "tool_input":{"command": command},
+                    "tool_response": if *failed { "FAILED: expected three retries" } else { "test result: ok. 1 passed; 0 failed" },
+                    "tool_response_is_error": failed}),
+            );
+        }
+        self.hook(
+            "claude",
+            session,
+            "Stop",
+            json!({"turn_id": turn, "last_assistant_message": "Reworked it."}),
+        );
+    }
+
+    /// The body of the summary that lists `file`.
+    fn summary_listing(&self, file: &str) -> String {
+        let all: Value = serde_json::from_str(&self.run(&["search"], None)).unwrap();
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "summary" && row["body"].as_str().unwrap().contains(file))
+            .unwrap_or_else(|| panic!("no summary lists {file}: {all}"))["body"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Every summary status as `(summary id, status, caused by, summary body)`.
+    fn status_rows(&self) -> Vec<(i64, String, Option<i64>, String)> {
+        let database =
+            rusqlite::Connection::open(self.temp.path().join("data/memory.sqlite3")).unwrap();
+        let mut statement = database
+            .prepare(
+                "SELECT s.event_id, s.status, s.by_event_id, e.body
+                 FROM summary_status s JOIN events e ON e.id = s.event_id ORDER BY s.event_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn summary_mentioning(&self, text: &str) -> i64 {
+        let all: Value = serde_json::from_str(&self.run(&["search"], None)).unwrap();
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "summary" && row["body"].as_str().unwrap().contains(text))
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_reverted_approach_is_recalled_as_abandoned_when_the_file_is_edited_again() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs(
+        "earlier",
+        "t1",
+        "src/retry.rs",
+        &[("git checkout -- src/retry.rs", false)],
+    );
+    // Newer turns on the same file hold decisions, which an abandoned one outranks.
+    workspace.turn_with_reason(
+        "earlier",
+        "t2",
+        "src/retry.rs",
+        "Kept the counter in src/retry.rs because the handshake resets it.",
+    );
+    workspace.turn_with_reason(
+        "earlier",
+        "t3",
+        "src/retry.rs",
+        "Moved the timeout in src/retry.rs instead of the counter.",
+    );
+    workspace.turn_with_reason("earlier", "t4", "src/plain.rs", "Renamed a helper.");
+    workspace.run(&["observe"], None);
+    let body = workspace.summary_listing("src/plain.rs");
+    assert!(!body.contains("Abandoned:"), "{body}");
+
+    workspace.start_session("later");
+    assert!(
+        workspace
+            .before_tool(
+                "later",
+                "Edit",
+                json!({"file_path": workspace.repo.join("src/plain.rs")})
+            )
+            .is_none()
+    );
+    let brief = workspace
+        .before_tool(
+            "later",
+            "Edit",
+            json!({"file_path": workspace.repo.join("src/retry.rs")}),
+        )
+        .expect("the edit recalled the abandoned approach");
+    assert!(
+        brief.contains("Abandoned: ran `git checkout --` after editing src/retry.rs"),
+        "{brief}"
+    );
+    assert!(brief.contains("instead of the counter"), "{brief}");
+    assert!(
+        !brief.contains("Kept the counter"),
+        "only two summaries are recalled, abandoned first: {brief}"
+    );
+}
+
+#[test]
+fn a_later_revert_commit_marks_the_original_summary() {
+    let workspace = Workspace::new();
+    workspace.turn_that_edits(&["src/retry.rs".to_owned()], true);
+    let original = workspace.summary_mentioning("src/retry.rs");
+    workspace.hook(
+        "claude",
+        "undo",
+        "UserPromptSubmit",
+        json!({"prompt": "Take the retry rename back"}),
+    );
+    git(
+        &workspace.repo,
+        &[
+            "-c",
+            "user.name=Mem in Black",
+            "-c",
+            "user.email=test@example.com",
+            "revert",
+            "--no-edit",
+            "HEAD",
+        ],
+    );
+    workspace.hook(
+        "claude",
+        "undo",
+        "Stop",
+        json!({"last_assistant_message": "Reverted the rename."}),
+    );
+    workspace.run(&["observe"], None);
+    let by = workspace.summary_mentioning("Revert");
+    assert_ne!(by, original);
+    let rows = workspace.status_rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].0, rows[0].1.as_str(), rows[0].2),
+        (original, "reverted", Some(by))
+    );
+    assert!(
+        !rows[0].3.contains("reverted"),
+        "the evidence text is not rewritten: {}",
+        rows[0].3
+    );
+
+    workspace.start_session("later");
+    let brief = workspace
+        .before_tool(
+            "later",
+            "Edit",
+            json!({"file_path": workspace.repo.join("src/retry.rs")}),
+        )
+        .expect("a reverted summary is recalled");
+    assert!(
+        brief.contains(&format!(" • later reverted in #{by}]")),
+        "{brief}"
+    );
+
+    // Forgetting the reverting turn drops the mark.
+    let all: Value = serde_json::from_str(&workspace.run(&["search"], None)).unwrap();
+    let reply = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["body"] == "Reverted the rename.")
+        .unwrap();
+    workspace.run(&["forget", &reply["id"].to_string()], None);
+    workspace.run(&["forget", &by.to_string()], None);
+    assert!(workspace.status_rows().is_empty());
+}
+
+#[test]
+fn a_prompt_that_rejects_the_last_result_marks_its_summary_disputed() {
+    let workspace = Workspace::new();
+    // The rejecting prompt arrives after the summary exists.
+    workspace.turn_with_reason("first", "t1", "src/one.rs", "Reworked src/one.rs.");
+    workspace.run(&["observe"], None);
+    workspace.hook(
+        "claude",
+        "first",
+        "UserPromptSubmit",
+        json!({"turn_id": "t2", "prompt": "That didn't work, the retry still resets"}),
+    );
+    workspace.hook(
+        "claude",
+        "first",
+        "Stop",
+        json!({"turn_id": "t2", "last_assistant_message": "Looking again."}),
+    );
+    workspace.run(&["observe"], None);
+    // The rejecting prompt arrives before the worker summarized the turn.
+    workspace.turn_with_reason("second", "t1", "src/two.rs", "Reworked src/two.rs.");
+    workspace.hook(
+        "claude",
+        "second",
+        "UserPromptSubmit",
+        json!({"turn_id": "t2", "prompt": "Undo this, it is still broken"}),
+    );
+    // An ordinary follow-up disputes nothing.
+    workspace.turn_with_reason("third", "t1", "src/three.rs", "Reworked src/three.rs.");
+    workspace.hook(
+        "claude",
+        "third",
+        "UserPromptSubmit",
+        json!({"turn_id": "t2", "prompt": "Now add a test for it"}),
+    );
+    workspace.run(&["observe"], None);
+    let rows = workspace.status_rows();
+    let disputed: Vec<_> = rows
+        .iter()
+        .map(|(id, status, _, _)| (*id, status.as_str()))
+        .collect();
+    assert_eq!(
+        disputed,
+        [
+            (workspace.summary_mentioning("src/one.rs"), "disputed"),
+            (workspace.summary_mentioning("src/two.rs"), "disputed")
+        ],
+        "{rows:?}"
+    );
+
+    workspace.start_session("later");
+    let brief = workspace
+        .before_tool(
+            "later",
+            "Edit",
+            json!({"file_path": workspace.repo.join("src/two.rs")}),
+        )
+        .expect("a disputed summary is recalled");
+    assert!(brief.contains(" • disputed by the user]"), "{brief}");
+}
+
+#[test]
+fn a_model_cannot_report_a_dead_end_the_tool_records_do_not_show() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("one", "t1", "src/invented.rs", &[]);
+    workspace.turn_that_runs("two", "t1", "src/tried.rs", &[("git reset --hard", false)]);
+    let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    std::fs::write(
+        workspace.temp.path().join("data/observer.json"),
+        json!({"endpoint":format!("http://{address}/v1/chat/completions"),"model":"fixture"})
+            .to_string(),
+    )
+    .unwrap();
+    let content =
+        json!({"title": "Tried buffering the retries", "outcome": "Back to the old counter.",
+        "decision": null, "abandoned": "The buffer dropped the first retry.", "next": null})
+        .to_string();
+    let handler = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .expect("observer request");
+            request
+                .respond(tiny_http::Response::from_string(
+                    json!({"choices":[{"message":{"content": content}}],
+                        "usage":{"prompt_tokens":10,"completion_tokens":5}})
+                    .to_string(),
+                ))
+                .unwrap();
+        }
+    });
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+    handler.join().unwrap();
+    let invented = workspace.summary_listing("src/invented.rs");
+    assert!(invented.contains("Summarized by: fixture"), "{invented}");
+    assert!(!invented.contains("Abandoned:"), "{invented}");
+    let shown = workspace.summary_listing("src/tried.rs");
+    assert!(
+        shown.contains("\nAbandoned: ran `git reset --hard` after editing src/tried.rs — The buffer dropped the first retry.\n"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn a_check_that_fails_then_passes_is_not_abandoned() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs(
+        "fixed",
+        "t1",
+        "src/fixed.rs",
+        &[("cargo test retry", true), ("cargo test retry", false)],
+    );
+    workspace.turn_that_runs("stuck", "t1", "src/stuck.rs", &[("cargo test retry", true)]);
+    workspace.run(&["observe"], None);
+    let fixed = workspace.summary_listing("src/fixed.rs");
+    assert!(!fixed.contains("Abandoned:"), "{fixed}");
+    let stuck = workspace.summary_listing("src/stuck.rs");
+    assert!(
+        stuck
+            .contains("\nAbandoned: `cargo test retry` still failing after editing src/stuck.rs\n"),
+        "{stuck}"
+    );
+}

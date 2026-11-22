@@ -18,7 +18,7 @@ const SCHEMA: i64 = 14;
 pub const DEMOTED_AFTER: i64 = 3;
 /// Version of the local summary format. When it increases, the worker
 /// rebuilds the local summaries of earlier turns in place.
-const SUMMARY_FORMAT: i64 = 2;
+const SUMMARY_FORMAT: i64 = 3;
 
 /// (record id, workspace, project, little-endian f32 vector)
 pub type VectorRow = (i64, String, String, Vec<u8>);
@@ -31,7 +31,7 @@ const MEMORY_FILTER: &str = "(
         e.source = 'claude-mem' OR EXISTS (
             SELECT 1 FROM (
                 SELECT 'Files: ' AS label UNION ALL SELECT 'Commits: ' UNION ALL SELECT 'Explored: ' UNION ALL SELECT 'Checks: '
-                UNION ALL SELECT 'Errors seen: ' UNION ALL SELECT 'Decision: ' UNION ALL SELECT 'Next: '
+                UNION ALL SELECT 'Errors seen: ' UNION ALL SELECT 'Decision: ' UNION ALL SELECT 'Abandoned: ' UNION ALL SELECT 'Next: '
             ) AS fact
             WHERE instr(e.body, char(10) || fact.label) BETWEEN 1 AND min(
                 coalesce(nullif(instr(e.body, char(10) || 'Outcome: '), 0), length(e.body) + 1),
@@ -47,6 +47,14 @@ const MEMORY_FILTER: &str = "(
         )
     ))
 )";
+
+/// What a finished summary is indexed and marked with.
+pub struct SummaryIndex<'a> {
+    pub files: &'a [String],
+    pub commits: &'a [&'a str],
+    /// Earlier summaries, or `None` for this one, to mark `reverted` or `disputed`.
+    pub marks: &'a [(Option<i64>, &'static str)],
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -387,6 +395,19 @@ impl Store {
                 // Why a delivery happened: `prompt`, `handoff` or `action`.
                 migration.execute_batch(
                     "ALTER TABLE deliveries ADD COLUMN \"trigger\" TEXT NOT NULL DEFAULT 'prompt';",
+                )?;
+            }
+            if version < 13 {
+                // A later outcome of a summary, kept beside it so that its
+                // evidence text is never rewritten: `reverted` or `disputed`.
+                migration.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS summary_status (
+                       event_id INTEGER PRIMARY KEY, status TEXT NOT NULL, by_event_id INTEGER
+                     );
+                     CREATE INDEX IF NOT EXISTS summary_status_by ON summary_status(by_event_id);
+                     CREATE TRIGGER IF NOT EXISTS summary_status_delete AFTER DELETE ON events BEGIN
+                       DELETE FROM summary_status WHERE event_id = old.id OR by_event_id = old.id;
+                     END;",
                 )?;
             }
             if version < 14 {
@@ -918,6 +939,64 @@ impl Store {
             ),
             params![project, short.to_ascii_lowercase()],
         )
+    }
+
+    /// The later outcome recorded for each of the summaries `ids` that has
+    /// one: `reverted` or `disputed`, and the summary that caused it.
+    pub fn summary_statuses(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (String, Option<i64>)>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self
+            .db
+            .prepare_cached("SELECT status, by_event_id FROM summary_status WHERE event_id = ?1")?;
+        let mut found = std::collections::HashMap::new();
+        for id in ids {
+            let row = statement
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some(status) = row {
+                found.insert(*id, status);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The assistant reply that closed the session's turn before `prompt`.
+    pub fn previous_reply(&self, prompt: &Record) -> Result<Option<Record>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM events e
+                     WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3
+                       AND e.kind = 'assistant' AND e.id < ?4
+                     ORDER BY e.id DESC LIMIT 1"
+                ),
+                params![prompt.source, prompt.session, prompt.workspace, prompt.id],
+                row_record,
+            )
+            .optional()?)
+    }
+
+    /// The first prompt the session received after `reply`, if any.
+    pub fn next_prompt(&self, reply: &Record) -> Result<Option<Record>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM events e
+                     WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3
+                       AND e.kind = 'prompt' AND e.id > ?4
+                     ORDER BY e.id LIMIT 1"
+                ),
+                params![reply.source, reply.session, reply.workspace, reply.id],
+                row_record,
+            )
+            .optional()?)
     }
 
     /// The worktree root and project of the newest record of a session, or
@@ -1523,8 +1602,7 @@ impl Store {
         summary: Observation<'_>,
         reported_tokens: i64,
         replace: bool,
-        files: &[String],
-        commits: &[&str],
+        index: SummaryIndex<'_>,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
@@ -1538,7 +1616,7 @@ impl Store {
                 params![summary.body, summary.source, summary.session, summary.key],
             )?;
         }
-        if inserted || replace {
+        if inserted || replace || !index.marks.is_empty() {
             let id: Option<i64> = transaction
                 .query_row(
                     "SELECT id FROM events WHERE source = ?1 AND session = ?2 AND event_key = ?3",
@@ -1547,7 +1625,14 @@ impl Store {
                 )
                 .optional()?;
             if let Some(id) = id {
-                index_summary(&transaction, id, files, commits)?;
+                if inserted || replace {
+                    index_summary(&transaction, id, index.files, index.commits)?;
+                }
+                for (target, status) in index.marks {
+                    // A summary never rules on itself, except through a later prompt.
+                    let by = target.map(|_| id);
+                    mark_summary(&transaction, target.unwrap_or(id), status, by)?;
+                }
             }
         }
         transaction.execute(
@@ -1614,6 +1699,17 @@ fn index_summary(
     for hash in commits {
         commit.execute(params![hash.as_ref(), id])?;
     }
+    Ok(())
+}
+
+/// Records `status` on summary `id`. `reverted` outranks `disputed`.
+fn mark_summary(db: &Connection, id: i64, status: &str, by: Option<i64>) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT INTO summary_status VALUES (?1, ?2, ?3)
+         ON CONFLICT(event_id) DO UPDATE SET status = excluded.status, by_event_id = excluded.by_event_id
+         WHERE summary_status.status != 'reverted' OR excluded.status = 'reverted'",
+        params![id, status, by],
+    )?;
     Ok(())
 }
 
@@ -1770,8 +1866,11 @@ mod tests {
             summary(&workspace, "summary:1", "Change: one"),
             0,
             false,
-            &first,
-            &["abc1234"],
+            SummaryIndex {
+                files: &first,
+                commits: &["abc1234"],
+                marks: &[],
+            },
         )?;
         let id = store.summaries_touching(&workspace.project, "src/a.rs", 5)?[0].id;
         assert_eq!(
@@ -1789,8 +1888,11 @@ mod tests {
             summary(&workspace, "summary:1", "Change: two"),
             0,
             true,
-            &["src/b.rs".to_owned(), "src/c.rs".to_owned()],
-            &["def5678"],
+            SummaryIndex {
+                files: &["src/b.rs".to_owned(), "src/c.rs".to_owned()],
+                commits: &["def5678"],
+                marks: &[],
+            },
         )?;
         assert!(
             store
@@ -1835,6 +1937,77 @@ mod tests {
                 .summaries_touching(&workspace.project, "src/c.rs", 5)?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_marks_keep_reverted_over_disputed_and_go_with_either_summary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&Storage::resolve(Some(temp.path().join("data")))?)?;
+        let workspace = Workspace::read(temp.path());
+        let finish = |reply: i64, marks: &[(Option<i64>, &'static str)]| -> Result<i64> {
+            let anchor = Record {
+                id: reply,
+                ..anchor(&workspace)
+            };
+            let key = format!("summary:{reply}");
+            store.finish_observation(
+                &anchor,
+                summary(&workspace, &key, "Change: x"),
+                0,
+                false,
+                SummaryIndex {
+                    files: &[],
+                    commits: &[],
+                    marks,
+                },
+            )?;
+            Ok(store
+                .db
+                .query_row("SELECT id FROM events WHERE event_key = ?1", [key], |row| {
+                    row.get(0)
+                })?)
+        };
+        let first = finish(1, &[])?;
+        let second = finish(2, &[(Some(first), "reverted"), (None, "disputed")])?;
+        let third = finish(3, &[(Some(first), "disputed")])?;
+        let statuses = store.summary_statuses(&[first, second, third])?;
+        assert_eq!(statuses[&first], ("reverted".to_owned(), Some(second)));
+        assert_eq!(statuses[&second], ("disputed".to_owned(), None));
+        assert!(!statuses.contains_key(&third));
+        store
+            .db
+            .execute("DELETE FROM events WHERE id = ?1", [second])?;
+        assert!(store.summary_statuses(&[first, second])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_summary_with_only_an_abandoned_line_counts_as_a_memory() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&Storage::resolve(Some(temp.path().join("data")))?)?;
+        let workspace = Workspace::read(temp.path());
+        let body = "Change: Rework retries\nAbandoned: ran `git reset --hard` after editing a.rs\nOutcome: Done.\nEvidence [#9]";
+        store.finish_observation(
+            &anchor(&workspace),
+            summary(&workspace, "summary:1", body),
+            0,
+            false,
+            SummaryIndex {
+                files: &[],
+                commits: &[],
+                marks: &[],
+            },
+        )?;
+        let id: i64 = store.db.query_row(
+            "SELECT id FROM events WHERE event_key = 'summary:1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(store.live_filtered(&[id], true)?.len(), 1);
+        let plain = body.replace("Abandoned: ran `git reset --hard` after editing a.rs\n", "");
+        store.db.execute("UPDATE events SET body = ?1", [plain])?;
+        assert!(store.live_filtered(&[id], true)?.is_empty());
         Ok(())
     }
 }

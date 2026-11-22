@@ -799,6 +799,7 @@ fn action_recall(
         Ok(dropped)
     };
     let mut kept: Vec<Record> = Vec::new();
+    let mut statuses = std::collections::HashMap::new();
     if editing {
         let mut targets: Vec<String> = Vec::new();
         for path in edit_path(&event.tool_input)
@@ -822,10 +823,15 @@ fn action_recall(
                     found.len()
                 );
             }
+            statuses.extend(
+                store
+                    .summary_statuses(&found.iter().map(|record| record.id).collect::<Vec<_>>())?,
+            );
             for record in found {
-                let qualifies = ["Decision: ", "Errors seen: "]
+                let qualifies = ["Decision: ", "Errors seen: ", "Abandoned: "]
                     .iter()
                     .any(|fact| crate::distill::summary_fact(&record.body, fact).is_some())
+                    || statuses.contains_key(&record.id)
                     || crate::distill::summary_fact(&record.body, "Checks: ")
                         .is_some_and(|checks| checks.contains("→ failed"));
                 if verdict(&record, qualifies)?.is_none()
@@ -835,9 +841,25 @@ fn action_recall(
                 }
             }
         }
+        // An abandoned, reverted or disputed summary is worth an interruption
+        // before one that merely holds a decision. Within each group, the
+        // more useful and then the newer summary comes first.
+        let flagged = |record: &Record| {
+            crate::distill::summary_fact(&record.body, "Abandoned: ").is_some()
+                || statuses.contains_key(&record.id)
+        };
         kept.sort_by_key(|record| std::cmp::Reverse((record.created_at, record.id)));
         rank_by_use(store, &mut kept)?;
+        kept.sort_by_key(|record| !flagged(record));
         kept.truncate(2);
+        if debug {
+            for record in kept.iter().filter(|record| flagged(record)) {
+                eprintln!(
+                    "Mem in Black action recall: #{} ranked first as abandoned, reverted or disputed",
+                    record.id
+                );
+            }
+        }
     } else if let Some(command) = command {
         let body = format!("{name} command: {command}");
         // A failed command is recorded whole, a passing one as the check segment.
@@ -869,6 +891,7 @@ fn action_recall(
                         .any(|check| line.contains(&format!("`{check}` → failed")))
                 });
             if verdict(&record, failed)?.is_none() {
+                statuses.extend(store.summary_statuses(&[record.id])?);
                 kept.push(record);
             }
         }
@@ -879,7 +902,7 @@ fn action_recall(
     let workspace = Workspace::read(&event.cwd);
     let shown: Vec<&Record> = kept.iter().collect();
     store.record_delivery(source, session, "action", &shown, &[], |records| {
-        render(&workspace, records)
+        render(&workspace, records, &statuses)
     })
 }
 
@@ -1049,8 +1072,10 @@ fn recall(
         evidence.push(outcome);
     }
     let shown: Vec<_> = evidence.iter().collect();
+    let statuses =
+        store.summary_statuses(&shown.iter().map(|record| record.id).collect::<Vec<_>>())?;
     store.record_delivery(source, session, "prompt", &shown, &matched, |records| {
-        render(workspace, records)
+        render(workspace, records, &statuses)
     })
 }
 
@@ -1332,12 +1357,18 @@ fn record_context(
     session: &str,
     records: &[&Record],
 ) -> Result<Option<String>> {
+    let statuses =
+        store.summary_statuses(&records.iter().map(|record| record.id).collect::<Vec<_>>())?;
     store.record_delivery(source, session, "handoff", records, &[], |records| {
-        render(workspace, records)
+        render(workspace, records, &statuses)
     })
 }
 
-fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
+fn render(
+    workspace: &Workspace,
+    records: &[&Record],
+    statuses: &std::collections::HashMap<i64, (String, Option<i64>)>,
+) -> Option<String> {
     if records.is_empty() {
         return None;
     }
@@ -1357,13 +1388,21 @@ fn render(workspace: &Workspace, records: &[&Record]) -> Option<String> {
             }
             _ => String::new(),
         };
+        let note = statuses
+            .get(&record.id)
+            .map_or_else(String::new, |(status, by)| match (status.as_str(), by) {
+                ("reverted", Some(id)) => format!(" • later reverted in #{id}"),
+                ("reverted", None) => " • later reverted".to_owned(),
+                _ => " • disputed by the user".to_owned(),
+            });
         result.push_str(&format!(
-            "\n\n[{} #{} • {}{}{}]\n{}",
+            "\n\n[{} #{} • {}{}{}{}]\n{}",
             record.source,
             record.id,
             record.kind,
             branch_state(workspace, record),
             state,
+            note,
             if record.kind == "summary" && is_local_summary(&record.body) {
                 summary_excerpt(&record.body)
             } else if matches!(record.kind.as_str(), "tool" | "assistant") {
@@ -1438,6 +1477,7 @@ fn summary_excerpt(body: &str) -> String {
         lines.push(cut(outcome, 230).to_owned());
     }
     for prefix in [
+        "Abandoned: ",
         "Checks: ",
         "Errors seen: ",
         "Decision: ",

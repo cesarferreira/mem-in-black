@@ -1,6 +1,6 @@
 use crate::{
     hooks::cut,
-    store::{Observation, Store},
+    store::{Observation, Record, Store},
     summaries::Settings,
     workspace::Workspace,
 };
@@ -75,6 +75,8 @@ pub fn process_one(
     {
         facts.add_commits(prompt, commits, files);
     }
+    let project = store.project_of(anchor.id)?;
+    let marks = status_marks(store, &anchor, request.copied(), &project, &facts.commits)?;
     let mut references = Vec::new();
     if let Some(first) = sources.first() {
         references.push(first.id);
@@ -123,7 +125,7 @@ pub fn process_one(
         .max(0);
     let workspace = Workspace {
         root: anchor.workspace.clone(),
-        project: store.project_of(anchor.id)?,
+        project,
         head: anchor.head.clone(),
         git_ref: anchor.git_ref.clone(),
     };
@@ -141,8 +143,11 @@ pub fn process_one(
         },
         tokens,
         refreshing,
-        &facts.files,
-        &facts.commit_hashes(),
+        crate::store::SummaryIndex {
+            files: &facts.files,
+            commits: &facts.commit_hashes(),
+            marks: &marks,
+        },
     )?;
     Ok(true)
 }
@@ -202,4 +207,116 @@ fn commits(
         }
     }
     Some((commits, files))
+}
+
+/// Openings of a prompt that rejects the result of the turn before it.
+const REJECTIONS: [&str; 7] = [
+    "that didn't work",
+    "that did not work",
+    "still failing",
+    "still broken",
+    "revert that",
+    "undo that",
+    "undo this",
+];
+
+/// Whether `prompt` opens by saying the previous result did not work.
+fn rejects(prompt: &str) -> bool {
+    let lead = prompt
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .replace('’', "'")
+        .to_lowercase();
+    REJECTIONS.iter().any(|phrase| {
+        lead.strip_prefix(phrase)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+    })
+}
+
+/// The summaries whose standing this turn changes, as `(summary, status)`: an
+/// earlier summary a `Revert` commit of this turn undoes is `reverted`; the
+/// previous turn's summary is `disputed` when this turn's prompt rejects its
+/// result. `(None, "disputed")` marks the summary being written, when the
+/// session's next prompt already rejects it.
+fn status_marks(
+    store: &Store,
+    anchor: &Record,
+    request: Option<&Record>,
+    project: &str,
+    commits: &[String],
+) -> Result<Vec<(Option<i64>, &'static str)>> {
+    let mut marks = Vec::new();
+    if let Some(request) = request
+        && rejects(&request.body)
+        && let Some(previous) = store.previous_reply(request)?
+        && let Some(summary) = store.summary_of(&previous)?
+    {
+        marks.push((Some(summary.id), "disputed"));
+    }
+    if let Some(next) = store.next_prompt(anchor)?
+        && rejects(&next.body)
+    {
+        marks.push((None, "disputed"));
+    }
+    for hash in reverted_commits(&anchor.workspace, commits) {
+        for summary in store.summaries_with_commit(project, &hash)? {
+            marks.push((Some(summary.id), "reverted"));
+        }
+    }
+    Ok(marks)
+}
+
+/// The full hash each `Revert "…"` commit among `commits` says it reverts,
+/// read from the `This reverts commit <hash>.` line of its message.
+fn reverted_commits(root: &str, commits: &[String]) -> Vec<String> {
+    commits
+        .iter()
+        .filter_map(|commit| {
+            let (short, subject) = commit.split_once(' ')?;
+            subject.starts_with("Revert ").then_some(())?;
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["log", "-1", "--format=%b", short])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            let body = String::from_utf8_lossy(&output.stdout);
+            let hash: String = body
+                .split("This reverts commit ")
+                .nth(1)?
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            (hash.len() >= 7).then_some(hash)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_prompt_that_opens_with_a_rejection_disputes_the_last_result() {
+        for prompt in [
+            "That didn't work.",
+            "that didn’t work, the retry still resets",
+            "  \"Still failing\" on CI",
+            "Revert that please",
+            "undo this",
+            "That did not work",
+        ] {
+            assert!(rejects(prompt), "{prompt}");
+        }
+        for prompt in [
+            "Why did that not work before?",
+            "Add a test that didn't work earlier",
+            "Revert thatcher's patch",
+            "Is it still failing?",
+            "",
+        ] {
+            assert!(!rejects(prompt), "{prompt}");
+        }
+    }
 }

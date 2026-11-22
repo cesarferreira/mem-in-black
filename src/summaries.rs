@@ -29,6 +29,7 @@ Return only a JSON object with these keys:
   \"title\": what was done or found, at most 10 words, written as a description of the work (not a copy of the user's words)
   \"outcome\": one sentence: what is true now as a result of the turn
   \"decision\": one sentence naming a choice the agent made and why, or null if the reply states none
+  \"abandoned\": an approach that was tried and given up, and why, as one sentence; null when none
   \"next\": one sentence naming the next step the reply gives, or null if it gives none
 Keep identifiers such as PR numbers, commit hashes, ticket keys, file names and measurements.
 Use only information in the input. Never invent files, commits, numbers or results.";
@@ -162,6 +163,9 @@ pub struct Narrative {
     pub title: String,
     pub outcome: String,
     pub decision: Option<String>,
+    /// Why an approach was given up. `Facts::narrate` keeps it only when the
+    /// tool records also show a dead end.
+    pub abandoned: Option<String>,
     pub next: Option<String>,
     pub tokens: i64,
 }
@@ -382,6 +386,7 @@ pub fn parse(text: &str, tokens: i64) -> Result<Narrative> {
         title: field("title", 120).context("the model returned no title")?,
         outcome: field("outcome", 400).context("the model returned no outcome")?,
         decision: field("decision", 300),
+        abandoned: field("abandoned", 300),
         next: field("next", 300),
         tokens,
     })
@@ -400,6 +405,7 @@ mod tests {
                 title: "Fixed the retry reset".into(),
                 outcome: "Retries now wait for the handshake.".into(),
                 decision: None,
+                abandoned: None,
                 next: None,
                 tokens: 7,
             }
