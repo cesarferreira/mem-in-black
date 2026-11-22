@@ -60,6 +60,14 @@ struct Forget {
     ids: Vec<i64>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct Why {
+    /// File to ask about: absolute, or relative to the server's working directory.
+    path: String,
+    /// Line of the file, counted from 1. Omit for the file's most recent agent work.
+    line: Option<u32>,
+}
+
 #[derive(Serialize)]
 struct IndexEntry {
     id: i64,
@@ -148,6 +156,19 @@ impl MemoryServer {
                 .rev()
                 .map(IndexEntry::from)
                 .collect::<Vec<_>>())
+        })
+    }
+
+    #[tool(
+        description = "Show why code is the way it is: for a line, the earlier agent turn whose commit wrote it, with the original request, decision, checks, commit and evidence IDs; without a line, the file's recent agent turns. Call this before changing code whose purpose is unclear. Entries with origin `file` are only the last agent work on the file, not proof of where the line came from."
+    )]
+    async fn why(
+        &self,
+        Parameters(input): Parameters<Why>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.run(|store| {
+            let target = crate::why::resolve(&input.path, None)?;
+            Ok(crate::why::lookup(store, &target.workspace, &target.path, input.line)?.entries)
         })
     }
 

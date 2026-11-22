@@ -895,10 +895,6 @@ impl Store {
     /// Summaries of `project` that made the commit `hash`, newest first. The
     /// index holds short hashes, so `hash` may be a full hash or a short one
     /// of at least 7 characters.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first called by recall at the point of action")
-    )]
     pub fn summaries_with_commit(&self, project: &str, hash: &str) -> Result<Vec<Record>> {
         // Stored hashes are exactly 7 characters, so one is a prefix of `hash`,
         // or the reverse, exactly when it equals `hash`'s first 7.

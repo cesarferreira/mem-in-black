@@ -3451,3 +3451,216 @@ fn a_check_that_failed_and_was_later_fixed_is_not_recalled() {
     );
     assert!(brief.is_none(), "{brief:?}");
 }
+
+fn commit_file(workspace: &Workspace, file: &str, text: &str, message: &str) {
+    std::fs::create_dir_all(workspace.repo.join(file).parent().unwrap()).unwrap();
+    std::fs::write(workspace.repo.join(file), text).unwrap();
+    git(&workspace.repo, &["add", "-A"]);
+    git(
+        &workspace.repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+/// An agent turn that commits `src/ws.rs` with one line, checks the work and
+/// explains why, then gets summarized.
+fn agent_turn_commits_ws(workspace: &Workspace) {
+    workspace.hook(
+        "claude",
+        "first",
+        "UserPromptSubmit",
+        json!({"prompt":"Fix the websocket retry regression"}),
+    );
+    commit_file(
+        workspace,
+        "src/ws.rs",
+        "reset after handshake\n",
+        "fix: reset the retry counter later",
+    );
+    workspace.hook(
+        "claude",
+        "first",
+        "PostToolUse",
+        json!({"tool_name":"Bash","tool_use_id":"check","tool_input":{"command":"cargo test websocket_retry"},"tool_response":"test result: ok. 3 passed; 0 failed"}),
+    );
+    workspace.hook(
+        "claude",
+        "first",
+        "Stop",
+        json!({"last_assistant_message":"I moved the reset after the handshake because the handshake clears the counter."}),
+    );
+    workspace.run(&["observe"], None);
+}
+
+fn why_json(workspace: &Workspace, target: &str) -> Vec<Value> {
+    let out = workspace.run(&["why", target, "--json"], None);
+    serde_json::from_str::<Value>(&out)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn why_resolves_a_line_committed_during_a_turn_to_its_request_and_decision() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+
+    let text = workspace.run(&["why", "src/ws.rs:1"], None);
+    for expected in [
+        "Request   Fix the websocket retry regression",
+        "Decision  I moved the reset after the handshake because the handshake clears the counter.",
+        "Checks    `cargo test websocket_retry` → passed",
+        "fix: reset the retry counter later",
+        "Evidence  #",
+    ] {
+        assert!(text.contains(expected), "{expected}\n{text}");
+    }
+    assert!(!text.contains("Last agent work"), "{text}");
+
+    let entries = why_json(&workspace, "src/ws.rs:1");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["origin"], "line");
+    assert_eq!(entry["agent"], "claude");
+    assert_eq!(entry["request"], "Fix the websocket retry regression");
+    assert!(
+        entry["decision"]
+            .as_str()
+            .unwrap()
+            .contains("because the handshake clears the counter")
+    );
+    assert!(
+        entry["commit"]
+            .as_str()
+            .unwrap()
+            .ends_with(" fix: reset the retry counter later"),
+        "{entry}"
+    );
+    assert!(!entry["evidence"].as_array().unwrap().is_empty(), "{entry}");
+
+    // Without a line, the file's agent work comes back newest first.
+    let entries = why_json(&workspace, "src/ws.rs");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["origin"], "file");
+    assert_eq!(entries[0]["id"], entry["id"]);
+}
+
+#[test]
+fn why_reports_no_agent_origin_for_a_human_commit_and_shows_the_fallback() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+    commit_file(
+        &workspace,
+        "src/ws.rs",
+        "reset after handshake\nlog the reset\n",
+        "chore: log the reset",
+    );
+
+    let text = workspace.run(&["why", "src/ws.rs:2"], None);
+    assert!(text.contains("no agent turn made commit"), "{text}");
+    assert!(text.contains("Last agent work on this file:"), "{text}");
+    assert!(
+        text.contains("Request   Fix the websocket retry regression"),
+        "{text}"
+    );
+    let entries = why_json(&workspace, "src/ws.rs:2");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["origin"], "file");
+
+    // The first line is still the agent's.
+    assert_eq!(why_json(&workspace, "src/ws.rs:1")[0]["origin"], "line");
+
+    // A file no agent worked on has no origin and no fallback.
+    commit_file(&workspace, "src/human.rs", "fn main() {}\n", "feat: human");
+    let text = workspace.run(&["why", "src/human.rs:1"], None);
+    assert!(text.contains("no agent turn made commit"), "{text}");
+    assert!(text.contains("No agent work on src/human.rs"), "{text}");
+    assert!(why_json(&workspace, "src/human.rs:1").is_empty());
+}
+
+#[test]
+fn why_treats_an_uncommitted_line_as_not_committed_yet() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+    std::fs::write(
+        workspace.repo.join("src/ws.rs"),
+        "reset after handshake\nunsaved edit\n",
+    )
+    .unwrap();
+
+    let text = workspace.run(&["why", "src/ws.rs:2"], None);
+    assert!(text.contains("not committed yet"), "{text}");
+    assert!(text.contains("Last agent work on this file:"), "{text}");
+    assert_eq!(why_json(&workspace, "src/ws.rs:2")[0]["origin"], "file");
+}
+
+#[test]
+fn why_resolves_paths_from_a_subdirectory_and_an_absolute_path() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+    let from_sub = |target: &str| {
+        let output = workspace
+            .command()
+            .current_dir(workspace.repo.join("src"))
+            .args(["why", target, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(from_sub("ws.rs:1")[0]["origin"], "line");
+    assert_eq!(from_sub("../src/ws.rs")[0]["origin"], "file");
+    let absolute = workspace.repo.join("src/ws.rs");
+    assert_eq!(
+        why_json(&workspace, &format!("{}:1", absolute.display()))[0]["origin"],
+        "line"
+    );
+}
+
+#[test]
+fn why_outside_a_git_repository_is_a_clear_error() {
+    let workspace = Workspace::new();
+    let plain = workspace.temp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::write(plain.join("notes.txt"), "hello\n").unwrap();
+    let output = workspace
+        .command()
+        .current_dir(&plain)
+        .args(["why", "notes.txt:1"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not inside a Git repository"), "{stderr}");
+}
+
+#[test]
+fn mcp_why_returns_the_same_entries_as_the_cli() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+    let path = workspace.repo.join("src/ws.rs");
+    let results = mcp_calls(
+        &workspace,
+        &[json!({"name":"why","arguments":{"path": path, "line": 1}})],
+    );
+    let entries: Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(
+        entries,
+        Value::Array(why_json(&workspace, "src/ws.rs:1")),
+        "{results:?}"
+    );
+    assert_eq!(entries[0]["origin"], "line");
+}

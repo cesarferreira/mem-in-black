@@ -18,19 +18,23 @@ node bench/run.mjs --validate            # free, no model calls
 make bench-validate                      # same, builds first
 
 node bench/run.mjs --task handoff-currency --runs 1 --model haiku --out /tmp/smoke.md
-node bench/run.mjs                       # everything: 12 tasks x 5 runs x 2 arms
-make bench BENCH_ARGS="--runs 3"         # same through make, builds first
+                                         # prints the session count and the cost ceiling, starts nothing
+node bench/run.mjs --task handoff-currency --runs 1 --model haiku --out /tmp/smoke.md --yes
+node bench/run.mjs --yes                 # everything: 12 tasks x 5 runs x 2 arms
+make bench                               # builds, prints the estimate and the command to run; never passes --yes
+make bench BENCH_ARGS="--runs 3 --yes"   # starts a paid run through make
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--validate` | | Check every task and the isolation, then exit. No model calls. |
+| `--yes` | | Required to start any paid run. Without it the benchmark prints the number of sessions and the cost ceiling (sessions x `--budget`) and exits without calling a model. |
 | `--task a,b` | all | Run only these tasks. |
 | `--runs N` | 5 | Runs per task and arm. |
 | `--model name` | Claude Code's default | Passed to `claude --model`. |
-| `--out file` | `bench/RESULTS.md` | Results table. Raw per-run data goes beside it as `*.runs.json`. |
+| `--out file` | `bench/RESULTS.md` | Results table. Raw data goes beside it: `*.runs.jsonl` (one row appended as each run finishes) and `*.runs.json`. |
 | `--budget usd` | 2 | `--max-budget-usd` for each run. `0` removes the cap. A run stopped by the cap counts as a failure. |
-| `--timeout s` | 900 | Wall-clock limit for each run. A timeout counts as a failure. |
+| `--timeout s` | 900 | Wall-clock limit for each run; the run's whole process group is killed. A timeout counts as a failure. |
 | `--keep` | | Keep the temporary directories (repos, data dirs, Claude Code debug logs). |
 
 `MIB_BENCH_BINARY` selects the `mib` binary. Without it the benchmark uses
@@ -42,8 +46,9 @@ database through `node:sqlite`), `git`, `sh`, and for real runs a logged-in
 
 ## What it costs
 
-**A full run spends real tokens, so it is manual and never part of CI.** It is
-12 tasks x 5 runs x 2 arms = 120 `claude -p` sessions, one after another.
+**A full run spends real tokens, so it is manual, never part of CI, and refuses
+to start without `--yes`.** It is 12 tasks x 5 runs x 2 arms = 120 `claude -p`
+sessions, one after another.
 
 One smoke run (`handoff-currency`, `--model haiku`, one run per arm) used
 117,114 input tokens and 2,849 output tokens with memory, and 64,271 input and
@@ -65,9 +70,20 @@ assumed.
   `--data-dir <run's data dir>`. Claude Code is started with
   `--setting-sources project --settings <that file> --strict-mcp-config --mcp-config <that file>`.
   Your global hooks (`~/.claude/settings.json`), plugins and MCP servers are not
-  loaded; the run's `--no-session-persistence` keeps its transcript out of
-  `~/.claude/projects`. Your `~/.claude/CLAUDE.md` is not part of the isolation
-  and may still be loaded; it applies equally to both arms.
+  loaded.
+- **Claude Code's own auto-memory is off in both arms.** It is a second memory
+  channel and writes under `~/.claude/projects`. The generated settings carry
+  `autoMemoryEnabled: false` and the `claude` process runs with
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. `--validate` verifies it without a model
+  call: it starts Claude Code against an address where nothing listens, once
+  with these switches and once without, and checks that only the run without them
+  creates a project directory under `~/.claude/projects` (if that control run
+  creates none, the check reports UNVERIFIED). `--no-session-persistence` keeps
+  the transcript out. After every run the benchmark also deletes any
+  `~/.claude/projects` entry named for its own temp directory (it only matches the
+  exact `mib-bench-XXXXXX` shape). Your `~/.claude/CLAUDE.md` is not part of the
+  isolation and may still be loaded; it applies equally to both arms, and its size
+  and hash are recorded in the results.
 - **Every `mib` process is pinned twice.** The commands in the config carry
   `--data-dir`, and the `claude` process runs with `MIB_DATA_DIR` set to the same
   directory. An explicit `--data-dir` wins over `MIB_DATA_DIR` (clap precedence;
@@ -180,3 +196,17 @@ checks that `check.sh` fails on the untouched repo and passes after
 every group except control, the recall hook injects every `expect.txt` line for
 `prompt.txt` (a control task reports whether recall fires). It also rejects a
 prompt that already contains an `expect.txt` fact.
+
+Results survive failure. Each run's row is appended to `*.runs.jsonl` the moment
+it finishes, and `RESULTS.md` is written (marked **PARTIAL**) on any exit,
+including Ctrl-C, a failed isolation check and three unusable results in a row. A
+run that times out or whose `claude` prints no JSON is a recorded failed run with
+null tokens and tool calls: the medians skip it and the table's `medians over`
+column says how many runs each median covers. A missing login aborts instead,
+since every run would fail the same way.
+
+`--validate` builds each task's repo from the files a checkout would contain
+(tracked, or untracked and not git-ignored) and fails if a fixture file is
+git-ignored. State that is meant to be ignored, such as `failure-cache`'s stale
+`.cache/`, is created by an optional `setup.sh` in the task directory, which runs
+in the repo after the fixture is committed.

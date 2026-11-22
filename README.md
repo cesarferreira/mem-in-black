@@ -111,11 +111,13 @@ Work as usual. Mem in Black stays quiet until it has something relevant:
 - **Recall at the point of action.** When an agent is about to edit a file or run a check that has history, it is reminded of it first. Editing a file recalls up to two earlier decisions, errors or failed checks from other sessions that touched that file. Running a check recalls the last time another session saw that same command fail. Each summary is shown once per session, a session gets at most five of these reminders, and nothing is recalled in a private turn. `MIB_ACTION_RECALL=0` turns it off.
 - **Handoff.** Open another supported agent in the same worktree and branch and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.” A detached HEAD uses an exact commit match. Earlier records without branch information are still searchable.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
+- **Why.** `mib why src/foo.rs:42` runs `git blame` on that line and shows the agent turn that committed it: the original request, the decision, the checks, the commit and the evidence IDs. A line committed by a person, or not committed yet, shows the newest agent work on the file instead, labelled as that. `mib why src/foo.rs` lists the file's last 10 turns, and `--json` prints the same fields with an `origin` of `line` or `file`.
 - **Viewer.** `mib open` starts on **Memories**, with work summaries, saved notes, and imported observations. Open **Source evidence** to see the underlying records or switch to **Activity** to browse and search the full log.
 - **Startup preview.** A new session shows the latest work summaries for the worktree, with their commits. Before the first summary exists, it shows recent activity. `MIB_STARTUP_PREVIEW=0` hides it.
 - **Privacy.** Wrap text in `<private>…</private>` and that turn is not captured.
 
 Agents can also call the MCP tools `search`, `timeline`, `get_observations`,
+`why` (a line or file back to the request and decision behind it),
 `save_memory` (with `replaces` to correct old records) and `forget`.
 Pass `memories_only: true` to `search` for decisions and completed work.
 
@@ -158,6 +160,7 @@ you describe a problem in different words than the record used.
 | `mib open` | Print the live viewer URL and open it in your default browser, starting the worker if needed |
 | `mib status` | Worker state, database path and the private viewer URL |
 | `mib search "query"` | Search memory (`--workspace .` for one worktree) |
+| `mib why <file>[:<line>]` | The request, decision and checks behind a line or file (`--json`, `--workspace <dir>`) |
 | `mib preview` | Recent activity for this worktree |
 | `mib forget <id>…` | Delete records and the summaries built from them |
 | `mib export` | All records as JSON lines |
