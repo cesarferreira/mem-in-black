@@ -132,6 +132,8 @@ pub fn process_one(
         },
         tokens,
         refreshing,
+        &facts.files,
+        &facts.commit_hashes(),
     )?;
     Ok(true)
 }

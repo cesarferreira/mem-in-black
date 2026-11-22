@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 10;
+const SCHEMA: i64 = 11;
 /// Version of the local summary format. When it increases, the worker
 /// rebuilds the local summaries of earlier turns in place.
 const SUMMARY_FORMAT: i64 = 2;
@@ -348,6 +348,32 @@ impl Store {
                     "ALTER TABLE events ADD COLUMN git_ref TEXT;
                      CREATE INDEX events_checkout ON events(workspace, git_ref, id DESC);",
                 )?;
+            }
+            if version < 11 {
+                // Which summaries touched a file or made a commit, as an
+                // indexed lookup instead of a scan of the `Files:` lines.
+                migration.execute_batch(
+                    "CREATE TABLE summary_files (
+                       path TEXT NOT NULL, event_id INTEGER NOT NULL, PRIMARY KEY(path, event_id)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX summary_files_event ON summary_files(event_id);
+                     CREATE TABLE summary_commits (
+                       hash TEXT NOT NULL, event_id INTEGER NOT NULL, PRIMARY KEY(hash, event_id)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX summary_commits_event ON summary_commits(event_id);
+                     CREATE TRIGGER summary_index_delete AFTER DELETE ON events BEGIN
+                       DELETE FROM summary_files WHERE event_id = old.id;
+                       DELETE FROM summary_commits WHERE event_id = old.id;
+                     END;",
+                )?;
+                let rows: Vec<(i64, String)> = migration
+                    .prepare("SELECT id, body FROM events WHERE kind = 'summary'")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (id, body) in rows {
+                    let (files, commits) = crate::distill::listed_facts(&body);
+                    index_summary(&migration, id, &files, &commits)?;
+                }
             }
             migration.pragma_update(None, "user_version", SCHEMA)?;
             migration.commit()?;
@@ -835,6 +861,51 @@ impl Store {
         Ok(records)
     }
 
+    /// Summaries of `project` that edited `path`, relative to the worktree
+    /// root, newest first. Superseded summaries are left out.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "first called by recall at the point of action")
+    )]
+    pub fn summaries_touching(
+        &self,
+        project: &str,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        self.query(
+            &format!(
+                "SELECT {RECORD_COLUMNS} FROM summary_files f JOIN events e ON e.id = f.event_id
+                 WHERE f.path = ?2 AND e.project = ?1 AND e.superseded_by IS NULL
+                 ORDER BY e.created_at DESC, e.id DESC LIMIT ?3"
+            ),
+            params![project, path, limit as i64],
+        )
+    }
+
+    /// Summaries of `project` that made the commit `hash`, newest first. The
+    /// index holds short hashes, so `hash` may be a full hash or a short one
+    /// of at least 7 characters.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "first called by recall at the point of action")
+    )]
+    pub fn summaries_with_commit(&self, project: &str, hash: &str) -> Result<Vec<Record>> {
+        // Stored hashes are exactly 7 characters, so one is a prefix of `hash`,
+        // or the reverse, exactly when it equals `hash`'s first 7.
+        let Some(short) = hash.get(..7) else {
+            return Ok(Vec::new());
+        };
+        self.query(
+            &format!(
+                "SELECT {RECORD_COLUMNS} FROM summary_commits c JOIN events e ON e.id = c.event_id
+                 WHERE c.hash = ?2 AND e.project = ?1 AND e.superseded_by IS NULL
+                 ORDER BY e.created_at DESC, e.id DESC"
+            ),
+            params![project, short.to_ascii_lowercase()],
+        )
+    }
+
     /// Delete records, the summaries built from them and their delivery history.
     pub fn forget(&self, ids: &[i64]) -> Result<usize> {
         let _guard = self.write_guard()?;
@@ -1296,10 +1367,13 @@ impl Store {
         summary: Observation<'_>,
         reported_tokens: i64,
         replace: bool,
+        files: &[String],
+        commits: &[&str],
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
-        if self.insert(summary, Some(anchor.created_at))? {
+        let inserted = self.insert(summary, Some(anchor.created_at))?;
+        if inserted {
             self.add_metric("observer_tokens", reported_tokens)?;
         } else if replace {
             transaction.execute(
@@ -1307,6 +1381,18 @@ impl Store {
                  WHERE source = ?2 AND session = ?3 AND event_key = ?4 AND body != ?1",
                 params![summary.body, summary.source, summary.session, summary.key],
             )?;
+        }
+        if inserted || replace {
+            let id: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM events WHERE source = ?1 AND session = ?2 AND event_key = ?3",
+                    params![summary.source, summary.session, summary.key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = id {
+                index_summary(&transaction, id, files, commits)?;
+            }
         }
         transaction.execute(
             "INSERT INTO memory_meta VALUES ('observe_cursor', ?1)
@@ -1348,6 +1434,26 @@ impl Store {
             .query_map(params, row_record)?
             .collect::<rusqlite::Result<_>>()?)
     }
+}
+
+/// Replaces the index rows of summary `id` with `files` and `commits`.
+fn index_summary(
+    db: &Connection,
+    id: i64,
+    files: &[impl AsRef<str>],
+    commits: &[impl AsRef<str>],
+) -> rusqlite::Result<()> {
+    db.execute("DELETE FROM summary_files WHERE event_id = ?1", [id])?;
+    db.execute("DELETE FROM summary_commits WHERE event_id = ?1", [id])?;
+    let mut file = db.prepare_cached("INSERT OR IGNORE INTO summary_files VALUES (?1, ?2)")?;
+    for path in files {
+        file.execute(params![path.as_ref(), id])?;
+    }
+    let mut commit = db.prepare_cached("INSERT OR IGNORE INTO summary_commits VALUES (?1, ?2)")?;
+    for hash in commits {
+        commit.execute(params![hash.as_ref(), id])?;
+    }
+    Ok(())
 }
 
 fn connect(path: &Path) -> Result<Connection> {
@@ -1454,6 +1560,120 @@ mod tests {
             .db
             .pragma_query_value(None, "quick_check", |row| row.get(0))?;
         assert_eq!(integrity, "ok");
+        Ok(())
+    }
+
+    fn summary<'a>(workspace: &'a Workspace, turn: &'a str, body: &'a str) -> Observation<'a> {
+        Observation {
+            source: "claude",
+            session: "s",
+            key: Some(turn),
+            turn_id: None,
+            kind: "summary",
+            body,
+            workspace,
+            source_bytes: None,
+        }
+    }
+
+    fn anchor(workspace: &Workspace) -> Record {
+        Record {
+            id: 1,
+            source: "claude".into(),
+            session: "s".into(),
+            kind: "assistant".into(),
+            body: String::new(),
+            workspace: workspace.root.clone(),
+            head: None,
+            created_at: 100,
+            turn_id: None,
+            project: workspace.project.clone(),
+            git_ref: None,
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_summary_replaces_its_index_rows_and_lookups_skip_stale_and_foreign_ones()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&Storage::resolve(Some(temp.path().join("data")))?)?;
+        let workspace = Workspace::read(temp.path());
+        let other = Workspace {
+            project: "/elsewhere/.git".into(),
+            ..workspace.clone()
+        };
+        let anchor = anchor(&workspace);
+        let first = ["src/a.rs".to_owned(), "src/b.rs".to_owned()];
+        store.finish_observation(
+            &anchor,
+            summary(&workspace, "summary:1", "Change: one"),
+            0,
+            false,
+            &first,
+            &["abc1234"],
+        )?;
+        let id = store.summaries_touching(&workspace.project, "src/a.rs", 5)?[0].id;
+        assert_eq!(
+            store.summaries_touching(&workspace.project, "src/b.rs", 5)?[0].id,
+            id
+        );
+        assert!(
+            store
+                .summaries_touching(&other.project, "src/a.rs", 5)?
+                .is_empty()
+        );
+
+        store.finish_observation(
+            &anchor,
+            summary(&workspace, "summary:1", "Change: two"),
+            0,
+            true,
+            &["src/b.rs".to_owned(), "src/c.rs".to_owned()],
+            &["def5678"],
+        )?;
+        assert!(
+            store
+                .summaries_touching(&workspace.project, "src/a.rs", 5)?
+                .is_empty()
+        );
+        assert_eq!(
+            store.summaries_touching(&workspace.project, "src/c.rs", 5)?[0].body,
+            "Change: two"
+        );
+        assert!(
+            store
+                .summaries_with_commit(&workspace.project, "abc1234ffff")?
+                .is_empty()
+        );
+        let full = "def5678aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(
+            store.summaries_with_commit(&workspace.project, full)?[0].id,
+            id
+        );
+        assert_eq!(
+            store.summaries_with_commit(&workspace.project, "def5678")?[0].id,
+            id,
+            "a short hash matches too"
+        );
+        assert!(
+            store
+                .summaries_with_commit(&workspace.project, "def567")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .summaries_with_commit(&other.project, full)?
+                .is_empty()
+        );
+
+        store
+            .db
+            .execute("UPDATE events SET superseded_by = 99", [])?;
+        assert!(
+            store
+                .summaries_touching(&workspace.project, "src/c.rs", 5)?
+                .is_empty()
+        );
         Ok(())
     }
 }

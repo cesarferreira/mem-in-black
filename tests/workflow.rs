@@ -2209,7 +2209,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     let export = workspace.run(&["export"], None);
     assert!(
         export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
@@ -2885,5 +2885,158 @@ fn the_summary_model_session_is_not_recorded() {
             .run(&["search", "summarize this turn"], None)
             .trim(),
         "[]"
+    );
+}
+
+impl Workspace {
+    /// Rows of one summary-index table as `(key, event_id)`, ordered.
+    fn index_rows(&self, table: &str, key: &str) -> Vec<(String, i64)> {
+        let database =
+            rusqlite::Connection::open(self.temp.path().join("data/memory.sqlite3")).unwrap();
+        let mut statement = database
+            .prepare(&format!(
+                "SELECT {key}, event_id FROM {table} ORDER BY {key}"
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// One turn that edits `files` and commits them, then summarizes it.
+    fn turn_that_edits(&self, files: &[String], commit: bool) {
+        self.hook(
+            "claude",
+            "editor",
+            "UserPromptSubmit",
+            json!({"prompt": "Rename the retry helpers"}),
+        );
+        for (index, file) in files.iter().enumerate() {
+            let path = self.repo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("fn f{index}() {{}}\n")).unwrap();
+            self.hook(
+                "claude",
+                "editor",
+                "PostToolUse",
+                json!({"tool_name":"Edit","tool_use_id":format!("e{index}"),
+                    "tool_input":{"file_path": path,"old_string":"a","new_string":"b"},
+                    "tool_response":{}}),
+            );
+        }
+        if commit {
+            git(&self.repo, &["add", "."]);
+            git(
+                &self.repo,
+                &[
+                    "-c",
+                    "user.name=Mem in Black",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "Rename retry helpers",
+                ],
+            );
+        }
+        self.hook(
+            "claude",
+            "editor",
+            "Stop",
+            json!({"last_assistant_message":"Renamed the retry helpers."}),
+        );
+        self.run(&["observe"], None);
+    }
+}
+
+fn short_head(workspace: &Workspace) -> String {
+    let output = Command::new("git")
+        .current_dir(&workspace.repo)
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn a_summary_is_indexed_under_every_edited_file_even_when_its_body_lists_eight() {
+    let workspace = Workspace::new();
+    let files: Vec<String> = (0..12).map(|index| format!("src/f{index:02}.rs")).collect();
+    workspace.turn_that_edits(&files, false);
+    let rows = workspace.index_rows("summary_files", "path");
+    let mut expected = files.clone();
+    expected.sort();
+    assert_eq!(
+        rows.iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>(),
+        expected,
+        "paths are relative to the worktree root"
+    );
+    let summary: Value = serde_json::from_str(&workspace.run(&["search"], None)).unwrap();
+    let summary = summary
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "summary")
+        .unwrap();
+    assert_eq!(rows[0].1, summary["id"].as_i64().unwrap());
+    let body = summary["body"].as_str().unwrap();
+    assert!(body.contains("src/f07.rs"), "{body}");
+    assert!(!body.contains("src/f08.rs"), "{body}");
+}
+
+#[test]
+fn forgetting_a_turn_removes_its_summary_from_the_index() {
+    let workspace = Workspace::new();
+    let files: Vec<String> = (0..3).map(|index| format!("src/f{index}.rs")).collect();
+    workspace.turn_that_edits(&files, true);
+    assert_eq!(workspace.index_rows("summary_files", "path").len(), 3);
+    assert_eq!(
+        workspace.index_rows("summary_commits", "hash"),
+        [(
+            short_head(&workspace),
+            workspace.index_rows("summary_files", "path")[0].1
+        )]
+    );
+    let all: Value = serde_json::from_str(&workspace.run(&["search"], None)).unwrap();
+    let assistant = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "assistant")
+        .unwrap();
+    workspace.run(&["forget", &assistant["id"].to_string()], None);
+    assert!(workspace.index_rows("summary_files", "path").is_empty());
+    assert!(workspace.index_rows("summary_commits", "hash").is_empty());
+}
+
+#[test]
+fn a_version_ten_database_gets_its_summary_index_backfilled() {
+    let workspace = Workspace::new();
+    let files: Vec<String> = (0..3).map(|index| format!("src/f{index}.rs")).collect();
+    workspace.turn_that_edits(&files, true);
+    let files_before = workspace.index_rows("summary_files", "path");
+    let commits_before = workspace.index_rows("summary_commits", "hash");
+    assert_eq!(files_before.len(), 3);
+    assert_eq!(commits_before.len(), 1);
+    let database = workspace.temp.path().join("data/memory.sqlite3");
+    let legacy = rusqlite::Connection::open(&database).unwrap();
+    legacy
+        .execute_batch(
+            "DROP TRIGGER summary_index_delete;
+             DROP TABLE summary_files;
+             DROP TABLE summary_commits;
+             PRAGMA user_version=10;",
+        )
+        .unwrap();
+    drop(legacy);
+    workspace.run(&["search"], None);
+    assert_eq!(workspace.index_rows("summary_files", "path"), files_before);
+    assert_eq!(
+        workspace.index_rows("summary_commits", "hash"),
+        commits_before
     );
 }
