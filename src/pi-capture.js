@@ -85,7 +85,7 @@ export default function (pi) {
     state?.tools.delete(event.toolCallId);
     state?.briefs.delete(event.toolCallId);
     await captureTool(turn, event.toolCallId, event.toolName, event.input, event.content, event.isError, event.details);
-    if (brief && !event.isError && Array.isArray(event.content)) {
+    if (brief && Array.isArray(event.content)) {
       return { content: withToolRecall(event.content, brief) };
     }
   });

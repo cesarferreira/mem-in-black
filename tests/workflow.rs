@@ -3269,19 +3269,25 @@ fn action_recall_is_silent_for_files_without_history_and_in_private_turns() {
     // The same session did the earlier work: it needs no reminder.
     assert!(edit("earlier", "t2", "src/retry.rs", &[]).is_none());
 
+    // A private turn in a session that already has a public one is silent.
+    workspace.start_session("mixed");
     workspace.hook(
         "claude",
-        "secret",
+        "mixed",
         "UserPromptSubmit",
         json!({"turn_id": "p", "prompt": "<private>Update the lockfile</private>"}),
     );
     assert!(
-        edit("secret", "p", "src/retry.rs", &[]).is_none(),
+        edit("mixed", "p", "src/retry.rs", &[]).is_none(),
         "private turn"
     );
 
-    // None of that used up the recall.
+    // None of that used up the recall, in this session or the private one.
     assert!(edit("later", "start", "src/retry.rs", &[]).is_some());
+    assert!(
+        edit("mixed", "start", "src/retry.rs", &[]).is_some(),
+        "a public turn after the private one still recalls"
+    );
 }
 
 #[test]
@@ -3337,28 +3343,61 @@ fn action_recall_without_a_hit_stays_fast_on_a_large_store_and_never_runs_git() 
             })
             .unwrap();
         connection.execute_batch("BEGIN").unwrap();
-        for index in 0..10_000 {
-            let path = format!("src/generated{index}.rs");
+        // Prompts, tool results, replies and summaries, with bodies the size of
+        // real ones, so the full-text index and the tables are realistic.
+        let filler = |index: usize| -> String {
+            (0..150)
+                .map(|word| format!("w{}", (index * 7 + word * 13) % 5000))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for index in 0..10_000usize {
+            let (kind, body) = match index % 4 {
+                0 => (
+                    "prompt",
+                    format!("Rework module {index}: {}", filler(index)),
+                ),
+                1 => (
+                    "tool",
+                    format!(
+                        "Bash command: cargo test case{index}\nResult:\n{}",
+                        filler(index)
+                    ),
+                ),
+                2 => ("assistant", filler(index)),
+                _ => {
+                    let case = index / 4;
+                    (
+                        "summary",
+                        format!(
+                            "Change: Rework generated {case}\nFiles: src/generated{case}.rs\nChecks: `cargo test case{case}` → failed\nDecision: Kept src/generated{case}.rs because of case {case}.\n{}\nEvidence #1",
+                            filler(index)
+                        ),
+                    )
+                }
+            };
             connection
                 .execute(
                     "INSERT INTO events(source, session, event_key, kind, body, workspace, project)
-                     VALUES ('claude', 'bulk', ?1, 'summary', ?2, ?3, ?4)",
+                     VALUES ('claude', ?5, ?1, ?6, ?2, ?3, ?4)",
                     rusqlite::params![
-                        format!("summary:{index}"),
-                        format!(
-                            "Change: Rework generated {index}\nFiles: {path}\nChecks: `cargo test case{index}` → failed\nDecision: Kept {path} because of case {index}.\nEvidence #1"
-                        ),
+                        format!("{kind}:{index}"),
+                        body,
                         root,
-                        project
+                        project,
+                        format!("bulk{}", index % 50),
+                        kind
                     ],
                 )
                 .unwrap();
-            connection
-                .execute(
-                    "INSERT INTO summary_files(path, event_id) VALUES (?1, last_insert_rowid())",
-                    [&path],
-                )
-                .unwrap();
+            if kind == "summary" {
+                connection
+                    .execute(
+                        "INSERT INTO summary_files(path, event_id) VALUES (?1, last_insert_rowid())",
+                        [format!("src/generated{}.rs", index / 4)],
+                    )
+                    .unwrap();
+            }
         }
         connection.execute_batch("COMMIT").unwrap();
         connection
@@ -3404,15 +3443,24 @@ fn action_recall_without_a_hit_stays_fast_on_a_large_store_and_never_runs_git() 
             .unwrap()
     };
     let unread = json!({"file_path": workspace.repo.join("src/untouched.rs")});
-    let baseline = timed("Read", unread.clone());
-    for (tool, input) in [
-        ("Edit", unread),
+    // Process start-up can be slow for the first runs only, so the no-op
+    // baseline is the faster of one before and one after the measured hooks.
+    let before = timed("Read", unread.clone());
+    let measured: Vec<_> = [
+        ("Edit", unread.clone()),
         ("Bash", json!({"command": "cargo test never_failed"})),
-    ] {
-        let elapsed = timed(tool, input);
+        // Its words are in thousands of summaries, none of which ran it.
+        ("Bash", json!({"command": "cargo test"})),
+    ]
+    .into_iter()
+    .map(|(tool, input)| (format!("{tool} {input}"), timed(tool, input)))
+    .collect();
+    let baseline = before.min(timed("Read", unread));
+    for (hook, elapsed) in measured {
+        eprintln!("{hook}: {elapsed:?}, a no-op hook {baseline:?}");
         assert!(
-            elapsed < baseline + std::time::Duration::from_millis(1000),
-            "{tool} took {elapsed:?} on 10,000 records, a no-op hook {baseline:?}"
+            elapsed < baseline + std::time::Duration::from_millis(150),
+            "{hook} took {elapsed:?} on 10,000 records, a no-op hook {baseline:?}"
         );
     }
     assert!(!marker.exists(), "the no-hit path ran git");

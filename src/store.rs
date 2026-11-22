@@ -1025,7 +1025,9 @@ impl Store {
     }
 
     /// Summaries of `project` outside the given session whose `Checks:` line
-    /// lists `check` with any status, newest first.
+    /// lists `check` with any status, newest first. Candidates come from the
+    /// full-text index, so the cost follows the summaries that mention the
+    /// command, not the size of the store.
     pub fn summaries_running_check(
         &self,
         project: &str,
@@ -1034,16 +1036,14 @@ impl Store {
         session: &str,
         limit: usize,
     ) -> Result<Vec<Record>> {
-        let listed = format!("`{check}` → ");
+        let Some(phrase) = check_phrase(check) else {
+            return Ok(Vec::new());
+        };
         let found = self.query(
-            &format!(
-                "SELECT {RECORD_COLUMNS} FROM events e
-                 WHERE e.kind = 'summary' AND e.project = ?1 AND e.superseded_by IS NULL
-                   AND NOT (e.source = ?3 AND e.session = ?4) AND instr(e.body, ?2) > 0
-                 ORDER BY e.created_at DESC, e.id DESC"
-            ),
-            params![project, listed, source, session],
+            &running_check_sql(),
+            params![project, phrase, source, session],
         )?;
+        let listed = format!("`{check}` → ");
         Ok(found
             .into_iter()
             .filter(|record| {
@@ -1677,6 +1677,29 @@ impl Store {
     }
 }
 
+/// The full-text phrase that finds summaries listing `check`: its words in
+/// order, or nothing for a command without any.
+fn check_phrase(check: &str) -> Option<String> {
+    let words: Vec<String> = check
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(24)
+        .map(str::to_lowercase)
+        .collect();
+    (!words.is_empty()).then(|| format!("\"{}\"", words.join(" ")))
+}
+
+/// Newest summaries of a project, outside one session, matching a phrase.
+/// The 50 newest candidates are enough: the caller applies the exact test.
+fn running_check_sql() -> String {
+    format!(
+        "SELECT {RECORD_COLUMNS} FROM event_search JOIN events e ON e.id = event_search.rowid
+         WHERE event_search MATCH ?2 AND e.kind = 'summary' AND e.project = ?1
+           AND e.superseded_by IS NULL AND NOT (e.source = ?3 AND e.session = ?4)
+         ORDER BY e.created_at DESC, e.id DESC LIMIT 50"
+    )
+}
+
 /// The metric that counts a session's recalls at the point of action.
 fn action_counter(source: &str, session: &str) -> String {
     format!("action:{source}:{session}")
@@ -2008,6 +2031,53 @@ mod tests {
         let plain = body.replace("Abandoned: ran `git reset --hard` after editing a.rs\n", "");
         store.db.execute("UPDATE events SET body = ?1", [plain])?;
         assert!(store.live_filtered(&[id], true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_check_lookup_reads_the_full_text_index_and_never_scans_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&Storage::resolve(Some(temp.path().join("data")))?)?;
+        let workspace = Workspace::read(temp.path());
+        store.finish_observation(
+            &anchor(&workspace),
+            summary(
+                &workspace,
+                "summary:1",
+                "Change: one\nChecks: `cargo test retry_loop` → failed\nEvidence #1",
+            ),
+            0,
+            false,
+            SummaryIndex {
+                files: &[],
+                commits: &[],
+                marks: &[],
+            },
+        )?;
+        let found = |check: &str, source: &str| {
+            store
+                .summaries_running_check(&workspace.project, check, source, "s", 5)
+                .map(|records| records.len())
+        };
+        assert_eq!(found("cargo test retry_loop", "codex")?, 1);
+        assert_eq!(found("cargo test retry_loop", "claude")?, 0, "same session");
+        assert_eq!(found("cargo test retry", "codex")?, 0, "exact command only");
+
+        let plan: Vec<String> = store
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", running_check_sql()))?
+            .query_map(params!["p", "\"a b\"", "x", "y"], |row| row.get(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert!(
+            plan.iter().any(|step| step.contains("VIRTUAL TABLE")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN events")
+                || step == "SCAN e"
+                || step.starts_with("SCAN e ")),
+            "{plan:?}"
+        );
         Ok(())
     }
 }
