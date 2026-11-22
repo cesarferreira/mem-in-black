@@ -12,6 +12,7 @@ mod preview;
 mod stats;
 mod store;
 mod summaries;
+mod why;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -112,6 +113,16 @@ enum Command {
         workspace: Option<PathBuf>,
         #[arg(long, default_value_t = 15)]
         limit: usize,
+    },
+    /// Show the request, decision and checks behind a line or file: `why src/foo.rs:42`.
+    Why {
+        /// A file, optionally followed by `:<line>`.
+        target: String,
+        /// Worktree to look in. Defaults to the one containing the file.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -406,6 +417,20 @@ fn main() -> Result<()> {
                     Some(&semantic),
                 )?)?
             );
+        }
+        Command::Why {
+            target,
+            workspace,
+            json,
+        } => {
+            let (path, line) = why::split_line(&target)?;
+            let target = why::resolve(path, workspace.as_deref())?;
+            let lookup = why::lookup(&Store::open(&data)?, &target.workspace, &target.path, line)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&lookup.entries)?);
+            } else {
+                print!("{}", why::text(&target.path, line, &lookup));
+            }
         }
     }
     Ok(())
