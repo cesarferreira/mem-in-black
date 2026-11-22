@@ -7,10 +7,11 @@
 //
 // See bench/README.md. Node's standard library only.
 import { spawn, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, copyFileSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -26,12 +27,13 @@ const fatal = (message) => {
 
 // ------------------------------------------------------------------ arguments
 function parseArguments(argv) {
-  const options = { validate: false, runs: 5, task: null, model: null, out: join(here, "RESULTS.md"), budget: 2, timeout: 900, keep: false };
+  const options = { validate: false, yes: false, runs: 5, task: null, model: null, out: join(here, "RESULTS.md"), budget: 2, timeout: 900, keep: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     const value = () => argv[++i] ?? fatal(`${flag} needs a value`);
     if (flag === "--validate") options.validate = true;
     else if (flag === "--keep") options.keep = true;
+    else if (flag === "--yes") options.yes = true;
     else if (flag === "--task") options.task = value().split(",");
     else if (flag === "--runs") options.runs = Number(value());
     else if (flag === "--model") options.model = value();
@@ -118,15 +120,48 @@ function git(cwd, ...args) {
   if (result.status !== 0) fatal(`git ${args.join(" ")} failed in ${cwd}: ${tail(result.stderr)}`);
 }
 
-/** Copy the task's fixture project, `git init` and commit it. Returns the canonical path. */
+/**
+ * The files of a task's `repo/` that a checkout would contain: tracked, or
+ * untracked and not ignored. `null` outside a git checkout.
+ */
+function fixtureFiles(task) {
+  const listed = sync("git", ["ls-files", "-co", "--exclude-standard", "-z", "--", relative(repoRoot, join(task.dir, "repo"))], { cwd: repoRoot });
+  if (listed.status !== 0) return null;
+  return text(listed.stdout).split("\0").filter(Boolean).map((file) => resolve(repoRoot, file)).filter(existsSync);
+}
+
+/** Fixture files that git ignores: a checkout would not have them. */
+function ignoredFixtureFiles(task) {
+  const listed = sync("git", ["ls-files", "-o", "-i", "--exclude-standard", "-z", "--", relative(repoRoot, join(task.dir, "repo"))], { cwd: repoRoot });
+  return listed.status === 0 ? text(listed.stdout).split("\0").filter(Boolean) : [];
+}
+
+/**
+ * Copy the task's fixture project as a checkout would have it (never git-ignored
+ * files), `git init` and commit it, then run the task's optional `setup.sh` for
+ * state that is not committed. Returns the canonical path.
+ */
 function prepareRepo(task, dir) {
   const repo = join(dir, "repo");
-  mkdirSync(dir, { recursive: true });
-  cpSync(join(task.dir, "repo"), repo, { recursive: true });
+  const source = join(task.dir, "repo");
+  mkdirSync(repo, { recursive: true });
+  const files = fixtureFiles(task);
+  if (files) {
+    for (const file of files) {
+      const target = join(repo, relative(source, file));
+      mkdirSync(dirname(target), { recursive: true });
+      copyFileSync(file, target);
+    }
+  } else cpSync(source, repo, { recursive: true });
   git(repo, "init", "-q", "-b", "main");
   git(repo, "add", "-A");
   git(repo, "commit", "-q", "-m", "Initial commit");
-  return realpathSync(repo);
+  const canonical = realpathSync(repo);
+  if (existsSync(join(task.dir, "setup.sh"))) {
+    const setup = runScript(task, "setup.sh", canonical);
+    if (!setup.ok) fatal(`${task.name}: setup.sh failed: ${setup.output}`);
+  }
+  return canonical;
 }
 
 /** Replay seed.jsonl through `mib hook <host>`, then `mib observe`. */
@@ -163,7 +198,7 @@ function realDatabasePath() {
   if (process.env.MIB_DATA_DIR) return join(resolve(process.env.MIB_DATA_DIR), "memory.sqlite3");
   const config = join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "mem-in-black", "config.toml");
   if (existsSync(config)) {
-    const found = readFileSync(config, "utf8").match(/^\s*database_path\s*=\s*"([^"]+)"/m);
+    const found = readFileSync(config, "utf8").match(/^\s*database_path\s*=\s*["']([^"']+)["']/m);
     if (found) return found[1].replace(/^~\//, `${home}/`);
   }
   return join(process.env.XDG_DATA_HOME ? join(process.env.XDG_DATA_HOME, "mem-in-black") : join(home, ".local/share/mem-in-black"), "memory.sqlite3");
@@ -245,7 +280,8 @@ function installHome(mib, data, home, counter) {
   if (installed.status !== 0) fatal(`mib install failed: ${tail(installed.stderr)}`);
   const settingsPath = join(home, ".claude", "settings.json");
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-  settings.hooks.PreToolUse.push({ hooks: [{ type: "command", command: `echo x >> '${counter}'`, timeout: 2 }] });
+  settings.autoMemoryEnabled = false;
+  settings.hooks.PreToolUse.push({ hooks: [{ type: "command", command: `echo x >> '${counter.replaceAll("'", "'\\''")}'`, timeout: 2 }] });
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
   const mcp = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")).mcpServers;
   const mcpPath = join(home, "mcp.json");
@@ -260,7 +296,7 @@ function installHome(mib, data, home, counter) {
  * commands may appear: a user hook would mean the user's config was loaded.
  */
 function assertOnlyRunHooks(logPath, allowed, context) {
-  if (!existsSync(logPath)) fatal(`${context}: no Claude Code debug log to verify the hooks against`);
+  if (!existsSync(logPath)) return 0;
   const ran = [...readFileSync(logPath, "utf8").matchAll(/Hooks: [A-Za-z:]+ \[(.*)\] finished with/g)].map((match) => match[1]);
   const foreign = ran.filter((command) => !allowed.has(command));
   if (foreign.length > 0) fatal(`${context}: Claude Code ran a hook that is not the run's own, so the user's config leaked in:\n  ${foreign[0]}`);
@@ -294,6 +330,10 @@ async function validate(tasks, ctx) {
     for (const expected of task.expect) {
       if (task.prompt.toLowerCase().includes(expected.toLowerCase())) fail(`prompt.txt already contains the remembered fact "${expected}"`);
     }
+
+    // Nothing the task depends on may be git-ignored: a checkout would not have it.
+    const ignored = ignoredFixtureFiles(task);
+    if (ignored.length > 0) fail(`fixture files ignored by git, so a checkout lacks them: ${ignored.join(", ")}. Create such state from setup.sh instead.`);
 
     // check.sh fails on the untouched repo.
     const untouched = prepareRepo(task, join(dir, "untouched"));
@@ -362,9 +402,11 @@ async function validate(tasks, ctx) {
   assertNoLeak(before, after, "validate");
   console.log(`isolation: ${isolation}`);
   console.log(`isolation: ${describeIsolation(before, after)}`);
+  const memory = await probeAutoMemory(ctx);
+  console.log(`isolation: ${memory.text}`);
 
   console.log(failures.length === 0 ? `\nvalidate: all ${tasks.length} tasks passed` : `\nvalidate: ${failures.length} of ${tasks.length} tasks failed: ${failures.join(", ")}`);
-  return failures.length === 0;
+  return failures.length === 0 && !memory.failed;
 }
 
 /** Start the configured MCP server, save a note through it, and stop it. */
@@ -442,28 +484,107 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+const activeChildren = new Set();
+
+/** Kill a child and everything it started (its MCP server, Bash-tool subprocesses). */
+function killGroup(child) {
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // The group is already gone.
+  }
+}
+
 function runClaude(args, input, env, cwd, timeoutSeconds) {
   return new Promise((resolveRun) => {
-    const child = spawn("claude", args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn("claude", args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+    activeChildren.add(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    const finish = (status, extra = "") => {
+      clearTimeout(timer);
+      killGroup(child);
+      activeChildren.delete(child);
+      resolveRun({ stdout, stderr: `${stderr}${extra}`, status, timedOut });
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killGroup(child);
     }, timeoutSeconds * 1000);
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolveRun({ stdout, stderr: `${stderr}${error.message}`, status: null, timedOut });
-    });
-    child.on("close", (status) => {
-      clearTimeout(timer);
-      resolveRun({ stdout, stderr, status, timedOut });
-    });
+    child.on("error", (error) => finish(null, error.message));
+    child.on("close", (status) => finish(status));
+    child.stdin.on("error", () => {});
     child.stdin.end(input);
   });
+}
+
+/** Claude Code's project directory for this checkout of the benchmark, where it keeps transcripts and auto-memory. */
+const claudeProjectsDir = () => join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
+
+/** Entries of Claude Code's projects directory that belong to this benchmark run's temp directory. */
+function claudeProjectEntries(root) {
+  const name = basename(root);
+  // Strict guard: only the exact mkdtemp shape, so nothing else can ever match.
+  if (!/^mib-bench-[A-Za-z0-9]{6}$/.test(name)) return [];
+  const projects = claudeProjectsDir();
+  if (!existsSync(projects)) return [];
+  return readdirSync(projects).filter((entry) => entry.startsWith("-") && entry.includes(`-${name}-`)).map((entry) => join(projects, entry)).filter((path) => dirname(path) === projects);
+}
+
+/** Remove the project directories Claude Code created for this run's temp directory. */
+function sweepClaudeProjects(root) {
+  for (const path of claudeProjectEntries(root)) rmSync(path, { recursive: true, force: true });
+}
+
+function claudeArguments(settingsPath, mcpPath, debugLog, options) {
+  return [
+    "-p", "--output-format", "json",
+    // Only the run's own settings: the user's global hooks, plugins and MCP servers stay out.
+    "--setting-sources", "project", "--settings", settingsPath,
+    "--strict-mcp-config", "--mcp-config", mcpPath,
+    "--permission-mode", "dontAsk", "--allowed-tools", TOOLS, "--disallowed-tools", "WebFetch,WebSearch",
+    "--no-session-persistence", "--debug-file", debugLog,
+    ...(options.model ? ["--model", options.model] : []),
+    ...(options.budget > 0 ? ["--max-budget-usd", String(options.budget)] : []),
+  ];
+}
+
+function claudeEnvironment(data) {
+  // Claude Code's own auto-memory is a second memory channel and writes into the real ~/.claude: off in both arms.
+  return benchEnvironment(data, { ...GIT_IDENTITY, DISABLE_AUTOUPDATER: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" });
+}
+
+/**
+ * Free check that the auto-memory switches stop Claude Code creating a project
+ * directory under the real ~/.claude. Claude Code is pointed at an address
+ * where nothing listens, so no request can reach a model. A control run with the
+ * switches off must create the directory, or the probe proves nothing.
+ */
+async function probeAutoMemory({ mib, root }) {
+  if (sync("claude", ["--version"]).status !== 0) return { text: "auto-memory: UNVERIFIED (claude is not installed here)" };
+  const probe = async (name, disabled) => {
+    const dir = join(root, name);
+    mkdirSync(join(dir, "repo"), { recursive: true });
+    const repo = realpathSync(join(dir, "repo"));
+    const { settingsPath, mcpPath } = installHome(mib, join(dir, "data"), join(dir, "home"), join(dir, "tools.log"));
+    const env = { ...claudeEnvironment(join(dir, "data")), ANTHROPIC_BASE_URL: "http://127.0.0.1:9" };
+    if (!disabled) {
+      const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+      delete settings.autoMemoryEnabled;
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      delete env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
+    }
+    await runClaude(claudeArguments(settingsPath, mcpPath, join(dir, "claude-debug.log"), { model: null, budget: 0 }), "hi", env, repo, 20);
+    return claudeProjectEntries(root).filter((path) => basename(path).endsWith(`-${basename(root)}-${name}-repo`)).length;
+  };
+  const [off, on] = await Promise.all([probe("probe-off", true), probe("probe-on", false)]);
+  sweepClaudeProjects(root);
+  if (off > 0) return { failed: true, text: `auto-memory: FAILED, Claude Code still created a project directory under ${claudeProjectsDir()} with auto-memory disabled` };
+  if (on === 0) return { text: "auto-memory: UNVERIFIED (the control run with auto-memory on created no project directory either, so the probe cannot tell)" };
+  return { text: `auto-memory: disabled runs create no project directory under ${claudeProjectsDir()}; the control run with it on does` };
 }
 
 function parseResult(stdout) {
@@ -478,6 +599,7 @@ function parseResult(stdout) {
 
 async function oneRun(task, arm, index, ctx) {
   const { mib, root, options, realPath } = ctx;
+  const label = `${task.name} (${arm} ${index})`;
   const dir = join(root, `${task.name}-${arm}-${index}`);
   const data = join(dir, "data");
   const home = join(dir, "home");
@@ -489,64 +611,58 @@ async function oneRun(task, arm, index, ctx) {
   if (arm === "with") seedMemory(task, repo, data, mib);
   const seeded = exportRecords(data, mib).length;
 
-  const args = [
-    "-p", "--output-format", "json",
-    // Only the run's own settings: the user's global hooks, plugins and MCP servers stay out.
-    "--setting-sources", "project", "--settings", settingsPath,
-    "--strict-mcp-config", "--mcp-config", mcpPath,
-    "--permission-mode", "dontAsk", "--allowed-tools", TOOLS, "--disallowed-tools", "WebFetch,WebSearch",
-    "--no-session-persistence", "--debug-file", join(dir, "claude-debug.log"),
-    ...(options.model ? ["--model", options.model] : []),
-    ...(options.budget > 0 ? ["--max-budget-usd", String(options.budget)] : []),
-  ];
-  const env = benchEnvironment(data, { ...GIT_IDENTITY, DISABLE_AUTOUPDATER: "1" });
+  const logPath = join(dir, "claude-debug.log");
   const started = Date.now();
-  const run = await runClaude(args, task.prompt, env, repo, options.timeout);
+  const run = await runClaude(claudeArguments(settingsPath, mcpPath, logPath, options), task.prompt, claudeEnvironment(data), repo, options.timeout);
   const wallSeconds = (Date.now() - started) / 1000;
 
   const result = parseResult(run.stdout);
-  if (!result && !run.timedOut) fatal(`claude -p printed no JSON result for ${task.name} (${arm} ${index}), exit ${run.status}:\n${tail(run.stderr || run.stdout, 800)}`);
-  const toolCalls = readFileSync(counter, "utf8").split("\n").filter(Boolean).length;
-  if (result?.is_error && toolCalls === 0 && /login|auth|api key|credit|billing|rate limit|overloaded|quota|not available|unknown model|model.*not/i.test(text(result.result))) {
-    fatal(`claude -p cannot run: ${text(result.result)}`);
-  }
+  const status = run.timedOut ? "timeout" : result ? "ok" : "no-json";
+  const calls = readFileSync(counter, "utf8").split("\n").filter(Boolean).length;
+  const message = status === "ok" ? text(result.result) : tail(run.stderr || run.stdout, 300);
+  // A machine that cannot authenticate would record every run as a failure: stop instead.
+  if (calls === 0 && (status === "no-json" || result?.is_error) && /not logged in|please run \/login|authentication|api key|credit balance|billing/i.test(message)) fatal(`claude -p cannot run: ${message}`);
 
   // Proof that this run's hooks reached its own data dir, and nothing else's.
-  if (!run.timedOut && assertOnlyRunHooks(join(dir, "claude-debug.log"), commands, `${task.name} (${arm} ${index})`) === 0) {
-    fatal(`${task.name} (${arm} ${index}): the debug log lists no hooks, so the isolation check cannot run. Claude Code's log format may have changed.`);
-  }
+  const hooksRan = assertOnlyRunHooks(logPath, commands, label);
+  if (result && hooksRan === 0) fatal(`${label}: the debug log lists no hooks, so the isolation check cannot run. Claude Code's log format may have changed.`);
   const records = exportRecords(data, mib);
   const captured = records.filter((record) => record.source === "claude").length;
-  if (!run.timedOut && captured === 0) fatal(`${task.name} (${arm} ${index}): claude ran but none of its hooks wrote to the run's data dir ${data}. The benchmark would be measuring the wrong thing.`);
+  if (result && captured === 0) fatal(`${label}: claude ran but none of its hooks wrote to the run's data dir ${data}. The benchmark would be measuring the wrong thing.`);
   const stats = JSON.parse(text(mib(data, ["stats", "--json"]).stdout || "{}"));
   const check = runScript(task, "check.sh", repo);
-  const usage = result?.usage ?? {};
+  // A run that printed no result has no usage to report: null, not zero, so medians skip it.
+  const usage = result ? result.usage ?? {} : null;
 
   const row = {
     task: task.name,
     group: task.group,
     arm,
     index,
+    status,
     success: check.ok,
     checkOutput: check.ok ? "" : check.output,
     timedOut: run.timedOut,
-    isError: result?.is_error ?? null,
-    stopReason: result?.subtype ?? null,
-    inputTokens: (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
-    uncachedInputTokens: usage.input_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-    outputTokens: usage.output_tokens ?? 0,
-    toolCalls,
+    isError: result ? result.is_error ?? null : status === "no-json" ? true : null,
+    stopReason: result?.subtype ?? (status === "no-json" ? "no-json" : null),
+    error: status === "ok" && !result.is_error ? "" : message,
+    inputTokens: usage ? (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) : null,
+    uncachedInputTokens: usage ? usage.input_tokens ?? 0 : null,
+    cacheCreationTokens: usage ? usage.cache_creation_input_tokens ?? 0 : null,
+    cacheReadTokens: usage ? usage.cache_read_input_tokens ?? 0 : null,
+    outputTokens: usage ? usage.output_tokens ?? 0 : null,
+    toolCalls: result ? calls : null,
     turns: result?.num_turns ?? null,
     costUsd: result?.total_cost_usd ?? null,
     wallSeconds,
     seededRecords: seeded,
     recalls: stats.context_injections ?? 0,
     mcpSearches: stats.mcp_searches ?? 0,
+    unusable: status === "no-json" || (status === "ok" && result.is_error === true && calls === 0),
   };
   const leak = await realSnapshot(realPath, [root]);
-  if (leak.leaked > 0) fatal(`${task.name} (${arm} ${index}): ${leak.leaked} records naming a benchmark directory reached the real database ${leak.path}. Isolation is broken.`);
+  if (leak.leaked > 0) fatal(`${label}: ${leak.leaked} records naming a benchmark directory reached the real database ${leak.path}. Isolation is broken.`);
+  sweepClaudeProjects(root);
   if (!options.keep) rmSync(dir, { recursive: true, force: true });
   return row;
 }
@@ -558,6 +674,10 @@ function summarize(rows) {
     runs: n,
     successes: wins,
     successRate: n ? wins / n : null,
+    // Runs that reported usage. Timeouts and runs that printed no JSON are not in the token, tool-call, turn or cost medians.
+    reported: rows.filter((row) => row.inputTokens !== null).length,
+    timeouts: rows.filter((row) => row.status === "timeout").length,
+    noJson: rows.filter((row) => row.status === "no-json").length,
     inputTokens: median(rows.map((row) => row.inputTokens)),
     outputTokens: median(rows.map((row) => row.outputTokens)),
     toolCalls: median(rows.map((row) => row.toolCalls)),
@@ -573,14 +693,14 @@ const pct = (value) => (value === null ? "n/a" : `${Math.round(value * 100)}%`);
 
 function table(heading, entries) {
   const lines = [
-    `| ${heading} | memory | runs | success | median input tokens | median output tokens | median tool calls | median turns | median wall s | median cost USD |`,
-    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${heading} | memory | runs | success | medians over | timed out / no JSON | median input tokens | median output tokens | median tool calls | median turns | median wall s | median cost USD |`,
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const [label, arms] of entries) {
     for (const arm of ["with", "without"]) {
       const s = arms[arm];
       if (!s || s.runs === 0) continue;
-      lines.push(`| ${label} | ${arm} | ${s.runs} | ${s.successes}/${s.runs} (${pct(s.successRate)}) | ${fmt(s.inputTokens)} | ${fmt(s.outputTokens)} | ${fmt(s.toolCalls, 1)} | ${fmt(s.turns, 1)} | ${fmt(s.wallSeconds, 1)} | ${fmt(s.costUsd, 3)} |`);
+      lines.push(`| ${label} | ${arm} | ${s.runs} | ${s.successes}/${s.runs} (${pct(s.successRate)}) | ${s.reported} of ${s.runs} | ${s.timeouts} / ${s.noJson} | ${fmt(s.inputTokens)} | ${fmt(s.outputTokens)} | ${fmt(s.toolCalls, 1)} | ${fmt(s.turns, 1)} | ${fmt(s.wallSeconds, 1)} | ${fmt(s.costUsd, 3)} |`);
     }
   }
   return lines.join("\n");
@@ -600,12 +720,14 @@ function render(rows, meta) {
     `- Date: ${meta.date}`,
     `- mib: ${meta.mibVersion}`,
     `- Agent: ${meta.claudeVersion}, model ${meta.model}`,
-    `- Runs: ${meta.runs} per task and arm, ${meta.tasks} tasks`,
+    `- Runs: ${meta.runs} per task and arm, ${meta.tasks} tasks${meta.partial ? ` (**PARTIAL**: ${meta.completed} of ${meta.planned} sessions finished; ${meta.reason})` : ""}`,
     `- Isolation: ${meta.isolation}`,
+    `- Global context: ${meta.globalContext}`,
     "",
     "Each task ran with a seeded memory (**with**) and with an empty one (**without**). Success is the task's `check.sh`.",
     "Input tokens count uncached, cache-creation and cache-read input together. Tool calls come from a `PreToolUse` hook counting every call;",
-    "turns are `num_turns` from the JSON result. Medians are over runs. See bench/README.md for how to read these.",
+    "turns are `num_turns` from the JSON result. A run that timed out or printed no JSON has no usage: it counts as a run and as a failure when `check.sh` fails,",
+    "but it is left out of the token, tool-call, turn and cost medians (`medians over` says how many runs each covers). Wall time covers all runs. See bench/README.md.",
     "",
     "## By group",
     "",
@@ -630,27 +752,39 @@ function render(rows, meta) {
   return lines.join("\n");
 }
 
+/** Print what a paid run will start and cost. Returns whether it may go ahead. */
+function confirmSpend(options, tasks) {
+  const sessions = tasks.length * options.runs * 2;
+  const ceiling = options.budget > 0 ? `at most ${fmt(sessions * options.budget, 2)} USD (${sessions} sessions x ${options.budget} USD cap each)` : "no cost cap (--budget 0)";
+  console.log(`This calls a real model: ${sessions} \`claude -p\` sessions (${tasks.length} tasks x ${options.runs} runs x 2 memory arms), one after another, ${ceiling}.`);
+  console.log(`Rough size, from one haiku smoke run: 60,000-120,000 input tokens (mostly cached) and 1,000-3,000 output tokens per session, about 20-30 s each, so ~${Math.max(1, Math.round((sessions * 25) / 60))} minutes; larger models cost more and take longer. The cap is a ceiling, not an estimate.`);
+  if (options.yes) return true;
+  const command = ["node", "bench/run.mjs", ...process.argv.slice(2).map((arg) => (/^[\w./:=,-]+$/.test(arg) ? arg : JSON.stringify(arg))), "--yes"].join(" ");
+  console.log(`Nothing was started. To spend the tokens, run:\n  ${command}`);
+  return false;
+}
+
+let interrupt = null;
+
+function globalContext() {
+  const file = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "CLAUDE.md");
+  if (!existsSync(file)) return "no global CLAUDE.md";
+  const body = readFileSync(file);
+  return `global CLAUDE.md ${body.length} bytes, sha256 ${createHash("sha256").update(body).digest("hex").slice(0, 12)} (imports not followed). Both arms see the same context, but numbers will not reproduce on a machine with a different one.`;
+}
+
 async function benchmark(tasks, ctx) {
-  const { options, mib, root, realPath } = ctx;
+  const { options, root, realPath } = ctx;
   const claude = sync("claude", ["--version"]);
   if (claude.status !== 0) fatal(`claude is not runnable: ${tail(claude.stderr) || claude.error?.message}`);
   const before = await realSnapshot(realPath);
   assertUserHooksDoNotPin();
   console.log(`${before.exists ? "" : "no "}real database at ${before.path}: ${before.records} records before the run`);
   const rows = [];
-  const total = tasks.length * options.runs * 2;
-  for (let index = 1; index <= options.runs; index++) {
-    for (const task of tasks) {
-      // Alternate which arm goes first so drift in load or rate limits does not favour one.
-      for (const arm of index % 2 ? ["with", "without"] : ["without", "with"]) {
-        const row = await oneRun(task, arm, index, ctx);
-        rows.push(row);
-        console.log(`[${rows.length}/${total}] ${task.name} ${arm} #${index}: ${row.success ? "pass" : "FAIL"}, ${fmt(row.inputTokens)} in / ${fmt(row.outputTokens)} out, ${row.toolCalls} tool calls, ${fmt(row.wallSeconds, 1)} s${arm === "with" ? `, recall ${row.recalls > 0 ? "yes" : "no"}` : ""}`);
-      }
-    }
-  }
-  const after = await realSnapshot(realPath, [root]);
-  assertNoLeak(before, after, "benchmark");
+  const planned = tasks.length * options.runs * 2;
+  const stem = options.out.replace(/\.md$/, "");
+  mkdirSync(dirname(options.out), { recursive: true });
+  writeFileSync(`${stem}.runs.jsonl`, "");
   const meta = {
     date: new Date().toISOString().slice(0, 10),
     mibVersion: text(sync(join(root, "bin/mib"), ["--version"]).stdout).trim(),
@@ -658,19 +792,71 @@ async function benchmark(tasks, ctx) {
     model: options.model ?? "the Claude Code default",
     runs: options.runs,
     tasks: tasks.length,
-    isolation: describeIsolation(before, after),
+    planned,
+    globalContext: globalContext(),
   };
-  mkdirSync(dirname(options.out), { recursive: true });
-  writeFileSync(options.out, render(rows, meta));
-  writeFileSync(options.out.replace(/\.md$/, "") + ".runs.json", JSON.stringify({ meta, rows }, null, 2) + "\n");
-  console.log(`\nwrote ${options.out} and ${basename(options.out.replace(/\.md$/, ""))}.runs.json\n${meta.isolation}`);
+  // Written after every exit path, so paid results are never lost.
+  const write = (partial, reason, isolation) => {
+    const full = { ...meta, partial, reason, completed: rows.length, isolation };
+    writeFileSync(options.out, render(rows, full));
+    writeFileSync(`${stem}.runs.json`, JSON.stringify({ meta: full, rows }, null, 2) + "\n");
+  };
+  const unread = `real database ${before.path}: ${before.records} records before; the count after was not read`;
+  interrupt = () => write(true, "interrupted", unread);
+  let failedInARow = 0;
+  try {
+    for (let index = 1; index <= options.runs; index++) {
+      for (const task of tasks) {
+        // Alternate which arm goes first so drift in load or rate limits does not favour one.
+        for (const arm of index % 2 ? ["with", "without"] : ["without", "with"]) {
+          const row = await oneRun(task, arm, index, ctx);
+          rows.push(row);
+          appendFileSync(`${stem}.runs.jsonl`, JSON.stringify(row) + "\n");
+          console.log(`[${rows.length}/${planned}] ${task.name} ${arm} #${index}: ${row.status === "ok" ? (row.success ? "pass" : "FAIL") : `FAIL (${row.status})`}, ${fmt(row.inputTokens)} in / ${fmt(row.outputTokens)} out, ${row.toolCalls ?? "n/a"} tool calls, ${fmt(row.wallSeconds, 1)} s${arm === "with" ? `, recall ${row.recalls > 0 ? "yes" : "no"}` : ""}`);
+          failedInARow = row.unusable ? failedInARow + 1 : 0;
+          if (failedInARow >= 3) fatal(`claude -p produced no usable result 3 times in a row; last: ${row.error}`);
+        }
+      }
+    }
+    const after = await realSnapshot(realPath, [root]);
+    assertNoLeak(before, after, "benchmark");
+    write(false, "", describeIsolation(before, after));
+    console.log(`\nwrote ${options.out}, ${basename(stem)}.runs.json and ${basename(stem)}.runs.jsonl\n${describeIsolation(before, after)}`);
+  } catch (error) {
+    write(true, `stopped: ${text(error.message).split("\n")[0]}`, unread);
+    console.error(`partial results (${rows.length} of ${planned} sessions) written to ${options.out}`);
+    throw error;
+  } finally {
+    interrupt = null;
+  }
 }
 
-// ------------------------------------------------------------------ main
+function cleanup(root, options) {
+  try {
+    sweepClaudeProjects(root);
+  } catch {
+    // Best effort: the directories hold no results.
+  }
+  if (options.keep) console.log(`kept ${root}`);
+  else rmSync(root, { recursive: true, force: true });
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const tasks = loadTasks(options.task);
+  if (!options.validate && !confirmSpend(options, tasks)) return;
   const root = realpathSync(mkdtempSync(join(tmpdir(), "mib-bench-")));
+  const stop = (code) => () => {
+    for (const child of activeChildren) killGroup(child);
+    try {
+      interrupt?.();
+    } finally {
+      cleanup(root, options);
+      process.exit(code);
+    }
+  };
+  process.once("SIGINT", stop(130));
+  process.once("SIGTERM", stop(143));
   try {
     const binary = resolveBinary(root);
     const ctx = { options, root, mib: makeMib(binary), realPath: realDatabasePath() };
@@ -680,8 +866,7 @@ async function main() {
       await benchmark(tasks, ctx);
     }
   } finally {
-    if (options.keep) console.log(`kept ${root}`);
-    else rmSync(root, { recursive: true, force: true });
+    cleanup(root, options);
   }
 }
 

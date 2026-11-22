@@ -55,8 +55,10 @@ demo: install
 	@echo "=== mem-in-black demo ==="
 	mib --help
 
-# Task benchmark. Calls a real model: it spends your tokens (see bench/README.md).
-# Usage: make bench BENCH_ARGS="--task handoff-currency --runs 3 --model haiku"
+# Task benchmark. Calls a real model and spends your tokens (see bench/README.md).
+# This target never passes --yes: it prints the session count and cost ceiling and
+# the command to run. Start a paid run with:
+#   make bench BENCH_ARGS="--task handoff-currency --runs 1 --model haiku --yes"
 bench: build
 	node bench/run.mjs $(BENCH_ARGS)
 
