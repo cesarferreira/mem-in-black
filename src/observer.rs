@@ -7,6 +7,15 @@ use crate::{
 use anyhow::Result;
 use std::path::Path;
 
+/// Recalls judged per pass, so judging never holds the worker back from summaries.
+const JUDGE_BATCH: i64 = 50;
+
+/// Judges one batch of recalls that are ready (see [`Store::judge_deliveries`]).
+/// Returns whether a full batch was judged, so more may be waiting.
+pub fn judge_batch(store: &Store) -> Result<bool> {
+    Ok(store.judge_deliveries(JUDGE_BATCH)? as i64 == JUDGE_BATCH)
+}
+
 /// Summarizes the next unobserved reply. Replies up to `refresh_until` are
 /// being rebuilt after a format change: their local summaries are replaced
 /// in place, and model summaries are kept without calling the model again.

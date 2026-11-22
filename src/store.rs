@@ -4,7 +4,7 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::ErrorKind,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 12;
+const SCHEMA: i64 = 14;
+/// A record delivered and ignored in this many sessions, and never used, is
+/// demoted from automatic recall.
+pub const DEMOTED_AFTER: i64 = 3;
 /// Version of the local summary format. When it increases, the worker
 /// rebuilds the local summaries of earlier turns in place.
 const SUMMARY_FORMAT: i64 = 2;
@@ -80,16 +83,14 @@ pub struct Stats {
     pub mcp_bytes: i64,
     pub mcp_source_bytes: i64,
     pub observer_tokens: i64,
-    /// Recalled summaries that named files or commits, so their use can be seen.
+    /// Recalled summaries that named files or commits and have been judged.
     pub recall_checked: i64,
     /// Of those, the ones after which the agent touched a recalled file or
     /// mentioned a recalled commit in the same session.
     pub recall_followed: i64,
-    /// Recalled summaries that were delivered because the agent was about to
-    /// edit a file or run a check, counted like `recall_checked`.
-    pub action_recall_checked: i64,
-    /// Of those, the ones the agent went on to use.
-    pub action_recall_followed: i64,
+    /// Records that automatic recall now skips: ignored in three or more
+    /// sessions and never used.
+    pub demoted: i64,
     /// Recalls delivered at the point of action.
     pub action_injections: i64,
 }
@@ -386,6 +387,14 @@ impl Store {
                 // Why a delivery happened: `prompt`, `handoff` or `action`.
                 migration.execute_batch(
                     "ALTER TABLE deliveries ADD COLUMN \"trigger\" TEXT NOT NULL DEFAULT 'prompt';",
+                )?;
+            }
+            if version < 14 {
+                // Whether the agent used a delivered record: 1, 0, or NULL while
+                // unjudged or when use cannot be checked.
+                migration.execute_batch(
+                    "ALTER TABLE deliveries ADD COLUMN used INTEGER;
+                     CREATE INDEX deliveries_judged ON deliveries(event_id) WHERE used IS NOT NULL;",
                 )?;
             }
             migration.pragma_update(None, "user_version", SCHEMA)?;
@@ -1228,22 +1237,75 @@ impl Store {
         Ok(total)
     }
 
-    /// Counts recalled summaries whose files or commits the agent went on to
-    /// use in the same session, within its next 60 records. A file counts
-    /// when a later tool call names its path; a commit counts when a later
-    /// tool call or reply mentions its hash. Returns checked and followed
-    /// counts for every recall, then for the ones delivered at the point of
-    /// action. The caller holds the read guard.
-    fn recall_follow_up(&self, workspace: Option<&str>) -> Result<[i64; 4]> {
-        let deliveries: Vec<(String, String, i64, String, bool)> = self
+    /// Whether the agent used a recalled summary: a file counts when a later
+    /// tool call in the session names its path, a commit when a later tool call
+    /// or reply mentions its hash, within the session's next 60 records.
+    /// `None` when the summary names no files or commits, so use cannot be seen.
+    /// This is the one definition of "used"; [`Store::judge_deliveries`] stores it.
+    fn follow_up(
+        &self,
+        (source, session, delivered_at): (&str, &str, i64),
+        body: &str,
+    ) -> Result<Option<bool>> {
+        let files: Vec<String> = crate::distill::summary_fact(body, "Files: ")
+            .into_iter()
+            .flat_map(|files| files.split(", "))
+            .filter(|file| file.len() > 2)
+            .map(str::to_owned)
+            .collect();
+        let commits: Vec<&str> = crate::distill::summary_fact(body, "Commits: ")
+            .into_iter()
+            .flat_map(|commits| commits.split("; "))
+            .filter_map(|commit| commit.split_whitespace().next())
+            .filter(|hash| hash.len() >= 7)
+            .collect();
+        if files.is_empty() && commits.is_empty() {
+            return Ok(None);
+        }
+        let mut later = self.db.prepare_cached(
+            "SELECT kind, body FROM events WHERE source = ?1 AND session = ?2
+               AND kind IN ('tool', 'assistant') AND created_at >= ?3
+             ORDER BY id LIMIT 60",
+        )?;
+        let used = later
+            .query_map(params![source, session, delivered_at], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(Result::ok)
+            .any(|(kind, text)| {
+                (kind == "tool" && files.iter().any(|file| text.contains(file.as_str())))
+                    || commits.iter().any(|hash| text.contains(hash))
+            });
+        Ok(Some(used))
+    }
+
+    /// Judges up to `limit` recalled summaries once their session has 60 later
+    /// records or has been quiet for 30 minutes, storing whether the agent
+    /// used them in `deliveries.used`. Deliveries at the point of action are
+    /// never judged: the edit that triggered one names the recalled file, so it
+    /// would count as used by construction. Summaries that name no files or
+    /// commits stay unjudged. Returns how many deliveries it judged.
+    pub fn judge_deliveries(&self, limit: i64) -> Result<usize> {
+        let read = self.read_guard()?;
+        let ready: Vec<(i64, String, String, i64, String)> = self
             .db
             .prepare(
-                "SELECT d.source, d.session, d.delivered_at, e.body, d.\"trigger\" = 'action'
+                "SELECT d.rowid, d.source, d.session, d.delivered_at, e.body
                  FROM deliveries d JOIN events e ON e.id = d.event_id
-                 WHERE d.shown AND d.delivered_at IS NOT NULL AND e.kind = 'summary'
-                   AND (?1 IS NULL OR e.workspace = ?1)",
+                 WHERE d.used IS NULL AND d.shown AND d.delivered_at IS NOT NULL
+                   AND d.\"trigger\" != 'action' AND e.kind = 'summary'
+                   AND (instr(char(10) || e.body, char(10) || 'Files: ') > 0
+                     OR instr(char(10) || e.body, char(10) || 'Commits: ') > 0)
+                   AND ((SELECT count(*) FROM (SELECT 1 FROM events l
+                           WHERE l.source = d.source AND l.session = d.session
+                             AND l.kind IN ('tool', 'assistant') AND l.created_at >= d.delivered_at
+                           LIMIT 60)) = 60
+                     OR max(d.delivered_at, coalesce((SELECT max(l.created_at) FROM events l
+                           WHERE l.source = d.source AND l.session = d.session), 0))
+                          <= unixepoch() - 1800)
+                 ORDER BY d.delivered_at LIMIT ?1",
             )?
-            .query_map(params![workspace], |row| {
+            .query_map([limit], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -1253,41 +1315,46 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut later = self.db.prepare_cached(
-            "SELECT kind, body FROM events WHERE source = ?1 AND session = ?2
-               AND kind IN ('tool', 'assistant') AND created_at >= ?3
-             ORDER BY id LIMIT 60",
+        let verdicts: Vec<(i64, bool)> = ready
+            .iter()
+            .filter_map(|(row, source, session, delivered_at, body)| {
+                self.follow_up((source, session, *delivered_at), body)
+                    .transpose()
+                    .map(|used| used.map(|used| (*row, used)))
+            })
+            .collect::<Result<_>>()?;
+        drop(read);
+        if verdicts.is_empty() {
+            return Ok(0);
+        }
+        // Only the writes hold the lock: one transaction of at most `limit` updates.
+        let _guard = self.write_guard()?;
+        let transaction = self.db.unchecked_transaction()?;
+        let mut judged = 0;
+        for (row, used) in verdicts {
+            judged += transaction.execute(
+                "UPDATE deliveries SET used = ?1 WHERE rowid = ?2 AND used IS NULL",
+                params![used, row],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(judged)
+    }
+
+    /// `(used, ignored)` for each record: in how many sessions the agent used
+    /// it after a recall, and in how many it did not. Deliveries that were
+    /// never judged count for neither.
+    pub fn usefulness(&self, ids: &[i64]) -> Result<HashMap<i64, (i64, i64)>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare_cached(
+            "SELECT coalesce(sum(used), 0), count(*) FROM deliveries
+             WHERE event_id = ?1 AND used IS NOT NULL",
         )?;
-        let mut counts = [0; 4];
-        for (source, session, delivered_at, body, action) in deliveries {
-            let files: Vec<String> = crate::distill::summary_fact(&body, "Files: ")
-                .into_iter()
-                .flat_map(|files| files.split(", "))
-                .filter(|file| file.len() > 2)
-                .map(str::to_owned)
-                .collect();
-            let commits: Vec<&str> = crate::distill::summary_fact(&body, "Commits: ")
-                .into_iter()
-                .flat_map(|commits| commits.split("; "))
-                .filter_map(|commit| commit.split_whitespace().next())
-                .filter(|hash| hash.len() >= 7)
-                .collect();
-            if files.is_empty() && commits.is_empty() {
-                continue;
-            }
-            let used = later
-                .query_map(params![source, session, delivered_at], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .filter_map(Result::ok)
-                .any(|(kind, text)| {
-                    (kind == "tool" && files.iter().any(|file| text.contains(file.as_str())))
-                        || commits.iter().any(|hash| text.contains(hash))
-                });
-            let kinds = if action { 4 } else { 2 };
-            for (index, count) in counts.iter_mut().enumerate().take(kinds) {
-                *count += if index % 2 == 0 { 1 } else { i64::from(used) };
-            }
+        let mut counts = HashMap::new();
+        for id in ids {
+            let (used, judged): (i64, i64) =
+                statement.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            counts.insert(*id, (used, judged - used));
         }
         Ok(counts)
     }
@@ -1310,17 +1377,21 @@ impl Store {
                 .optional()?
                 .unwrap_or(0))
         };
-        let [
-            recall_checked,
-            recall_followed,
-            action_recall_checked,
-            action_recall_followed,
-        ] = self.recall_follow_up(workspace)?;
         Ok(Stats {
-            recall_checked,
-            recall_followed,
-            action_recall_checked,
-            action_recall_followed,
+            recall_checked: scalar(
+                "SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
+                 WHERE d.used IS NOT NULL AND (?1 IS NULL OR e.workspace = ?1)",
+            )?,
+            recall_followed: scalar(
+                "SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
+                 WHERE d.used = 1 AND (?1 IS NULL OR e.workspace = ?1)",
+            )?,
+            demoted: scalar(&format!(
+                "SELECT count(*) FROM (SELECT d.event_id FROM deliveries d
+                 JOIN events e ON e.id = d.event_id
+                 WHERE d.used IS NOT NULL AND (?1 IS NULL OR e.workspace = ?1)
+                 GROUP BY d.event_id HAVING sum(d.used) = 0 AND count(*) >= {DEMOTED_AFTER})"
+            ))?,
             action_injections: metric("action_injections")?,
             workspace: workspace.map(str::to_owned),
             records: scalar("SELECT count(*) FROM events WHERE ?1 IS NULL OR workspace = ?1")?,

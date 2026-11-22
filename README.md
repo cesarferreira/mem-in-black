@@ -178,7 +178,14 @@ record replaced re-reading its full original output.
 **Recall used** in `mib stats` shows how often recall mattered: the share of
 recalled work summaries after which the agent, in the same session, opened one
 of the summary's files or mentioned one of its commits. An agent may open a
-file for other reasons, so treat it as an upper bound too.
+file for other reasons, so treat it as an upper bound too. The worker judges
+each recall once its session has 60 later records or has been quiet for 30
+minutes, so recent recalls are not counted yet. Recalls before an edit or a
+check are not judged, since the edit itself names the recalled file. Prompt
+recall ranks its candidates by how often each summary was used, and
+**Demoted** lists the summaries it now skips because the agent ignored them in
+three sessions and never used them, unless a prompt matches them almost
+completely. `MIB_ADAPTIVE_RANKING=0` turns the ranking off.
 
 **What gets captured:** prompts, agent replies, shell commands with a trimmed
 result, edited paths with line counts, read paths, search patterns with matching
@@ -231,6 +238,7 @@ turns model summaries off for one process.
 | `MIB_NO_AUTOSTART=1` | Keep the worker stopped. Hooks still record |
 | `MIB_DEBUG=1` | Print hook errors and why each record was or was not recalled |
 | `MIB_ACTION_RECALL=0` | Turn off recall before edits and checks. Prompt recall stays on |
+| `MIB_ADAPTIVE_RANKING=0` | Recall candidates in a fixed order instead of ranking by past use, and never skip a record the agent ignored |
 
 Mem in Black uses WAL journaling on local disks and switches to rollback
 journaling on NFS and SMB mounts.
