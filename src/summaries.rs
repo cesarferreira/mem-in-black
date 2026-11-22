@@ -182,6 +182,26 @@ pub fn narrate(
     facts: &str,
     reply: &str,
 ) -> Option<Narrative> {
+    let input = format!(
+        "Request:\n{}\n\nFacts:\n{}\n\nAgent's final reply:\n{}",
+        cut(request, 1200),
+        if facts.is_empty() { "(none)" } else { facts },
+        cut(reply, 2500)
+    );
+    ask(data, settings, SYSTEM, &input, parse)
+}
+
+/// Sends `input` to the configured model under the instructions `system` and
+/// reads its answer with `parse`, which also gets the tokens the call used.
+/// Returns `None` when summaries are off, after a recent failure, or when this
+/// call or `parse` fails. A failure starts the backoff for every caller.
+pub fn ask<T>(
+    data: &Path,
+    settings: &Settings,
+    system: &str,
+    input: &str,
+    parse: impl FnOnce(&str, i64) -> Result<T>,
+) -> Option<T> {
     if !settings.enabled {
         return None;
     }
@@ -193,16 +213,11 @@ pub fn narrate(
     {
         return None;
     }
-    let input = format!(
-        "Request:\n{}\n\nFacts:\n{}\n\nAgent's final reply:\n{}",
-        cut(request, 1200),
-        if facts.is_empty() { "(none)" } else { facts },
-        cut(reply, 2500)
-    );
     let result = match settings.provider {
-        Provider::Claude => claude(settings, &input),
-        Provider::Openai => openai(settings, &input),
-    };
+        Provider::Claude => claude(settings, system, input),
+        Provider::Openai => openai(settings, system, input),
+    }
+    .and_then(|(text, tokens)| parse(&text, tokens));
     let status = match &result {
         Ok(_) => json!({"model": settings.model, "last_success_at": now()}),
         Err(error) => {
@@ -231,11 +246,12 @@ fn now() -> u64 {
         .map_or(0, |time| time.as_secs())
 }
 
-fn claude(settings: &Settings, input: &str) -> Result<Narrative> {
+/// The model's answer text and the tokens the call used.
+fn claude(settings: &Settings, system: &str, input: &str) -> Result<(String, i64)> {
     let mut command = Command::new(&settings.command);
     command
         .args(["-p", "--model", &settings.model, "--output-format", "json"])
-        .args(["--system-prompt", SYSTEM, "--tools", ""])
+        .args(["--system-prompt", system, "--tools", ""])
         .args(["--settings", r#"{"disableAllHooks":true}"#])
         .args([
             "--strict-mcp-config",
@@ -256,7 +272,8 @@ fn claude(settings: &Settings, input: &str) -> Result<Narrative> {
     );
     let text = value["result"]
         .as_str()
-        .context("the Claude result has no text")?;
+        .context("the Claude result has no text")?
+        .to_owned();
     let usage = &value["usage"];
     let tokens = [
         "input_tokens",
@@ -267,10 +284,10 @@ fn claude(settings: &Settings, input: &str) -> Result<Narrative> {
     .iter()
     .map(|key| usage[*key].as_i64().unwrap_or(0).clamp(0, 10_000_000))
     .sum();
-    parse(text, tokens)
+    Ok((text, tokens))
 }
 
-fn openai(settings: &Settings, input: &str) -> Result<Narrative> {
+fn openai(settings: &Settings, system: &str, input: &str) -> Result<(String, i64)> {
     let endpoint = settings.endpoint.as_deref().context("no endpoint")?;
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(settings.timeout_secs)))
@@ -291,7 +308,7 @@ fn openai(settings: &Settings, input: &str) -> Result<Narrative> {
         "model": settings.model,
         "max_tokens": 400,
         "messages": [
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": input}
         ]
     }))?;
@@ -302,7 +319,8 @@ fn openai(settings: &Settings, input: &str) -> Result<Narrative> {
         .read_json()?;
     let text = value["choices"][0]["message"]["content"]
         .as_str()
-        .context("the endpoint returned no message")?;
+        .context("the endpoint returned no message")?
+        .to_owned();
     let tokens = ["prompt_tokens", "completion_tokens"]
         .iter()
         .map(|key| {
@@ -312,7 +330,7 @@ fn openai(settings: &Settings, input: &str) -> Result<Narrative> {
                 .clamp(0, 10_000_000)
         })
         .sum();
-    parse(text, tokens)
+    Ok((text, tokens))
 }
 
 /// Runs `command` with `input` on stdin and returns its stdout. The process

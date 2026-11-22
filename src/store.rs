@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA: i64 = 14;
+const SCHEMA: i64 = 15;
 /// A record delivered and ignored in this many sessions, and never used, is
 /// demoted from automatic recall.
 pub const DEMOTED_AFTER: i64 = 3;
@@ -418,6 +418,22 @@ impl Store {
                      CREATE INDEX deliveries_judged ON deliveries(event_id) WHERE used IS NOT NULL;",
                 )?;
             }
+            if version < 15 {
+                // Project facts are notes; this lists the summaries each one
+                // condenses. The partial index finds a project's summaries
+                // without scanning every record. The tables use IF NOT EXISTS
+                // because an upgrade test rewinds `user_version` only.
+                migration.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS knowledge_sources (
+                       note_id INTEGER NOT NULL, event_id INTEGER NOT NULL, PRIMARY KEY(note_id, event_id)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX IF NOT EXISTS knowledge_sources_event ON knowledge_sources(event_id);
+                     CREATE INDEX IF NOT EXISTS events_summaries ON events(project, id) WHERE kind = 'summary';
+                     CREATE TRIGGER IF NOT EXISTS knowledge_sources_delete AFTER DELETE ON events BEGIN
+                       DELETE FROM knowledge_sources WHERE note_id = old.id OR event_id = old.id;
+                     END;",
+                )?;
+            }
             migration.pragma_update(None, "user_version", SCHEMA)?;
             migration.commit()?;
         }
@@ -607,7 +623,7 @@ impl Store {
         let mut statement = self.db.prepare(
             "WITH recent AS (
                SELECT * FROM events WHERE workspace = ?1 AND created_at >= unixepoch() - 2592000
-                 AND superseded_by IS NULL
+                 AND superseded_by IS NULL AND NOT (source = 'mib' AND kind = 'note')
              ), outcomes AS (
                SELECT * FROM recent WHERE kind IN ('summary', 'note', 'observation')
              )
@@ -1054,12 +1070,27 @@ impl Store {
             .collect())
     }
 
-    /// Delete records, the summaries built from them and their delivery history.
+    /// Delete records, the summaries built from them and their delivery
+    /// history. A project fact whose sources are all gone goes with them. A
+    /// fact deleted here is not written again by consolidation.
     pub fn forget(&self, ids: &[i64]) -> Result<usize> {
+        self.delete(ids, true)
+    }
+
+    /// Deletes project facts that no longer hold, so that a later pass may
+    /// write them again.
+    pub fn drop_facts(&self, ids: &[i64]) -> Result<usize> {
+        self.delete(ids, false)
+    }
+
+    fn delete(&self, ids: &[i64], tombstones: bool) -> Result<usize> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
         let mut removed = 0;
         for id in ids.iter().take(100) {
+            if tombstones {
+                tombstone(&transaction, *id)?;
+            }
             transaction.execute(
                 "DELETE FROM deliveries WHERE event_id = ?1
                     OR event_id IN (SELECT id FROM events WHERE event_key = 'summary:' || ?1)",
@@ -1070,6 +1101,31 @@ impl Store {
                 [id],
             )?;
         }
+        let orphans: Vec<i64> = transaction
+            .prepare(
+                "SELECT e.id FROM events e WHERE e.source = 'mib' AND e.kind = 'note'
+                   AND e.event_key LIKE 'knowledge:%'
+                   AND NOT EXISTS (SELECT 1 FROM knowledge_sources k WHERE k.note_id = e.id)",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in orphans {
+            transaction.execute("DELETE FROM deliveries WHERE event_id = ?1", [id])?;
+            removed += transaction.execute("DELETE FROM events WHERE id = ?1", [id])?;
+        }
+        // A replaced fact does not come back when its replacement goes: the
+        // rule that wrote it writes it again if it still holds.
+        const DANGLING_FACTS: &str = "SELECT id FROM events WHERE source = 'mib' AND kind = 'note'
+            AND event_key LIKE 'knowledge:%' AND superseded_by IS NOT NULL
+            AND superseded_by NOT IN (SELECT id FROM events)";
+        transaction.execute(
+            &format!("DELETE FROM deliveries WHERE event_id IN ({DANGLING_FACTS})"),
+            [],
+        )?;
+        transaction.execute(
+            &format!("DELETE FROM events WHERE id IN ({DANGLING_FACTS})"),
+            [],
+        )?;
         transaction.execute(
             "UPDATE events SET superseded_by = NULL
              WHERE superseded_by IS NOT NULL AND superseded_by NOT IN (SELECT id FROM events)",
@@ -1081,18 +1137,118 @@ impl Store {
 
     /// Record a note and hide the records it corrects from search and recall.
     pub fn supersede(&self, note: Observation<'_>, replaces: &[i64]) -> Result<i64> {
+        self.supersede_with_sources(note, replaces, &[])
+    }
+
+    /// Like [`Store::supersede`], and lists the summaries `sources` as the
+    /// ones the note condenses, in the same transaction.
+    pub fn supersede_with_sources(
+        &self,
+        note: Observation<'_>,
+        replaces: &[i64],
+        sources: &[i64],
+    ) -> Result<i64> {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
-        self.insert(note, None)?;
+        ensure!(
+            self.insert(note, None)?,
+            "a record with this key already exists"
+        );
         let id = transaction.last_insert_rowid();
+        // Someone else's note replacing a fact ends it, like forgetting it.
         for old in replaces.iter().take(100).filter(|old| **old != id) {
+            if note.source != "mib" {
+                tombstone(&transaction, *old)?;
+            }
             transaction.execute(
                 "UPDATE events SET superseded_by = ?1 WHERE id = ?2",
                 params![id, old],
             )?;
         }
+        for source in sources {
+            transaction.execute(
+                "INSERT OR IGNORE INTO knowledge_sources VALUES (?1, ?2)",
+                params![id, source],
+            )?;
+        }
         transaction.commit()?;
         Ok(id)
+    }
+
+    /// A project with at least `every` summaries newer than the last it was
+    /// consolidated at, and its newest summary. Only the index is scanned.
+    pub fn due_project(&self, every: i64) -> Result<Option<(String, i64)>> {
+        let _guard = self.read_guard()?;
+        Ok(self
+            .db
+            .query_row(
+                "SELECT p.project, (SELECT max(e.id) FROM events e WHERE e.kind = 'summary' AND e.project = p.project)
+                 FROM (SELECT DISTINCT project FROM events WHERE kind = 'summary') p
+                 WHERE (SELECT count(*) FROM events e WHERE e.kind = 'summary' AND e.project = p.project
+                          AND e.id > coalesce((SELECT value FROM memory_meta WHERE key = 'consolidated:' || p.project), 0)) >= ?1
+                 ORDER BY 2 DESC LIMIT 1",
+                [every],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The newest summaries of a project that are not superseded, newest first.
+    pub fn recent_summaries(&self, project: &str, limit: usize) -> Result<Vec<Record>> {
+        self.query(
+            &format!(
+                "SELECT {RECORD_COLUMNS} FROM events e
+                 WHERE e.kind = 'summary' AND e.project = ?1 AND e.superseded_by IS NULL
+                 ORDER BY e.id DESC LIMIT ?2"
+            ),
+            params![project, limit as i64],
+        )
+    }
+
+    /// Records that the project's summaries up to `newest` have been consolidated.
+    pub fn set_consolidated(&self, project: &str, newest: i64) -> Result<()> {
+        let _guard = self.write_guard()?;
+        self.db.execute(
+            "INSERT INTO memory_meta VALUES ('consolidated:' || ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = max(value, excluded.value)",
+            params![project, newest],
+        )?;
+        Ok(())
+    }
+
+    /// The project facts that are not superseded, as `(key, record)`, newest
+    /// first. Without a project, those of every project.
+    pub fn facts(&self, project: Option<&str>) -> Result<Vec<(String, Record)>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS}, e.event_key FROM events e
+             WHERE e.source = 'mib' AND e.kind = 'note' AND e.event_key LIKE 'knowledge:%'
+               AND e.superseded_by IS NULL AND (?1 IS NULL OR e.project = ?1)
+             ORDER BY e.created_at DESC, e.id DESC"
+        ))?;
+        let rows = statement.query_map([project], |row| Ok((row.get(11)?, row_record(row)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The summaries a project fact condenses, oldest first.
+    pub fn fact_sources(&self, note: i64) -> Result<Vec<i64>> {
+        let _guard = self.read_guard()?;
+        let mut statement = self.db.prepare_cached(
+            "SELECT event_id FROM knowledge_sources WHERE note_id = ?1 ORDER BY event_id",
+        )?;
+        let rows = statement.query_map([note], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether the user deleted or replaced the fact with this key. The
+    /// consolidation pass never writes such a fact again.
+    pub fn fact_forgotten(&self, key: &str) -> Result<bool> {
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM memory_meta WHERE key = 'forgotten:' || ?1)",
+            [key],
+            |row| row.get(0),
+        )?)
     }
 
     /// Records after `after`, oldest first, for embedding.
@@ -1260,6 +1416,19 @@ impl Store {
                     params![source, session, record.id, flag, trigger],
                 )?;
             }
+        }
+        // The episodes behind a delivered fact are matched, so the session is
+        // not sent them again.
+        for record in fresh
+            .iter()
+            .filter(|record| crate::consolidate::is_fact(record))
+        {
+            transaction.execute(
+                "INSERT INTO deliveries(source, session, event_id, shown, \"trigger\")
+                   SELECT ?1, ?2, k.event_id, 0, ?3 FROM knowledge_sources k WHERE k.note_id = ?4
+                 ON CONFLICT(source, session, event_id) DO NOTHING",
+                params![source, session, trigger, record.id],
+            )?;
         }
         self.add_metric("context_injections", 1)?;
         self.add_metric("context_bytes", context.len() as i64)?;
@@ -1703,6 +1872,18 @@ fn running_check_sql() -> String {
 /// The metric that counts a session's recalls at the point of action.
 fn action_counter(source: &str, session: &str) -> String {
     format!("action:{source}:{session}")
+}
+
+/// Remembers the key of record `id` when it is a project fact, so that
+/// consolidation does not write the fact again.
+fn tombstone(db: &Connection, id: i64) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO memory_meta
+           SELECT 'forgotten:' || event_key, 1 FROM events
+           WHERE id = ?1 AND source = 'mib' AND kind = 'note' AND event_key LIKE 'knowledge:%'",
+        [id],
+    )?;
+    Ok(())
 }
 
 /// Replaces the index rows of summary `id` with `files` and `commits`.

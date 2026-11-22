@@ -2209,7 +2209,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
     let export = workspace.run(&["export"], None);
     assert!(
         export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
@@ -4326,5 +4326,499 @@ fn a_check_that_fails_then_passes_is_not_abandoned() {
         stuck
             .contains("\nAbandoned: `cargo test retry` still failing after editing src/stuck.rs\n"),
         "{stuck}"
+    );
+}
+
+impl Workspace {
+    /// Adds `count` unremarkable summaries to the store, as if that many turns
+    /// had been summarized. Needs one real summary to copy the checkout from.
+    fn pad_summaries(&self, count: usize) {
+        static PADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let database = self.database();
+        let (workspace, project): (String, String) = database
+            .query_row(
+                "SELECT workspace, project FROM events WHERE kind = 'summary' ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        for _ in 0..count {
+            let pad = PADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            database
+                .execute(
+                    "INSERT INTO events(source, session, event_key, kind, body, workspace, project)
+                     VALUES ('claude', ?1, 'summary:pad', 'summary', ?2, ?3, ?4)",
+                    rusqlite::params![
+                        format!("pad-{pad}"),
+                        format!("Change: Renamed helper {pad}\nEvidence [#1]"),
+                        workspace,
+                        project
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    /// The project facts `mib knowledge --json` lists.
+    fn facts(&self) -> Vec<Value> {
+        serde_json::from_str(&self.run(&["knowledge", "--json"], None)).unwrap()
+    }
+
+    /// Three sessions that pass `cargo test`, summarized and padded to twenty summaries.
+    fn project_with_a_check_fact(&self) {
+        for (session, module) in [("s1", "alpha"), ("s2", "beta"), ("s3", "gamma")] {
+            self.turn_that_runs(
+                session,
+                "t1",
+                &format!("src/{module}.rs"),
+                &[("cargo test", false)],
+            );
+        }
+        self.run(&["observe"], None);
+        assert!(self.facts().is_empty(), "three summaries are not enough");
+        self.pad_summaries(17);
+        self.run(&["observe"], None);
+    }
+}
+
+#[test]
+fn a_check_that_passes_in_three_sessions_becomes_a_project_fact() {
+    let workspace = Workspace::new();
+    for session in ["s1", "s2"] {
+        workspace.turn_that_runs(
+            session,
+            "t1",
+            &format!("src/{session}.rs"),
+            &[("cargo test", false), ("cargo clippy", false)],
+        );
+    }
+    workspace.turn_that_runs("s3", "t1", "src/s3.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(17);
+    workspace.run(&["observe"], None);
+
+    let facts = workspace.facts();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    let text = facts[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("This project is checked with `cargo test` (passed 3 times, last on 20"),
+        "{text}"
+    );
+    assert_eq!(facts[0]["kind"], "check");
+    let sources: Vec<i64> = ["src/s1.rs", "src/s2.rs", "src/s3.rs"]
+        .iter()
+        .map(|file| workspace.summary_id(file))
+        .collect();
+    let mut listed: Vec<i64> = facts[0]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(listed, sources);
+
+    // The fact is an ordinary note: searchable, a memory, attributed to the worktree.
+    let id = facts[0]["id"].as_i64().unwrap();
+    let found: Value = serde_json::from_str(&workspace.run(
+        &[
+            "search",
+            "project checked cargo test",
+            "--workspace",
+            workspace.repo.to_str().unwrap(),
+        ],
+        None,
+    ))
+    .unwrap();
+    let note = found
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .expect("the fact is searchable in its worktree");
+    assert_eq!(note["kind"], "note");
+    assert_eq!(note["source"], "mib");
+    assert!(
+        note["body"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("Evidence [#"),
+        "{note}"
+    );
+    assert!(workspace.stats_json()["memories"].as_i64().unwrap() >= 1);
+    let human = workspace.run(&["knowledge"], None);
+    assert!(
+        human.contains("This project is checked with `cargo test`"),
+        "{human}"
+    );
+}
+
+#[test]
+fn a_recurring_error_links_to_the_turn_that_fixed_it() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("e1", "t1", "src/e1.rs", &[("cargo test retry", true)]);
+    workspace.turn_that_runs("e2", "t1", "src/e2.rs", &[("cargo test retry", true)]);
+    workspace.turn_that_runs("e3", "t1", "src/fix.rs", &[("cargo test retry", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(17);
+    workspace.run(&["observe"], None);
+
+    let facts = workspace.facts();
+    let failure = facts
+        .iter()
+        .find(|fact| fact["kind"] == "failure")
+        .unwrap_or_else(|| panic!("no known failure: {facts:?}"));
+    let fix = workspace.summary_id("src/fix.rs");
+    let text = failure["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "`FAILED: expected three retries` has happened 2 times. Fixed before by: "
+        ),
+        "{text}"
+    );
+    assert!(text.ends_with(&format!("(#{fix})")), "{text}");
+    let sources: Vec<i64> = failure["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect();
+    assert!(sources.contains(&fix), "{sources:?}");
+    assert_eq!(sources.len(), 3);
+}
+
+#[test]
+fn repeated_dead_ends_on_one_file_merge_into_one_fact() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("d1", "t1", "src/dead.rs", &[("cargo test", true)]);
+    workspace.turn_that_runs(
+        "d2",
+        "t1",
+        "src/dead.rs",
+        &[("git checkout -- src/dead.rs", false)],
+    );
+    workspace.turn_that_runs("d3", "t1", "src/fine.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(17);
+    workspace.run(&["observe"], None);
+
+    let facts = workspace.facts();
+    let dead: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact["kind"] == "dead-end")
+        .collect();
+    assert_eq!(dead.len(), 1, "{facts:?}");
+    let text = dead[0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Tried and rejected for `src/dead.rs`:\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("\n- ").count(), 2, "{text}");
+    assert!(!text.contains("src/fine.rs"), "{text}");
+}
+
+#[test]
+fn a_delivered_fact_keeps_its_source_episodes_out_of_the_same_session() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    let fact = workspace.facts().remove(0);
+    let sources: Vec<i64> = fact["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect();
+    let prompt = "Which command checks this project, and how often has it passed?";
+    let episode = "Rework alpha module again";
+
+    let control = workspace
+        .recall_in("control", episode, &[])
+        .expect("an episode is recalled when no fact was delivered");
+    assert!(control.contains("Rework src/"), "{control}");
+
+    let context = workspace
+        .recall_in("later", prompt, &[])
+        .expect("the fact is recalled");
+    assert!(
+        context.contains("This project is checked with `cargo test`"),
+        "{context}"
+    );
+    let matched: Vec<i64> = {
+        let database = workspace.database();
+        let mut statement = database
+            .prepare(
+                "SELECT event_id FROM deliveries WHERE session = 'later' AND shown = 0 ORDER BY event_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let mut expected = sources.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        matched, expected,
+        "the sources are written as matched, not shown"
+    );
+    assert!(
+        workspace
+            .recall_in("later", episode, &[])
+            .is_none_or(|text| !text.contains("Rework src/")),
+        "the episodes behind the fact are not sent again"
+    );
+}
+
+#[test]
+fn forgetting_every_source_removes_the_fact() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    let fact = workspace.facts().remove(0);
+    let sources: Vec<i64> = fact["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect();
+    assert_eq!(sources.len(), 3);
+
+    workspace.run(
+        &["forget", &sources[0].to_string(), &sources[1].to_string()],
+        None,
+    );
+    let left = workspace.facts();
+    assert_eq!(left.len(), 1, "one source is still there");
+    assert_eq!(left[0]["sources"], json!([sources[2]]));
+
+    workspace.run(&["forget", &sources[2].to_string()], None);
+    assert!(workspace.facts().is_empty());
+    let id = fact["id"].as_i64().unwrap();
+    let database = workspace.database();
+    for (table, column) in [
+        ("events", "id"),
+        ("knowledge_sources", "note_id"),
+        ("deliveries", "event_id"),
+    ] {
+        let rows: i64 = database
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "{table} still holds the fact");
+    }
+}
+
+#[test]
+fn a_fact_is_replaced_when_its_rule_runs_again_and_dropped_when_its_check_goes_quiet() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    let first = workspace.facts().remove(0);
+    assert!(first["text"].as_str().unwrap().contains("passed 3 times"));
+
+    workspace.turn_that_runs("s4", "t1", "src/s4.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(19);
+    workspace.run(&["observe"], None);
+    let facts = workspace.facts();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert!(
+        facts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passed 4 times")
+    );
+    let hidden: i64 = workspace
+        .database()
+        .query_row(
+            "SELECT superseded_by FROM events WHERE id = ?1",
+            [first["id"].as_i64().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hidden, facts[0]["id"].as_i64().unwrap());
+
+    workspace.pad_summaries(50);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "the command has not run in the last 50 summaries"
+    );
+}
+
+#[test]
+fn consolidation_waits_for_twenty_new_summaries_and_obeys_its_switch() {
+    let workspace = Workspace::new();
+    for session in ["s1", "s2", "s3"] {
+        workspace.turn_that_runs(
+            session,
+            "t1",
+            &format!("src/{session}.rs"),
+            &[("cargo test", false)],
+        );
+    }
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(16);
+    workspace.run(&["observe"], None);
+    assert!(workspace.facts().is_empty(), "19 summaries");
+    workspace.pad_summaries(1);
+    workspace.run_with_env(&["observe"], None, &[("MIB_CONSOLIDATE", "0")]);
+    assert!(workspace.facts().is_empty(), "switched off");
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts()[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passed 3 times")
+    );
+
+    // A fourth pass is only worth a rerun after twenty more summaries.
+    workspace.turn_that_runs("s4", "t1", "src/s4.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(18);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts()[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passed 3 times")
+    );
+    workspace.pad_summaries(1);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts()[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passed 4 times")
+    );
+}
+
+#[test]
+fn a_model_fact_without_valid_sources_is_rejected() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("m1", "t1", "src/m1.rs", &[("cargo build", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(19);
+    let ids: Vec<i64> = {
+        let database = workspace.database();
+        let mut statement = database
+            .prepare("SELECT id FROM events WHERE kind = 'summary' ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let calls = workspace.temp.path().join("calls");
+    std::fs::create_dir(&calls).unwrap();
+    let items = json!([
+        {"text": "Retry settings live in one module.", "sources": [ids[1], ids[2]]},
+        {"text": "Invented from an id nobody sent.", "sources": [ids[3], 987654]},
+        {"text": "Cited once only.", "sources": [ids[4]]},
+        {"text": "Cited twice but the same entry.", "sources": [ids[5], ids[5]]},
+        {"text": "No sources at all."}
+    ]);
+    let reply = json!({"type": "result", "is_error": false, "result": items.to_string(),
+        "usage": {"input_tokens": 600, "output_tokens": 30}});
+    std::fs::write(calls.join("reply.json"), reply.to_string()).unwrap();
+    let dir = calls.display();
+    fake_claude(
+        &workspace,
+        &format!(
+            r#"printf '%s\n' "$@" > "{dir}/args"; cat > "{dir}/stdin"; cat "{dir}/reply.json""#
+        ),
+        json!({}),
+    );
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+
+    let facts = workspace.facts();
+    let conventions: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact["kind"] == "convention")
+        .collect();
+    assert_eq!(conventions.len(), 1, "{facts:?}");
+    assert!(
+        conventions[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Retry settings live in one module."),
+    );
+    assert_eq!(conventions[0]["sources"], json!([ids[1], ids[2]]));
+    let args = std::fs::read_to_string(calls.join("args")).unwrap();
+    assert!(args.contains("quoted data"), "{args}");
+    assert!(args.contains(r#"{"disableAllHooks":true}"#), "{args}");
+    let stdin = std::fs::read_to_string(calls.join("stdin")).unwrap();
+    assert!(stdin.contains(&format!("[#{}]", ids[1])), "{stdin}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&workspace.run(&["status"], None)).unwrap()["observer_tokens"],
+        630
+    );
+}
+
+#[test]
+fn the_model_is_never_asked_for_conventions_when_summaries_are_off() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("m1", "t1", "src/m1.rs", &[("cargo build", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(19);
+    let called = workspace.temp.path().join("called");
+    fake_claude(
+        &workspace,
+        &format!(r#"touch "{}""#, called.display()),
+        json!({}),
+    );
+    workspace.run(&["observe"], None);
+    assert!(!called.exists());
+}
+
+#[test]
+fn a_forgotten_fact_is_not_rebuilt_by_the_next_pass() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    let fact = workspace.facts().remove(0)["id"].as_i64().unwrap();
+    workspace.run(&["forget", &fact.to_string()], None);
+    assert!(workspace.facts().is_empty());
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "the user deleted it; the rule must not write it again"
+    );
+}
+
+#[test]
+fn a_replaced_fact_is_not_rebuilt_even_after_its_replacement_is_forgotten() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    let fact = workspace.facts().remove(0)["id"].as_i64().unwrap();
+    let saved = mcp_calls(
+        &workspace,
+        &[json!({"name":"save_memory","arguments":{
+            "workspace": workspace.repo,
+            "text": "Run the suite with cargo nextest, never cargo test",
+            "replaces": [fact]
+        }})],
+    );
+    let note: i64 = saved[0]
+        .trim_matches('"')
+        .trim_start_matches("Saved #")
+        .parse()
+        .unwrap_or_else(|_| panic!("{saved:?}"));
+    assert!(workspace.facts().is_empty());
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    assert!(workspace.facts().is_empty(), "replaced, so not rebuilt");
+    workspace.run(&["forget", &note.to_string()], None);
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "forgetting the correction does not bring the rule's fact back"
     );
 }

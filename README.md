@@ -110,6 +110,7 @@ Work as usual. Mem in Black stays quiet until it has something relevant:
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
 - **Recall at the point of action.** When an agent is about to edit a file or run a check that has history, it is reminded of it first. Editing a file recalls up to two earlier decisions, errors or failed checks from other sessions that touched that file. Running a check recalls the last time another session saw that same command fail. Each summary is shown once per session, a session gets at most five of these reminders, and nothing is recalled in a private turn. `MIB_ACTION_RECALL=0` turns it off.
 - **Dead ends.** A summary records an approach that was tried and given up, and one whose commit was later reverted or whose result you rejected is marked so. Editing a file recalls those first, shown as `Abandoned: …`, `later reverted in #id` or `disputed by the user`, and **Memories** badges them `abandoned`, `reverted` or `disputed`.
+- **Project facts.** Once a project has 20 new work summaries, the worker condenses repeated episodes into a few durable notes: a check command that passed in three or more sessions (“This project is checked with `cargo test`…”), an error that recurred with the turn that fixed it, and the abandoned, reverted or disputed attempts on one file merged into one “Tried and rejected for …” note. With model summaries on, it also asks the model for conventions across the last 20 summaries and keeps only those that cite two or more of them. Each fact lists the summaries it condenses, which stay searchable. Recall sends a fact like any note, and the summaries behind it are not sent again in that session. A fact whose sources are all forgotten is deleted, a check that has not run in the last 50 summaries is dropped, and a rule that runs again replaces its earlier fact. A fact you `forget` or replace with `save_memory … replaces` is never written again. `mib knowledge` lists them and **Project facts** in the viewer shows them. `MIB_CONSOLIDATE=0` turns the pass off.
 - **Handoff.** Open another supported agent in the same worktree and branch and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.” A detached HEAD uses an exact commit match. Earlier records without branch information are still searchable.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Why.** `mib why src/foo.rs:42` runs `git blame` on that line and shows the agent turn that committed it: the original request, the decision, the checks, the commit and the evidence IDs. A line committed by a person, or not committed yet, shows the newest agent work on the file instead, labelled as that. `mib why src/foo.rs` lists the file's last 10 turns, and `--json` prints the same fields with an `origin` of `line` or `file`.
@@ -162,6 +163,7 @@ you describe a problem in different words than the record used.
 | `mib status` | Worker state, database path and the private viewer URL |
 | `mib search "query"` | Search memory (`--workspace .` for one worktree) |
 | `mib why <file>[:<line>]` | The request, decision and checks behind a line or file (`--json`, `--workspace <dir>`) |
+| `mib knowledge` | The project's facts and the summaries behind each (`--json`, `--workspace <dir>`) |
 | `mib preview` | Recent activity for this worktree |
 | `mib forget <id>…` | Delete records and the summaries built from them |
 | `mib export` | All records as JSON lines |
@@ -219,6 +221,11 @@ facts and the agent's final reply; turns marked `<private>` are never captured
 and never sent. Files, commits, checks and errors always come from the tool
 records, not from the model.
 
+With model summaries on, the worker also sends the titles, decisions and
+abandoned lines of a project's last 20 summaries, once per 20 new summaries, to
+look for conventions (see **Project facts**). Tool records are never sent.
+`MIB_CONSOLIDATE=0` stops this and the rest of that pass.
+
 If the call fails or takes longer than the timeout (60 s), the turn gets the
 local summary instead, and the worker writes local summaries for the next 10
 minutes before it tries the model again. `mib stats` reports the model's tokens.
@@ -249,6 +256,7 @@ turns model summaries off for one process.
 | `MIB_DEBUG=1` | Print hook errors and why each record was or was not recalled |
 | `MIB_ACTION_RECALL=0` | Turn off recall before edits and checks. Prompt recall stays on |
 | `MIB_ADAPTIVE_RANKING=0` | Recall candidates in a fixed order instead of ranking by past use, and never skip a record the agent ignored |
+| `MIB_CONSOLIDATE=0` | Do not condense summaries into project facts |
 
 Mem in Black uses WAL journaling on local disks and switches to rollback
 journaling on NFS and SMB mounts.
