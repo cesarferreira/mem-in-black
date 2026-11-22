@@ -216,16 +216,21 @@ fn machine_prompt(prompt: &str) -> bool {
 /// `path` as the worktree at `root` names it. The root is canonical, but an
 /// agent may write the path through a symlink (`/var` for `/private/var`), which
 /// would leave it absolute and outside the project. A relative path or one
-/// already under `root` is returned unchanged. Otherwise the path is resolved
-/// through its nearest existing ancestor, so files not yet created resolve too,
-/// and the resolved form is returned when it lies under `root`.
+/// already under `root` is returned unchanged. Otherwise the file's directory
+/// is resolved through its nearest existing ancestor, so files not yet created
+/// resolve too, and the file name is appended unresolved: a file that is itself
+/// a symlink (`CLAUDE.md` → `AGENTS.md`) keeps the name the agent used. The
+/// resolved form is returned when it lies under `root`.
 pub(crate) fn project_path(root: &str, path: &str) -> String {
     let given = std::path::Path::new(path);
     if !given.is_absolute() || given.starts_with(root) {
         return path.to_owned();
     }
+    let (Some(directory), Some(name)) = (given.parent(), given.file_name()) else {
+        return path.to_owned();
+    };
     let mut tail = Vec::new();
-    let mut base = given;
+    let mut base = directory;
     let mut resolved = loop {
         if let Ok(found) = base.canonicalize() {
             break found;
@@ -239,6 +244,7 @@ pub(crate) fn project_path(root: &str, path: &str) -> String {
         }
     };
     resolved.extend(tail.iter().rev());
+    resolved.push(name);
     if resolved.starts_with(root) {
         resolved.to_string_lossy().into_owned()
     } else {
@@ -1528,6 +1534,13 @@ mod tests {
             under("src/lib.rs")
         );
         assert_eq!(project_path(root, "src/lib.rs"), "src/lib.rs");
+        // A file that is itself a symlink keeps its own name.
+        std::fs::write(real.join("AGENTS.md"), "").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", real.join("CLAUDE.md")).unwrap();
+        assert_eq!(
+            project_path(root, &through("CLAUDE.md")),
+            under("CLAUDE.md")
+        );
         let outside = dir.path().canonicalize().unwrap().join("other/x.rs");
         let outside = outside.to_string_lossy().into_owned();
         assert_eq!(project_path(root, &outside), outside);

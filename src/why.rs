@@ -74,13 +74,15 @@ pub fn split_line(argument: &str) -> Result<(&str, Option<u32>)> {
     Ok((argument, None))
 }
 
-/// Resolves `path` against the current directory and finds its worktree: the
-/// one containing `workspace` when given, otherwise the one containing the file.
+/// Finds the worktree of `path`: the one containing `workspace` when given
+/// (a relative `path` is then taken inside it), otherwise the one containing
+/// the file, resolved against the current directory.
 pub fn resolve(path: &str, workspace: Option<&Path>) -> Result<Target> {
-    let absolute = normalize(&std::env::current_dir()?.join(path));
+    let workspace_given = workspace.is_some();
+    let from_here = normalize(&std::env::current_dir()?.join(path));
     let directory = match workspace {
         Some(directory) => directory.to_path_buf(),
-        None => absolute
+        None => from_here
             .ancestors()
             .skip(1)
             .find(|directory| directory.is_dir())
@@ -99,6 +101,11 @@ pub fn resolve(path: &str, workspace: Option<&Path>) -> Result<Target> {
         bail!("{} is not inside a Git repository", directory.display());
     }
     let workspace = Workspace::read(&directory);
+    let absolute = if workspace_given && Path::new(path).is_relative() {
+        normalize(&Path::new(&workspace.root).join(path))
+    } else {
+        from_here
+    };
     let resolved = project_path(&workspace.root, &absolute.to_string_lossy());
     let Some(relative) = Path::new(&resolved)
         .strip_prefix(&workspace.root)

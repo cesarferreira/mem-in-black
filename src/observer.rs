@@ -236,7 +236,8 @@ fn rejects(prompt: &str) -> bool {
 /// earlier summary a `Revert` commit of this turn undoes is `reverted`; the
 /// previous turn's summary is `disputed` when this turn's prompt rejects its
 /// result. `(None, "disputed")` marks the summary being written, when the
-/// session's next prompt already rejects it.
+/// session's next prompt already rejects it. A session with a private turn
+/// disputes nothing: that turn left no record to tell which result was meant.
 fn status_marks(
     store: &Store,
     anchor: &Record,
@@ -245,17 +246,19 @@ fn status_marks(
     commits: &[String],
 ) -> Result<Vec<(Option<i64>, &'static str)>> {
     let mut marks = Vec::new();
-    if let Some(request) = request
-        && rejects(&request.body)
-        && let Some(previous) = store.previous_reply(request)?
-        && let Some(summary) = store.summary_of(&previous)?
-    {
-        marks.push((Some(summary.id), "disputed"));
-    }
-    if let Some(next) = store.next_prompt(anchor)?
-        && rejects(&next.body)
-    {
-        marks.push((None, "disputed"));
+    if !store.has_private_turn(&anchor.source, &anchor.session)? {
+        if let Some(request) = request
+            && rejects(&request.body)
+            && let Some(previous) = store.previous_reply(request)?
+            && let Some(summary) = store.summary_of(&previous)?
+        {
+            marks.push((Some(summary.id), "disputed"));
+        }
+        if let Some(next) = store.next_prompt(anchor)?
+            && rejects(&next.body)
+        {
+            marks.push((None, "disputed"));
+        }
     }
     for hash in reverted_commits(&anchor.workspace, commits) {
         for summary in store.summaries_with_commit(project, &hash)? {

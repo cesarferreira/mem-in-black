@@ -1,0 +1,5 @@
+# The hook timing test compares wall-clock times, so it runs with every test
+# thread reserved and nothing else competes with it.
+[[profile.default.overrides]]
+filter = 'test(action_recall_without_a_hit_stays_fast_on_a_large_store_and_never_runs_git)'
+threads-required = 'num-cpus'

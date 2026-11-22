@@ -63,7 +63,9 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
             continue;
         };
         match undo(command) {
-            Some(Undo::Discards(what)) if !failed && !facts.files.is_empty() => {
+            Some(Undo::Discards(what, paths))
+                if !failed && !facts.files.is_empty() && hits(&paths, root, &facts.files) =>
+            {
                 discarded = Some(what);
             }
             Some(Undo::Restores) if !failed => discarded = None,
@@ -197,10 +199,51 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
 
 /// What a shell command does with the edits in the work tree.
 enum Undo {
-    /// Throws them away or sets them aside, named as the command.
-    Discards(&'static str),
+    /// Throws them away or sets them aside, named as the command, limited to
+    /// the pathspec operands (empty when it affects the whole work tree).
+    Discards(&'static str, Vec<String>),
     /// Brings back what `git stash` set aside.
     Restores,
+}
+
+/// Whether a discard reaches a file the turn edited: it names no path, names
+/// `.`, or names an edited file or a directory holding one.
+fn hits(paths: &[String], root: &str, files: &[String]) -> bool {
+    paths.is_empty()
+        || paths.iter().any(|path| {
+            let path = relative(path, root);
+            let path = path.strip_prefix("./").unwrap_or(path);
+            let path = path.trim_end_matches('/');
+            path.is_empty()
+                || path == "."
+                || files.iter().any(|file| {
+                    file == path
+                        || file
+                            .strip_prefix(path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+        })
+}
+
+/// The pathspec operands among a subcommand's arguments: everything after
+/// `--`, plus, unless `only_after`, the words that are neither flags nor the
+/// value of one of the `valued` flags.
+fn pathspec(args: &[&str], valued: &[&str], only_after: bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut args = args.iter().copied();
+    let mut after = false;
+    while let Some(arg) = args.next() {
+        if after {
+            paths.push(arg.to_owned());
+        } else if arg == "--" {
+            after = true;
+        } else if valued.contains(&arg) {
+            args.next();
+        } else if !only_after && !arg.starts_with('-') {
+            paths.push(arg.to_owned());
+        }
+    }
+    paths
 }
 
 /// The last git command of a shell line that discards or restores edits.
@@ -223,18 +266,32 @@ fn undo(command: &str) -> Option<Undo> {
         }
         let has = |flag: &str| rest.contains(&flag);
         found = match rest.first().copied() {
-            Some("revert") => Some(Undo::Discards("git revert")),
-            Some("reset") if has("--hard") => Some(Undo::Discards("git reset --hard")),
+            Some("revert") => Some(Undo::Discards("git revert", Vec::new())),
+            Some("reset") if has("--hard") => Some(Undo::Discards("git reset --hard", Vec::new())),
             // `git restore --staged` only unstages.
             Some("restore")
                 if !(has("--staged") || has("-S")) || has("--worktree") || has("-W") =>
             {
-                Some(Undo::Discards("git restore"))
+                let paths = pathspec(&rest[1..], &["-s", "--source"], false);
+                Some(Undo::Discards("git restore", paths))
             }
-            Some("checkout") if has("--") => Some(Undo::Discards("git checkout --")),
+            Some("checkout") if has("--") => {
+                let paths = pathspec(&rest[1..], &[], true);
+                Some(Undo::Discards("git checkout --", paths))
+            }
             Some("stash") => match rest.get(1).copied() {
-                None | Some("push" | "save") => Some(Undo::Discards("git stash")),
-                Some(flag) if flag.starts_with('-') => Some(Undo::Discards("git stash")),
+                None | Some("push" | "save") => {
+                    // `save` takes a message, not paths.
+                    let paths = match rest.get(1).copied() {
+                        Some("save") => Vec::new(),
+                        _ => pathspec(&rest[rest.len().min(2)..], &["-m", "--message"], false),
+                    };
+                    Some(Undo::Discards("git stash", paths))
+                }
+                Some(flag) if flag.starts_with('-') => {
+                    let paths = pathspec(&rest[1..], &["-m", "--message"], true);
+                    Some(Undo::Discards("git stash", paths))
+                }
                 Some("pop" | "apply") => Some(Undo::Restores),
                 Some(_) => found,
             },
@@ -1084,6 +1141,35 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn discarding_a_file_the_turn_never_edited_is_not_abandoning() {
+        let edit = "Edit /repo/src/retry.rs";
+        let run = |command: &str| format!("Bash command: {command}\nResult:\nok");
+        for command in [
+            "git checkout -- Cargo.lock",
+            "git restore Cargo.lock",
+            "git restore --source HEAD~1 Cargo.lock",
+            "git stash push -m lock Cargo.lock",
+            "git stash push -- Cargo.lock tests",
+            "git checkout main -- docs/",
+            "git checkout -- src/retry",
+        ] {
+            assert_eq!(abandoned(&[edit, &run(command)]), None, "{command}");
+        }
+        for command in [
+            "git checkout -- .",
+            "git checkout -- src",
+            "git checkout -- src/",
+            "git checkout -- Cargo.lock src/retry.rs",
+            "git checkout main -- ./src/retry.rs",
+            "git restore /repo/src/retry.rs",
+            "git restore --source=HEAD~1 src",
+            "git stash push -m try src/retry.rs",
+        ] {
+            assert!(abandoned(&[edit, &run(command)]).is_some(), "{command}");
+        }
     }
 
     #[test]

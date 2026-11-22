@@ -3693,6 +3693,28 @@ fn why_resolves_paths_from_a_subdirectory_and_an_absolute_path() {
 }
 
 #[test]
+fn why_with_a_workspace_resolves_a_relative_path_inside_that_worktree() {
+    let workspace = Workspace::new();
+    agent_turn_commits_ws(&workspace);
+    let elsewhere = workspace.temp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let output = workspace
+        .command()
+        .current_dir(&elsewhere)
+        .args(["why", "src/ws.rs:1", "--json", "--workspace"])
+        .arg(&workspace.repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(entries[0]["origin"], "line", "{entries}");
+}
+
+#[test]
 fn why_outside_a_git_repository_is_a_clear_error() {
     let workspace = Workspace::new();
     let plain = workspace.temp.path().join("plain");
@@ -3923,7 +3945,12 @@ fn uncheckable_records_are_ranked_as_before() {
     // The summary names no files or commits, so its use can never be seen.
     workspace.age(3600);
     workspace.run(&["observe"], None);
-    assert!(workspace.judgments().iter().all(|(_, used)| used.is_none()));
+    assert!(
+        workspace
+            .judgments()
+            .iter()
+            .all(|(_, used)| *used == Some(-1))
+    );
     let stats = workspace.stats_json();
     assert_eq!(stats["recall_checked"], 0, "{stats}");
     assert_eq!(stats["demoted"], 0, "{stats}");
@@ -3996,6 +4023,60 @@ fn a_recall_is_judged_after_sixty_later_records_or_thirty_quiet_minutes() {
     let stats = workspace.stats_json();
     assert_eq!(stats["recall_checked"], 2, "{stats}");
     assert_eq!(stats["recall_followed"], 1, "{stats}");
+}
+
+#[test]
+fn deliveries_that_cannot_be_checked_never_hold_up_judging() {
+    let workspace = Workspace::new();
+    retry_decision(&workspace, "earlier", "src/retry.rs");
+    workspace.run(&["observe"], None);
+    // A summary whose `Files:` line sits in the reply text, where use cannot be read.
+    let (root, project): (String, String) = workspace
+        .database()
+        .query_row("SELECT workspace, project FROM events LIMIT 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let database = workspace.database();
+    database
+        .execute(
+            "INSERT INTO events(source, session, event_key, kind, body, workspace, project)
+             VALUES ('claude', 'odd', 'summary:odd', 'summary',
+                     'Change: Odd\nOutcome: Reported.\nFiles: src/odd.rs', ?1, ?2)",
+            rusqlite::params![root, project],
+        )
+        .unwrap();
+    let odd = database.last_insert_rowid();
+    for index in 0..50 {
+        database
+            .execute(
+                "INSERT INTO deliveries(source, session, event_id, shown, delivered_at)
+                 VALUES ('claude', ?1, ?2, 1, unixepoch() - 7200)",
+                rusqlite::params![format!("stale-{index}"), odd],
+            )
+            .unwrap();
+    }
+    assert!(workspace.recall_in("later", RETRY_PROMPT, &[]).is_some());
+    workspace.age(3600);
+    workspace.run(&["observe"], None);
+    assert_eq!(
+        workspace.judgments().pop().unwrap(),
+        ("later".to_owned(), Some(0)),
+        "the checkable delivery is judged behind fifty that cannot be"
+    );
+    let sentinels: i64 = database
+        .query_row(
+            "SELECT count(*) FROM deliveries WHERE event_id = ?1 AND used = -1",
+            [odd],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sentinels, 50,
+        "they are marked so that no pass reads them again"
+    );
+    let stats = workspace.stats_json();
+    assert_eq!(stats["recall_checked"], 1, "{stats}");
 }
 
 impl Workspace {
@@ -4262,6 +4343,80 @@ fn a_prompt_that_rejects_the_last_result_marks_its_summary_disputed() {
         )
         .expect("a disputed summary is recalled");
     assert!(brief.contains(" • disputed by the user]"), "{brief}");
+}
+
+#[test]
+fn a_rejection_after_an_interrupted_turn_does_not_dispute_the_older_summary() {
+    let workspace = Workspace::new();
+    workspace.turn_with_reason("s", "t1", "src/one.rs", "Reworked src/one.rs.");
+    workspace.run(&["observe"], None);
+    // The user interrupted the second turn: its prompt and tool were stored, no reply came.
+    workspace.hook(
+        "claude",
+        "s",
+        "UserPromptSubmit",
+        json!({"turn_id": "t2", "prompt": "Rework the counter"}),
+    );
+    workspace.hook(
+        "claude",
+        "s",
+        "PostToolUse",
+        json!({"turn_id": "t2", "tool_name":"Edit", "tool_use_id": "edit-t2",
+            "tool_input":{"file_path": workspace.repo.join("src/two.rs"), "old_string":"a", "new_string":"b"},
+            "tool_response":{}}),
+    );
+    workspace.hook(
+        "claude",
+        "s",
+        "UserPromptSubmit",
+        json!({"turn_id": "t3", "prompt": "That didn't work, the retry still resets"}),
+    );
+    workspace.hook(
+        "claude",
+        "s",
+        "Stop",
+        json!({"turn_id": "t3", "last_assistant_message": "Checking again."}),
+    );
+    workspace.run(&["observe"], None);
+    assert!(workspace.status_rows().is_empty());
+}
+
+#[test]
+fn a_rejection_after_a_private_turn_disputes_nothing_in_that_session() {
+    let workspace = Workspace::new();
+    for session in ["early", "late"] {
+        workspace.turn_with_reason(session, "t1", &format!("src/{session}.rs"), "Reworked it.");
+        if session == "early" {
+            // The summary exists before the private turn and the rejection.
+            workspace.run(&["observe"], None);
+        }
+        workspace.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"turn_id": "t2", "prompt": "<private> try something else"}),
+        );
+        workspace.hook(
+            "claude",
+            session,
+            "Stop",
+            json!({"turn_id": "t2", "last_assistant_message": "Tried it."}),
+        );
+        workspace.hook(
+            "claude",
+            session,
+            "UserPromptSubmit",
+            json!({"turn_id": "t3", "prompt": "Still failing"}),
+        );
+        workspace.hook(
+            "claude",
+            session,
+            "Stop",
+            json!({"turn_id": "t3", "last_assistant_message": "Checking again."}),
+        );
+    }
+    workspace.run(&["observe"], None);
+    assert!(workspace.status_rows().is_empty());
 }
 
 #[test]
@@ -4586,15 +4741,13 @@ fn forgetting_every_source_removes_the_fact() {
         .collect();
     assert_eq!(sources.len(), 3);
 
+    // The fact goes with its first forgotten source; the rest changes nothing.
+    workspace.run(&["forget", &sources[0].to_string()], None);
+    assert!(workspace.facts().is_empty());
     workspace.run(
-        &["forget", &sources[0].to_string(), &sources[1].to_string()],
+        &["forget", &sources[1].to_string(), &sources[2].to_string()],
         None,
     );
-    let left = workspace.facts();
-    assert_eq!(left.len(), 1, "one source is still there");
-    assert_eq!(left[0]["sources"], json!([sources[2]]));
-
-    workspace.run(&["forget", &sources[2].to_string()], None);
     assert!(workspace.facts().is_empty());
     let id = fact["id"].as_i64().unwrap();
     let database = workspace.database();
@@ -4612,6 +4765,55 @@ fn forgetting_every_source_removes_the_fact() {
             .unwrap();
         assert_eq!(rows, 0, "{table} still holds the fact");
     }
+}
+
+#[test]
+fn forgetting_one_source_removes_its_text_from_facts_until_they_are_rebuilt() {
+    let workspace = Workspace::new();
+    for session in ["s1", "s2", "s3", "s4"] {
+        workspace.turn_that_runs(
+            session,
+            "t1",
+            &format!("src/{session}.rs"),
+            &[("cargo test", false)],
+        );
+    }
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(16);
+    workspace.run(&["observe"], None);
+    let fact = workspace.facts().remove(0);
+    assert!(fact["text"].as_str().unwrap().contains("passed 4 times"));
+    let forgotten = workspace.summary_id("src/s1.rs");
+    assert!(
+        fact["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(forgotten))
+    );
+
+    workspace.run(&["forget", &forgotten.to_string()], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "a fact that cited the forgotten record is gone at once"
+    );
+
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    let rebuilt = workspace.facts();
+    assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
+    assert!(
+        rebuilt[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passed 3 times"),
+        "{rebuilt:?}"
+    );
+    assert!(
+        !rebuilt[0]["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(forgotten))
+    );
 }
 
 #[test]
@@ -4762,6 +4964,64 @@ fn a_model_fact_without_valid_sources_is_rejected() {
 }
 
 #[test]
+fn a_reworded_convention_replaces_the_earlier_one_instead_of_piling_up() {
+    let workspace = Workspace::new();
+    workspace.turn_that_runs("m1", "t1", "src/m1.rs", &[("cargo build", false)]);
+    workspace.run(&["observe"], None);
+    workspace.pad_summaries(19);
+    let summary_ids = || -> Vec<i64> {
+        let database = workspace.database();
+        let mut statement = database
+            .prepare("SELECT id FROM events WHERE kind = 'summary' ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let calls = workspace.temp.path().join("calls");
+    std::fs::create_dir(&calls).unwrap();
+    let say = |sentence: &str, sources: [i64; 2]| {
+        let items = json!([{"text": sentence, "sources": sources}]);
+        let reply = json!({"type": "result", "is_error": false, "result": items.to_string(),
+            "usage": {"input_tokens": 600, "output_tokens": 30}});
+        std::fs::write(calls.join("reply.json"), reply.to_string()).unwrap();
+    };
+    let dir = calls.display();
+    fake_claude(
+        &workspace,
+        &format!(r#"cat > /dev/null; cat "{dir}/reply.json""#),
+        json!({}),
+    );
+    let ids = summary_ids();
+    say("Retry settings live in one module.", [ids[1], ids[2]]);
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+    let conventions = |facts: Vec<Value>| -> Vec<String> {
+        facts
+            .into_iter()
+            .filter(|fact| fact["kind"] == "convention")
+            .map(|fact| fact["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = conventions(workspace.facts());
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].contains("live in one module"), "{first:?}");
+
+    // The next window words the same rule differently; only that wording stays.
+    workspace.pad_summaries(20);
+    let ids = summary_ids();
+    say(
+        "All retry configuration is kept together.",
+        [ids[25], ids[26]],
+    );
+    workspace.run_with_env(&["observe"], None, &[("MIB_SUMMARIES", "on")]);
+    let second = conventions(workspace.facts());
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].contains("kept together"), "{second:?}");
+}
+
+#[test]
 fn the_model_is_never_asked_for_conventions_when_summaries_are_off() {
     let workspace = Workspace::new();
     workspace.turn_that_runs("m1", "t1", "src/m1.rs", &[("cargo build", false)]);
@@ -4789,6 +5049,30 @@ fn a_forgotten_fact_is_not_rebuilt_by_the_next_pass() {
     assert!(
         workspace.facts().is_empty(),
         "the user deleted it; the rule must not write it again"
+    );
+}
+
+#[test]
+fn a_fact_forgotten_together_with_one_of_its_sources_is_not_rebuilt() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    // A fourth passing session, so three remain after one source is forgotten
+    // and only the tombstone keeps the rule from writing the fact again.
+    workspace.turn_that_runs("s4", "t1", "src/delta.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    let fact = workspace.facts().remove(0);
+    let source = fact["sources"][0].as_i64().unwrap();
+    // The source comes first, so the fact is already gone when its own id is reached.
+    workspace.run(
+        &["forget", &source.to_string(), &fact["id"].to_string()],
+        None,
+    );
+    assert!(workspace.facts().is_empty());
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "the user named the fact; the remaining sources must not bring it back"
     );
 }
 
