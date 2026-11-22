@@ -160,6 +160,7 @@ pub fn observe_once(data: &Storage) -> Result<()> {
     let refresh = store.summary_refresh_bound()?;
     while observer::process_one(&store, &data.directory, &settings, refresh)? {}
     while observer::judge_batch(&store)? {}
+    while crate::consolidate::batch(&store, &data.directory, &settings)? {}
     Ok(())
 }
 
@@ -217,8 +218,10 @@ pub fn run(data: &Storage) -> Result<()> {
         let Ok(store) = Store::open(&worker_data) else {
             return;
         };
-        // Recalls are judged only when no summary is waiting, at most every 30 seconds.
+        // Recalls are judged and projects consolidated only when no summary is
+        // waiting, each at most every 30 seconds.
         let mut judged = None::<Instant>;
+        let mut consolidated = None::<Instant>;
         loop {
             match observer::process_one(&store, &worker_data.directory, &settings, refresh) {
                 Ok(true) => {}
@@ -227,6 +230,15 @@ pub fn run(data: &Storage) -> Result<()> {
                         judged = Some(Instant::now());
                         if observer::judge_batch(&store).unwrap_or(false) {
                             judged = None;
+                            continue;
+                        }
+                    }
+                    if consolidated.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                        consolidated = Some(Instant::now());
+                        if crate::consolidate::batch(&store, &worker_data.directory, &settings)
+                            .unwrap_or(false)
+                        {
+                            consolidated = None;
                             continue;
                         }
                     }
@@ -549,6 +561,7 @@ fn handle(
 struct ViewerQuery {
     text: String,
     activity: bool,
+    facts: bool,
     evidence: Option<i64>,
     record: Option<i64>,
 }
@@ -559,7 +572,10 @@ impl ViewerQuery {
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
                 "q" => view.text = value.into_owned(),
-                "view" => view.activity = value == "activity",
+                "view" => {
+                    view.activity = value == "activity";
+                    view.facts = value == "facts";
+                }
                 "evidence" => view.evidence = value.parse().ok(),
                 "record" => view.record = value.parse().ok(),
                 _ => {}
@@ -605,6 +621,16 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, view: &ViewerQuery) -
         source_evidence(store, id)?
     } else if let Some(id) = view.record {
         store.live(&[id])?
+    } else if view.facts {
+        // Facts hold no keyword index of their own: the few there are are filtered here.
+        let needle = view.text.trim().to_lowercase();
+        store
+            .facts(None)?
+            .into_iter()
+            .map(|(_, record)| record)
+            .filter(|record| needle.is_empty() || record.body.to_lowercase().contains(&needle))
+            .take(40)
+            .collect()
     } else {
         mcp::search_filtered(
             store,
@@ -615,35 +641,44 @@ fn viewer(store: &Store, semantic: &Semantic, token: &str, view: &ViewerQuery) -
             !view.activity,
         )?
     };
-    let mode_input = if view.activity {
-        r#"<input type="hidden" name="view" value="activity">"#
+    let current = if view.activity {
+        Some("activity")
+    } else if view.facts {
+        Some("facts")
     } else {
-        ""
+        None
     };
-    let view_tabs = [("Memories", false), ("Activity", true)]
-        .into_iter()
-        .map(|(label, activity)| {
-            let mut query = form_urlencoded::Serializer::new(String::new());
-            if activity {
-                query.append_pair("view", "activity");
-            }
-            if !view.text.is_empty() {
-                query.append_pair("q", &view.text);
-            }
-            let query = query.finish();
-            let link = if query.is_empty() {
-                token.to_owned()
-            } else {
-                format!("{token}?{query}")
-            };
-            let selected = if activity == view.activity {
-                r#" aria-current="page""#
-            } else {
-                ""
-            };
-            format!(r#"<a href="{}"{selected}>{label}</a>"#, escape(&link))
-        })
-        .collect::<String>();
+    let mode_input = current
+        .map(|mode| format!(r#"<input type="hidden" name="view" value="{mode}">"#))
+        .unwrap_or_default();
+    let view_tabs = [
+        ("Memories", None),
+        ("Activity", Some("activity")),
+        ("Project facts", Some("facts")),
+    ]
+    .into_iter()
+    .map(|(label, mode)| {
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        if let Some(mode) = mode {
+            query.append_pair("view", mode);
+        }
+        if !view.text.is_empty() {
+            query.append_pair("q", &view.text);
+        }
+        let query = query.finish();
+        let link = if query.is_empty() {
+            token.to_owned()
+        } else {
+            format!("{token}?{query}")
+        };
+        let selected = if mode == current {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
+        format!(r#"<a href="{}"{selected}>{label}</a>"#, escape(&link))
+    })
+    .collect::<String>();
     let evidence_heading = view
         .evidence
         .map(|id| format!("<h2>Source evidence for #{id}</h2>"))
@@ -680,6 +715,8 @@ a{{color:var(--accent)}}nav{{display:flex;gap:8px;margin-bottom:12px}}nav a{{pad
             "This record is no longer available."
         } else if !view.text.trim().is_empty() {
             "No records match this search."
+        } else if view.facts {
+            "Project facts appear once a project has 20 new work summaries."
         } else if view.activity {
             "Captured activity will appear here."
         } else {

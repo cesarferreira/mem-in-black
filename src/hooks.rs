@@ -1225,7 +1225,8 @@ const ASSISTED_RARITY: f64 = 0.4;
 
 /// Unprompted recall only injects evidence of work: a summary with files,
 /// checks or errors, an agent reply from a turn that ran tools, or any other
-/// record kind. Pure conversation stays searchable but is never injected.
+/// record kind, such as a project fact. Pure conversation stays searchable but
+/// is never injected.
 fn substantive(store: &Store, record: &Record) -> Result<bool> {
     Ok(match record.kind.as_str() {
         "summary" if is_local_summary(&record.body) => [
@@ -1377,11 +1378,13 @@ fn render(
         workspace.root
     );
     for record in records {
+        // A project fact holds for every worktree and branch of the project.
         let state = match (
             record.workspace == workspace.root,
             record.head.as_ref(),
             workspace.head.as_ref(),
         ) {
+            _ if crate::consolidate::is_fact(record) => String::new(),
             (false, _, _) => " • different worktree".to_owned(),
             (true, Some(old), Some(current)) if old != current => {
                 revision_state(&workspace.root, old, record)
@@ -1416,7 +1419,10 @@ fn render(
 }
 
 fn branch_state(workspace: &Workspace, record: &Record) -> String {
-    if workspace.root != record.workspace || workspace.git_ref == record.git_ref {
+    if crate::consolidate::is_fact(record)
+        || workspace.root != record.workspace
+        || workspace.git_ref == record.git_ref
+    {
         return String::new();
     }
     match record.git_ref.as_deref() {

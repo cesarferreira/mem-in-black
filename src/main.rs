@@ -1,4 +1,5 @@
 mod config;
+mod consolidate;
 mod daemon;
 mod distill;
 mod embed;
@@ -119,6 +120,14 @@ enum Command {
         /// A file, optionally followed by `:<line>`.
         target: String,
         /// Worktree to look in. Defaults to the one containing the file.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the project facts Mem in Black condensed from repeated work.
+    Knowledge {
+        /// Worktree whose project to list. Defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
@@ -430,6 +439,16 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&lookup.entries)?);
             } else {
                 print!("{}", why::text(&target.path, line, &lookup));
+            }
+        }
+        Command::Knowledge { workspace, json } => {
+            let directory = workspace.map(Ok).unwrap_or_else(std::env::current_dir)?;
+            let workspace = Workspace::read(&directory);
+            let facts = consolidate::list(&Store::open(&data)?, &workspace.project)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&facts)?);
+            } else {
+                print!("{}", consolidate::text(&workspace.root, &facts));
             }
         }
     }
