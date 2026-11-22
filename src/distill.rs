@@ -21,6 +21,8 @@ pub struct Facts {
     pub checks: Vec<(String, &'static str)>,
     pub errors: Vec<String>,
     pub decision: Option<String>,
+    /// An approach that was tried and given up, as the tool records show it.
+    pub abandoned: Option<String>,
     pub next: Option<String>,
     /// A model-written outcome, shown before the reply excerpt.
     pub outcome: Option<String>,
@@ -31,6 +33,9 @@ pub struct Facts {
 /// `tools` are stored tool bodies in chronological order.
 pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
     let mut facts = Facts::default();
+    // The command that threw the turn's edits away, and the check whose last run failed.
+    let mut discarded: Option<&str> = None;
+    let mut failing: Option<String> = None;
     for body in tools {
         edited_paths(body, root, &mut facts.files);
         let first = body.lines().next().unwrap_or_default();
@@ -57,6 +62,13 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
         let Some((command, output, failed)) = shell(body) else {
             continue;
         };
+        match undo(command) {
+            Some(Undo::Discards(what)) if !failed && !facts.files.is_empty() => {
+                discarded = Some(what);
+            }
+            Some(Undo::Restores) if !failed => discarded = None,
+            _ => {}
+        }
         let reported = body
             .lines()
             .take_while(|line| *line != "Result:")
@@ -84,6 +96,7 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
             continue;
         };
         let status = if failed { "failed" } else { status(output) };
+        failing = (status == "failed").then(|| check.clone());
         facts.checks.retain(|(seen, _)| *seen != check);
         facts.checks.push((check, status));
         if status == "failed" {
@@ -102,6 +115,14 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
     let checks = facts.checks.len();
     facts.checks.drain(..checks.saturating_sub(4));
     facts.errors.truncate(3);
+    if !facts.files.is_empty() {
+        let files = shown(&facts.files).join(", ");
+        facts.abandoned = match (discarded, failing) {
+            (Some(command), _) => Some(format!("ran `{command}` after editing {files}")),
+            (None, Some(check)) => Some(format!("`{check}` still failing after editing {files}")),
+            _ => None,
+        };
+    }
     let request = prompt
         .lines()
         .map(strip_attachments)
@@ -174,6 +195,55 @@ pub fn distill(root: &str, prompt: &str, tools: &[&str], reply: &str) -> Facts {
     facts
 }
 
+/// What a shell command does with the edits in the work tree.
+enum Undo {
+    /// Throws them away or sets them aside, named as the command.
+    Discards(&'static str),
+    /// Brings back what `git stash` set aside.
+    Restores,
+}
+
+/// The last git command of a shell line that discards or restores edits.
+fn undo(command: &str) -> Option<Undo> {
+    let mut found = None;
+    for segment in shell_segments(command.lines().next().unwrap_or_default()) {
+        let words = shell_words(&segment);
+        let mut words = words.iter().map(|(word, _)| word.as_str());
+        if words.next().map(basename) != Some("git") {
+            continue;
+        }
+        // The subcommand and what follows it, without `-C <dir>` and `-c <key=value>`.
+        let mut rest: Vec<&str> = Vec::new();
+        while let Some(word) = words.next() {
+            if rest.is_empty() && matches!(word, "-C" | "-c") {
+                words.next();
+            } else if !rest.is_empty() || !word.starts_with('-') {
+                rest.push(word);
+            }
+        }
+        let has = |flag: &str| rest.contains(&flag);
+        found = match rest.first().copied() {
+            Some("revert") => Some(Undo::Discards("git revert")),
+            Some("reset") if has("--hard") => Some(Undo::Discards("git reset --hard")),
+            // `git restore --staged` only unstages.
+            Some("restore")
+                if !(has("--staged") || has("-S")) || has("--worktree") || has("-W") =>
+            {
+                Some(Undo::Discards("git restore"))
+            }
+            Some("checkout") if has("--") => Some(Undo::Discards("git checkout --")),
+            Some("stash") => match rest.get(1).copied() {
+                None | Some("push" | "save") => Some(Undo::Discards("git stash")),
+                Some(flag) if flag.starts_with('-') => Some(Undo::Discards("git stash")),
+                Some("pop" | "apply") => Some(Undo::Restores),
+                Some(_) => found,
+            },
+            _ => found,
+        };
+    }
+    found
+}
+
 /// Keep only the part of a compound shell command that runs a check.
 fn check_segment(command: &str) -> Option<String> {
     let first = command.lines().next().unwrap_or_default();
@@ -217,6 +287,13 @@ impl Facts {
         self.outcome = Some(narrative.outcome);
         self.decision = narrative.decision;
         self.next = narrative.next;
+        if self.abandoned.is_some()
+            && let Some(reason) = narrative.abandoned
+        {
+            // The tool records decide that a dead end exists; the model only says why.
+            let local = self.abandoned.take().unwrap_or_default();
+            self.abandoned = Some(cut(&format!("{local} — {reason}"), 300).to_owned());
+        }
         self.narrated_by = Some(cut(model, 80).to_owned());
     }
 
@@ -265,6 +342,9 @@ impl Facts {
         }
         if let Some(decision) = &self.decision {
             text.push_str(&format!("\nDecision: {decision}"));
+        }
+        if let Some(abandoned) = &self.abandoned {
+            text.push_str(&format!("\nAbandoned: {abandoned}"));
         }
         if let Some(next) = &self.next {
             text.push_str(&format!("\nNext: {next}"));
@@ -957,6 +1037,109 @@ mod tests {
         assert_eq!(
             facts.checks,
             [("cargo test && ./publish-artifact".to_owned(), "failed")]
+        );
+    }
+
+    fn abandoned(tools: &[&str]) -> Option<String> {
+        distill("/repo", "Fix the retry counter reset", tools, "Done.").abandoned
+    }
+
+    #[test]
+    fn a_turn_that_throws_its_edits_away_is_abandoned() {
+        let edit = "Edit /repo/src/retry.rs";
+        let run = |command: &str| format!("Bash command: {command}\nResult:\nok");
+        for (command, named) in [
+            ("git reset --hard HEAD~1", "git reset --hard"),
+            ("git -C /repo checkout -- src/retry.rs", "git checkout --"),
+            ("cd /repo && git restore src/retry.rs", "git restore"),
+            ("git stash -u", "git stash"),
+            ("git stash push src/retry.rs", "git stash"),
+            ("git revert --no-edit HEAD", "git revert"),
+        ] {
+            assert_eq!(
+                abandoned(&[edit, &run(command)]),
+                Some(format!("ran `{named}` after editing src/retry.rs")),
+                "{command}"
+            );
+        }
+        for command in [
+            "git restore --staged src/retry.rs",
+            "git reset --soft HEAD~1",
+            "git checkout main",
+            "git stash list",
+            "git status",
+        ] {
+            assert_eq!(abandoned(&[edit, &run(command)]), None, "{command}");
+        }
+        // Nothing was edited, or the stash came back, or the command failed.
+        assert_eq!(abandoned(&[&run("git stash")]), None);
+        assert_eq!(
+            abandoned(&[edit, &run("git stash"), &run("git stash pop")]),
+            None
+        );
+        assert_eq!(
+            abandoned(&[
+                edit,
+                "Bash command: git reset --hard\nTool status: failed\nResult:\nfatal"
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_check_that_ends_failing_after_edits_is_abandoned_but_a_later_pass_clears_it() {
+        let edit = "Edit /repo/src/retry.rs";
+        let fail =
+            "Bash command: cargo test retry\nTool status: failed\nResult:\ntest retry ... FAILED";
+        let pass = "Bash command: cargo test retry\nResult:\ntest result: ok. 3 passed";
+        assert_eq!(
+            abandoned(&[edit, fail]),
+            Some("`cargo test retry` still failing after editing src/retry.rs".to_owned())
+        );
+        assert_eq!(abandoned(&[edit, fail, pass]), None);
+        // A compound command that failed is named whole, yet a later passing run still clears it.
+        let compound =
+            "Bash command: cd /repo && cargo test retry\nTool status: failed\nResult:\nFAILED";
+        assert_eq!(abandoned(&[edit, compound, pass]), None);
+        assert_eq!(abandoned(&[fail]), None, "no edits, no dead end");
+        let facts = distill("/repo", "x", &[edit, fail], "Done.");
+        let text = facts.render("Outcome", "Done.", "[#1]");
+        assert!(
+            text.contains(
+                "\nAbandoned: `cargo test retry` still failing after editing src/retry.rs\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_model_reason_is_kept_only_beside_a_dead_end_the_tool_records_show() {
+        let narrative = || crate::summaries::Narrative {
+            title: "Tried a buffered retry".into(),
+            outcome: "Reverted to the old counter.".into(),
+            decision: None,
+            abandoned: Some("The buffer dropped the first retry.".into()),
+            next: None,
+            tokens: 0,
+        };
+        let mut invented = distill("/repo", "Try buffering", &["Edit /repo/a.rs"], "Done.");
+        invented.narrate(narrative(), "haiku");
+        assert_eq!(invented.abandoned, None);
+        assert!(
+            !invented
+                .render("Outcome", "Done.", "[#1]")
+                .contains("Abandoned:")
+        );
+
+        let tools = [
+            "Edit /repo/a.rs",
+            "Bash command: git checkout -- a.rs\nResult:\n",
+        ];
+        let mut shown = distill("/repo", "Try buffering", &tools, "Done.");
+        shown.narrate(narrative(), "haiku");
+        assert_eq!(
+            shown.abandoned.as_deref(),
+            Some("ran `git checkout --` after editing a.rs — The buffer dropped the first retry.")
         );
     }
 }

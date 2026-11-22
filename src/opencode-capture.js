@@ -64,7 +64,7 @@ async function setupOpenCode(ctx) {
     state?.briefs.delete(id);
     await captureTool(turn, id, event.tool, event.input,
       event.result?.content ?? event.error?.message, event.status === "error", event.result?.metadata);
-    const content = brief && event.status !== "error" ? withToolRecall(event.result?.content, brief) : undefined;
+    const content = brief ? withToolRecall(event.result?.content, brief) : undefined;
     if (content !== undefined) event.result = { ...event.result, content };
   });
 
@@ -169,6 +169,7 @@ async function legacyOpenCode({ client, directory }) {
       if (!["session.idle", "session.error", "session.deleted"].includes(event.type)) return;
       const turns = sessions.get(id);
       sessions.delete(id);
+      for (const key of briefs.keys()) if (key.startsWith(`${id}:`)) briefs.delete(key);
       if (event.type !== "session.idle" || !turns) return;
       try {
         const result = await client.session.messages({ path: { id }, query: { limit: 100 } });

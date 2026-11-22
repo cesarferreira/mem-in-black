@@ -109,6 +109,7 @@ Work as usual. Mem in Black stays quiet until it has something relevant:
 
 - **Recall.** Claude Code, Codex, OpenCode, Pi, and Oh My Pi automatically get relevant outcomes when a prompt matches earlier work in the same project. The brief includes the outcome, checks, decisions, and next step when available. Agents can also search memory through MCP.
 - **Recall at the point of action.** When an agent is about to edit a file or run a check that has history, it is reminded of it first. Editing a file recalls up to two earlier decisions, errors or failed checks from other sessions that touched that file. Running a check recalls the last time another session saw that same command fail. Each summary is shown once per session, a session gets at most five of these reminders, and nothing is recalled in a private turn. `MIB_ACTION_RECALL=0` turns it off.
+- **Dead ends.** A summary records an approach that was tried and given up, and one whose commit was later reverted or whose result you rejected is marked so. Editing a file recalls those first, shown as `Abandoned: …`, `later reverted in #id` or `disputed by the user`, and **Memories** badges them `abandoned`, `reverted` or `disputed`.
 - **Handoff.** Open another supported agent in the same worktree and branch and ask it to “continue the task started in Claude Code.” When you switch back, ask Claude Code to “continue the task started in Codex.” A detached HEAD uses an exact commit match. Earlier records without branch information are still searchable.
 - **Staleness.** When recalled work comes from an earlier Git revision, the brief says which of its files changed since, or that none did.
 - **Why.** `mib why src/foo.rs:42` runs `git blame` on that line and shows the agent turn that committed it: the original request, the decision, the checks, the commit and the evidence IDs. A line committed by a person, or not committed yet, shows the newest agent work on the file instead, labelled as that. `mib why src/foo.rs` lists the file's last 10 turns, and `--json` prints the same fields with an `origin` of `line` or `file`.
@@ -195,8 +196,17 @@ escape codes, and lines that look like credentials are not stored.
 **What a work summary holds:** after each turn, the worker writes a summary
 with the request, the outcome, the files changed (including edits made by
 shell commands), commits made during the turn, the checks that ran and their
-result, errors seen, decisions and the next step. When this format improves,
-the worker rebuilds earlier local summaries in place.
+result, errors seen, decisions, an approach the turn gave up, and the next
+step. When this format improves, the worker rebuilds earlier local summaries
+in place.
+
+An approach counts as given up when the tool records show it: the turn ran
+`git revert`, `git reset --hard`, `git restore`, `git checkout -- <path>` or
+`git stash` after editing, or its last check run failed. A summary also carries
+a status beside its text when a later commit reverts it or the next prompt
+rejects its result ("that didn't work", "still failing", "undo that"). A model
+can say why an approach was given up but cannot report one the tool records do
+not show.
 
 <a id="model-summaries"></a>
 ## Summaries
