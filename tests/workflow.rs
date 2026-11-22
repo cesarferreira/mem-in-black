@@ -5053,6 +5053,30 @@ fn a_forgotten_fact_is_not_rebuilt_by_the_next_pass() {
 }
 
 #[test]
+fn a_fact_forgotten_together_with_one_of_its_sources_is_not_rebuilt() {
+    let workspace = Workspace::new();
+    workspace.project_with_a_check_fact();
+    // A fourth passing session, so three remain after one source is forgotten
+    // and only the tombstone keeps the rule from writing the fact again.
+    workspace.turn_that_runs("s4", "t1", "src/delta.rs", &[("cargo test", false)]);
+    workspace.run(&["observe"], None);
+    let fact = workspace.facts().remove(0);
+    let source = fact["sources"][0].as_i64().unwrap();
+    // The source comes first, so the fact is already gone when its own id is reached.
+    workspace.run(
+        &["forget", &source.to_string(), &fact["id"].to_string()],
+        None,
+    );
+    assert!(workspace.facts().is_empty());
+    workspace.pad_summaries(20);
+    workspace.run(&["observe"], None);
+    assert!(
+        workspace.facts().is_empty(),
+        "the user named the fact; the remaining sources must not bring it back"
+    );
+}
+
+#[test]
 fn a_replaced_fact_is_not_rebuilt_even_after_its_replacement_is_forgotten() {
     let workspace = Workspace::new();
     workspace.project_with_a_check_fact();

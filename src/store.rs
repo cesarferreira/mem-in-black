@@ -1105,9 +1105,16 @@ impl Store {
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
         let mut removed = 0;
+        // Tombstones are written for every id before anything is deleted:
+        // forgetting a source deletes the facts that cite it, and a fact named
+        // later in the same call must still be found.
+        if tombstones {
+            for id in ids.iter().take(100) {
+                tombstone(&transaction, *id)?;
+            }
+        }
         for id in ids.iter().take(100) {
             if tombstones {
-                tombstone(&transaction, *id)?;
                 let citing: Vec<i64> = transaction
                     .prepare_cached(
                         "SELECT note_id FROM knowledge_sources WHERE event_id = ?1
