@@ -411,11 +411,11 @@ impl Store {
                 )?;
             }
             if version < 14 {
-                // Whether the agent used a delivered record: 1, 0, or NULL while
-                // unjudged or when use cannot be checked.
+                // Whether the agent used a delivered record: 1, 0, -1 when use
+                // can never be checked, or NULL while unjudged.
                 migration.execute_batch(
                     "ALTER TABLE deliveries ADD COLUMN used INTEGER;
-                     CREATE INDEX deliveries_judged ON deliveries(event_id) WHERE used IS NOT NULL;",
+                     CREATE INDEX deliveries_judged ON deliveries(event_id) WHERE used >= 0;",
                 )?;
             }
             if version < 15 {
@@ -979,7 +979,9 @@ impl Store {
         Ok(found)
     }
 
-    /// The assistant reply that closed the session's turn before `prompt`.
+    /// The assistant reply that closed the session's turn immediately before
+    /// `prompt`: none when a stored prompt (a turn that never got a reply, as
+    /// after an interrupt) lies between that reply and `prompt`.
     pub fn previous_reply(&self, prompt: &Record) -> Result<Option<Record>> {
         let _guard = self.read_guard()?;
         Ok(self
@@ -989,12 +991,26 @@ impl Store {
                     "SELECT {RECORD_COLUMNS} FROM events e
                      WHERE e.source = ?1 AND e.session = ?2 AND e.workspace = ?3
                        AND e.kind = 'assistant' AND e.id < ?4
+                       AND NOT EXISTS (SELECT 1 FROM events p WHERE p.source = ?1
+                         AND p.session = ?2 AND p.kind = 'prompt' AND p.id > e.id AND p.id < ?4)
                      ORDER BY e.id DESC LIMIT 1"
                 ),
                 params![prompt.source, prompt.session, prompt.workspace, prompt.id],
                 row_record,
             )
             .optional()?)
+    }
+
+    /// Whether any turn of the session was private, which leaves no stored
+    /// record to tell a turn's neighbours apart.
+    pub fn has_private_turn(&self, source: &str, session: &str) -> Result<bool> {
+        let _guard = self.read_guard()?;
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM turn_privacy WHERE source = ?1 AND session = ?2 AND private = 1)
+                 OR coalesce((SELECT private FROM sessions WHERE source = ?1 AND session = ?2), 0)",
+            params![source, session],
+            |row| row.get(0),
+        )?)
     }
 
     /// The first prompt the session received after `reply`, if any.
@@ -1071,8 +1087,10 @@ impl Store {
     }
 
     /// Delete records, the summaries built from them and their delivery
-    /// history. A project fact whose sources are all gone goes with them. A
-    /// fact deleted here is not written again by consolidation.
+    /// history. Every project fact that cites one of them goes too, without a
+    /// tombstone, so that the next consolidation pass rebuilds it from the
+    /// sources that remain and no forgotten text survives. A fact deleted
+    /// directly is not written again by consolidation.
     pub fn forget(&self, ids: &[i64]) -> Result<usize> {
         self.delete(ids, true)
     }
@@ -1090,6 +1108,18 @@ impl Store {
         for id in ids.iter().take(100) {
             if tombstones {
                 tombstone(&transaction, *id)?;
+                let citing: Vec<i64> = transaction
+                    .prepare_cached(
+                        "SELECT note_id FROM knowledge_sources WHERE event_id = ?1
+                         UNION SELECT k.note_id FROM events s JOIN knowledge_sources k ON k.event_id = s.id
+                         WHERE s.event_key = 'summary:' || ?1",
+                    )?
+                    .query_map([id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for fact in citing {
+                    transaction.execute("DELETE FROM deliveries WHERE event_id = ?1", [fact])?;
+                    removed += transaction.execute("DELETE FROM events WHERE id = ?1", [fact])?;
+                }
             }
             transaction.execute(
                 "DELETE FROM deliveries WHERE event_id = ?1
@@ -1531,62 +1561,71 @@ impl Store {
     /// records or has been quiet for 30 minutes, storing whether the agent
     /// used them in `deliveries.used`. Deliveries at the point of action are
     /// never judged: the edit that triggered one names the recalled file, so it
-    /// would count as used by construction. Summaries that name no files or
-    /// commits stay unjudged. Returns how many deliveries it judged.
+    /// would count as used by construction. A summary that names no files or
+    /// commits can never be checked; its deliveries are marked `-1` so that no
+    /// pass reads them again and they never count as judged. Returns how many
+    /// deliveries it judged.
     pub fn judge_deliveries(&self, limit: i64) -> Result<usize> {
         let read = self.read_guard()?;
-        let ready: Vec<(i64, String, String, i64, String)> = self
-            .db
-            .prepare(
-                "SELECT d.rowid, d.source, d.session, d.delivered_at, e.body
-                 FROM deliveries d JOIN events e ON e.id = d.event_id
-                 WHERE d.used IS NULL AND d.shown AND d.delivered_at IS NOT NULL
-                   AND d.\"trigger\" != 'action' AND e.kind = 'summary'
-                   AND (instr(char(10) || e.body, char(10) || 'Files: ') > 0
-                     OR instr(char(10) || e.body, char(10) || 'Commits: ') > 0)
-                   AND ((SELECT count(*) FROM (SELECT 1 FROM events l
-                           WHERE l.source = d.source AND l.session = d.session
-                             AND l.kind IN ('tool', 'assistant') AND l.created_at >= d.delivered_at
-                           LIMIT 60)) = 60
-                     OR max(d.delivered_at, coalesce((SELECT max(l.created_at) FROM events l
-                           WHERE l.source = d.source AND l.session = d.session), 0))
-                          <= unixepoch() - 1800)
-                 ORDER BY d.delivered_at LIMIT ?1",
-            )?
-            .query_map([limit], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let verdicts: Vec<(i64, bool)> = ready
-            .iter()
-            .filter_map(|(row, source, session, delivered_at, body)| {
-                self.follow_up((source, session, *delivered_at), body)
-                    .transpose()
-                    .map(|used| used.map(|used| (*row, used)))
-            })
-            .collect::<Result<_>>()?;
+        let mut ready = self.db.prepare(
+            "SELECT d.rowid, d.source, d.session, d.delivered_at, e.body
+             FROM deliveries d JOIN events e ON e.id = d.event_id
+             WHERE d.used IS NULL AND d.shown AND d.delivered_at IS NOT NULL
+               AND d.\"trigger\" != 'action' AND e.kind = 'summary'
+               AND ((SELECT count(*) FROM (SELECT 1 FROM events l
+                       WHERE l.source = d.source AND l.session = d.session
+                         AND l.kind IN ('tool', 'assistant') AND l.created_at >= d.delivered_at
+                       LIMIT 60)) = 60
+                 OR max(d.delivered_at, coalesce((SELECT max(l.created_at) FROM events l
+                       WHERE l.source = d.source AND l.session = d.session), 0))
+                      <= unixepoch() - 1800)
+             ORDER BY d.delivered_at",
+        )?;
+        let mut rows = ready.query([])?;
+        // Rows that cannot be checked cost only parsing, so they do not count
+        // toward the limit.
+        let mut verdicts: Vec<(i64, i64)> = Vec::new();
+        let mut judged = 0;
+        while let Some(row) = rows.next()? {
+            let (id, source, session, delivered_at, body): (i64, String, String, i64, String) = (
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            );
+            match self.follow_up((&source, &session, delivered_at), &body)? {
+                Some(used) => {
+                    verdicts.push((id, i64::from(used)));
+                    judged += 1;
+                    if judged == limit {
+                        break;
+                    }
+                }
+                None => verdicts.push((id, -1)),
+            }
+        }
+        drop(rows);
+        drop(ready);
         drop(read);
         if verdicts.is_empty() {
             return Ok(0);
         }
-        // Only the writes hold the lock: one transaction of at most `limit` updates.
+        // Only the writes hold the lock: one transaction of updates by rowid.
         let _guard = self.write_guard()?;
         let transaction = self.db.unchecked_transaction()?;
-        let mut judged = 0;
+        let mut written = 0;
         for (row, used) in verdicts {
-            judged += transaction.execute(
+            let changed = transaction.execute(
                 "UPDATE deliveries SET used = ?1 WHERE rowid = ?2 AND used IS NULL",
                 params![used, row],
             )?;
+            if used >= 0 {
+                written += changed;
+            }
         }
         transaction.commit()?;
-        Ok(judged)
+        Ok(written)
     }
 
     /// `(used, ignored)` for each record: in how many sessions the agent used
@@ -1596,7 +1635,7 @@ impl Store {
         let _guard = self.read_guard()?;
         let mut statement = self.db.prepare_cached(
             "SELECT coalesce(sum(used), 0), count(*) FROM deliveries
-             WHERE event_id = ?1 AND used IS NOT NULL",
+             WHERE event_id = ?1 AND used >= 0",
         )?;
         let mut counts = HashMap::new();
         for id in ids {
@@ -1628,7 +1667,7 @@ impl Store {
         Ok(Stats {
             recall_checked: scalar(
                 "SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
-                 WHERE d.used IS NOT NULL AND (?1 IS NULL OR e.workspace = ?1)",
+                 WHERE d.used >= 0 AND (?1 IS NULL OR e.workspace = ?1)",
             )?,
             recall_followed: scalar(
                 "SELECT count(*) FROM deliveries d JOIN events e ON e.id = d.event_id
@@ -1637,7 +1676,7 @@ impl Store {
             demoted: scalar(&format!(
                 "SELECT count(*) FROM (SELECT d.event_id FROM deliveries d
                  JOIN events e ON e.id = d.event_id
-                 WHERE d.used IS NOT NULL AND (?1 IS NULL OR e.workspace = ?1)
+                 WHERE d.used >= 0 AND (?1 IS NULL OR e.workspace = ?1)
                  GROUP BY d.event_id HAVING sum(d.used) = 0 AND count(*) >= {DEMOTED_AFTER})"
             ))?,
             action_injections: metric("action_injections")?,

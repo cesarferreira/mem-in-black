@@ -476,7 +476,9 @@ pub fn batch(store: &Store, data: &Path, settings: &Settings) -> Result<bool> {
     facts.extend(failure_facts(&turns));
     facts.extend(dead_end_facts(&turns, &statuses));
     let mut tokens = 0;
+    let mut conventions_found = false;
     if let Some((found, used)) = convention_facts(data, settings, &summaries) {
+        conventions_found = !found.is_empty();
         facts.extend(found);
         tokens = used;
     }
@@ -526,9 +528,15 @@ pub fn batch(store: &Store, data: &Path, settings: &Settings) -> Result<bool> {
         written += 1;
     }
     // A check that has not run lately is no longer how the project is checked.
+    // A convention is keyed by the model's wording, so once the model has
+    // answered, the ones it did not repeat are earlier wordings of the same
+    // findings or rules that no longer hold.
     let stale: Vec<i64> = live
         .iter()
-        .filter(|(key, _)| kind_of(key) == "check" && !kept.contains(key))
+        .filter(|(key, _)| {
+            (kind_of(key) == "check" || (conventions_found && kind_of(key) == "convention"))
+                && !kept.contains(key)
+        })
         .map(|(_, record)| record.id)
         .collect();
     if !stale.is_empty() {

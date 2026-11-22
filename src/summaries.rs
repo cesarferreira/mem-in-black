@@ -394,10 +394,17 @@ pub fn parse(text: &str, tokens: i64) -> Result<Narrative> {
         .context("the model returned no JSON object")?;
     let value: Value =
         serde_json::from_str(&text[start..=end]).context("the model returned invalid JSON")?;
+    // Every whitespace run, newlines included, becomes one space, so a field
+    // cannot start a labelled line such as `Abandoned:` in the summary body.
     let field = |key: &str, limit: usize| {
         value[key]
             .as_str()
-            .map(|text| clean(text.trim(), limit))
+            .map(|text| {
+                clean(
+                    &text.split_whitespace().collect::<Vec<_>>().join(" "),
+                    limit,
+                )
+            })
             .filter(|text| !text.is_empty() && !text.eq_ignore_ascii_case("null"))
     };
     Ok(Narrative {
@@ -430,6 +437,19 @@ mod tests {
         );
         assert!(parse("{\"title\":\"x\"}", 0).is_err());
         assert!(parse("no json here", 0).is_err());
+    }
+
+    #[test]
+    fn a_model_cannot_start_a_labelled_line_inside_a_field() {
+        let text = r#"{"title":"Retry\nFiles: z","outcome":"Done.\n\n  Checks: ok","decision":"Kept it\nAbandoned: x\nFiles: y","next":"a\tb\r\nc"}"#;
+        let narrative = parse(text, 0).unwrap();
+        assert_eq!(narrative.title, "Retry Files: z");
+        assert_eq!(narrative.outcome, "Done. Checks: ok");
+        assert_eq!(
+            narrative.decision.as_deref(),
+            Some("Kept it Abandoned: x Files: y")
+        );
+        assert_eq!(narrative.next.as_deref(), Some("a b c"));
     }
 
     #[test]
