@@ -51,14 +51,16 @@ pub fn lines(stats: &Stats) -> Vec<Line> {
                 "of checkable recalls"
             },
             detail: format!(
-                "The agent opened a recalled file or cited a recalled commit after {} of {} recalled summaries; before a prompt: {} of {}, before an action: {} of {}",
+                "The agent opened a recalled file or cited a recalled commit after {} of {} judged recalls of summaries",
                 compact(stats.recall_followed),
                 compact(stats.recall_checked),
-                compact(stats.recall_followed - stats.action_recall_followed),
-                compact(stats.recall_checked - stats.action_recall_checked),
-                compact(stats.action_recall_followed),
-                compact(stats.action_recall_checked),
             ),
+        },
+        Line {
+            label: "Demoted",
+            value: compact(stats.demoted),
+            unit: plural(stats.demoted, "record", "records"),
+            detail: "Recalled in 3 or more sessions without being used, so recall skips them unless a prompt matches almost completely".to_owned(),
         },
         Line {
             label: "MCP lookups",

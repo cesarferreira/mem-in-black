@@ -2209,7 +2209,7 @@ fn a_version_three_database_upgrades_and_keeps_its_records() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 14);
     let export = workspace.run(&["export"], None);
     assert!(
         export.contains(r#""body":"Bash command: gh pr view 1\nResult:\nMERGED""#),
@@ -2668,6 +2668,9 @@ fn summaries_list_turn_commits_and_recall_names_files_changed_since() {
         "PostToolUse",
         json!({"tool_name":"Read","tool_input":{"file_path": workspace.repo.join("src/ws.rs")}}),
     );
+    // The worker judges each recall once its session has gone quiet.
+    workspace.age(3600);
+    workspace.run(&["observe"], None);
     let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
     assert_eq!(stats["recall_checked"], 2, "{stats}");
     assert_eq!(stats["recall_followed"], 1, "{stats}");
@@ -3030,6 +3033,8 @@ fn a_version_ten_database_gets_its_summary_index_backfilled() {
              DROP TABLE summary_files;
              DROP TABLE summary_commits;
              ALTER TABLE deliveries DROP COLUMN \"trigger\";
+             DROP INDEX deliveries_judged;
+             ALTER TABLE deliveries DROP COLUMN used;
              PRAGMA user_version=10;",
         )
         .unwrap();
@@ -3154,7 +3159,7 @@ fn editing_a_file_recalls_the_decision_made_there_in_an_earlier_session() {
         "a summary is recalled once per session"
     );
 
-    // The agent edited the recalled file next, so the recall counts as used.
+    // The agent edited the recalled file next.
     workspace.hook(
         "claude",
         "later",
@@ -3162,13 +3167,22 @@ fn editing_a_file_recalls_the_decision_made_there_in_an_earlier_session() {
         json!({"turn_id":"start", "tool_name":"Edit", "tool_use_id":"edit-later",
             "tool_input":{"file_path": workspace.repo.join("src/retry.rs")}, "tool_response":{}}),
     );
-    let stats: Value = serde_json::from_str(&workspace.run(&["stats", "--json"], None)).unwrap();
+    // The edit that triggered the brief names the recalled file, so the recall
+    // is never judged: its use would be true by construction.
+    workspace.age(3600);
+    workspace.run(&["observe"], None);
+    assert_eq!(
+        workspace.judgments(),
+        [("later".to_owned(), None)],
+        "an action recall stays unjudged"
+    );
+    let stats = workspace.stats_json();
     assert_eq!(stats["action_injections"], 1, "{stats}");
-    assert_eq!(stats["action_recall_checked"], 1, "{stats}");
-    assert_eq!(stats["action_recall_followed"], 1, "{stats}");
+    assert_eq!(stats["recall_checked"], 0, "{stats}");
+    assert!(stats.get("action_recall_checked").is_none(), "{stats}");
     assert_eq!(stats["context_injections"], 1, "{stats}");
     let text = workspace.run(&["stats"], None);
-    assert!(text.contains("before an action: 1 of 1"), "{text}");
+    assert!(!text.contains("before an action"), "{text}");
 }
 
 #[test]
@@ -3663,4 +3677,275 @@ fn mcp_why_returns_the_same_entries_as_the_cli() {
         "{results:?}"
     );
     assert_eq!(entries[0]["origin"], "line");
+}
+
+impl Workspace {
+    fn database(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.temp.path().join("data/memory.sqlite3")).unwrap()
+    }
+
+    /// Moves every record and delivery `seconds` into the past, as if the
+    /// sessions had ended that long ago.
+    fn age(&self, seconds: i64) {
+        let database = self.database();
+        database
+            .execute("UPDATE events SET created_at = created_at - ?1", [seconds])
+            .unwrap();
+        database
+            .execute(
+                "UPDATE deliveries SET delivered_at = delivered_at - ?1 WHERE delivered_at IS NOT NULL",
+                [seconds],
+            )
+            .unwrap();
+    }
+
+    /// The `used` verdict of every shown delivery, oldest first, as `(session, used)`.
+    fn judgments(&self) -> Vec<(String, Option<i64>)> {
+        let database = self.database();
+        let mut statement = database
+            .prepare(
+                "SELECT session, used FROM deliveries WHERE shown ORDER BY delivered_at, rowid",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The context a prompt in a new session receives, if any.
+    fn recall_in(&self, session: &str, prompt: &str, env: &[(&str, &str)]) -> Option<String> {
+        let output = self.run_with_env(
+            &["hook", "claude"],
+            Some(
+                json!({"cwd": self.repo, "session_id": session, "turn_id": "ask",
+                "hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+            ),
+            env,
+        );
+        (!output.is_empty()).then(|| {
+            serde_json::from_str::<Value>(&output).unwrap()["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+    }
+
+    fn stats_json(&self) -> Value {
+        serde_json::from_str(&self.run(&["stats", "--json"], None)).unwrap()
+    }
+
+    fn summary_id(&self, file: &str) -> i64 {
+        self.database()
+            .query_row(
+                "SELECT id FROM events WHERE kind = 'summary' AND body LIKE ?1",
+                [format!("%Files: {file}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+const RETRY_PROMPT: &str = "Why does the retry counter get reset after the handshake";
+
+fn retry_decision(workspace: &Workspace, session: &str, file: &str) {
+    workspace.turn_with_reason(
+        session,
+        "t1",
+        file,
+        &format!("Kept the retry counter in {file} because the handshake resets it."),
+    );
+}
+
+#[test]
+fn a_summary_ignored_in_three_sessions_stops_being_recalled() {
+    let workspace = Workspace::new();
+    retry_decision(&workspace, "earlier", "src/retry.rs");
+    // A second record gives "jitter" some rarity, so the prompt below matches
+    // the retry decision on most of its weight but not on nearly all of it.
+    workspace.turn_with_reason(
+        "other",
+        "t1",
+        "src/backoff.rs",
+        "Added jitter to the backoff.",
+    );
+    workspace.run(&["observe"], None);
+    let partial = &format!("{RETRY_PROMPT} with jitter");
+    for session in ["a", "b", "c"] {
+        assert!(
+            workspace.recall_in(session, partial, &[]).is_some(),
+            "{session} is recalled the decision"
+        );
+    }
+    assert!(workspace.judgments().iter().all(|(_, used)| used.is_none()));
+
+    // None of the three sessions touched src/retry.rs before it went quiet.
+    workspace.age(3600);
+    workspace.run(&["observe"], None);
+    assert_eq!(
+        workspace.judgments(),
+        ["a", "b", "c"].map(|session| (session.to_owned(), Some(0)))
+    );
+    let stats = workspace.stats_json();
+    assert_eq!(stats["demoted"], 1, "{stats}");
+    assert_eq!(stats["recall_checked"], 3, "{stats}");
+    assert_eq!(stats["recall_followed"], 0, "{stats}");
+    let text = workspace.run(&["stats"], None);
+    assert!(text.contains("Demoted       1 record"), "{text}");
+
+    assert_eq!(
+        workspace.recall_in("d", partial, &[]),
+        None,
+        "the demoted summary is not recalled again"
+    );
+    assert!(
+        workspace
+            .recall_in("e", partial, &[("MIB_ADAPTIVE_RANKING", "0")])
+            .is_some(),
+        "the off switch restores the fixed order"
+    );
+    assert!(
+        workspace.recall_in("f", RETRY_PROMPT, &[]).is_some(),
+        "a prompt that matches almost completely still recalls it"
+    );
+}
+
+#[test]
+fn a_summary_that_was_used_outranks_an_equal_match_that_was_not() {
+    let workspace = Workspace::new();
+    let files = [
+        "src/alpha.rs",
+        "src/beta.rs",
+        "src/gamma.rs",
+        "src/delta.rs",
+    ];
+    for file in files {
+        retry_decision(&workspace, &format!("earlier-{file}"), file);
+    }
+    workspace.run(&["observe"], None);
+    let ids = files.map(|file| workspace.summary_id(file));
+    let mentions = |text: &str, id: i64| text.find(&format!(" #{id} • summary"));
+
+    // Four equal matches, room for three: the fused order drops one.
+    let baseline = workspace.recall_in("baseline", RETRY_PROMPT, &[]).unwrap();
+    let missing: Vec<i64> = ids
+        .into_iter()
+        .filter(|id| mentions(&baseline, *id).is_none())
+        .collect();
+    assert_eq!(missing.len(), 1, "{baseline}");
+    let shown: Vec<i64> = ids.into_iter().filter(|id| *id != missing[0]).collect();
+
+    // Earlier sessions used the missing one and ignored the first one shown.
+    let database = workspace.database();
+    for (session, id, used) in [("old-1", missing[0], 1), ("old-2", shown[0], 0)] {
+        database
+            .execute(
+                "INSERT INTO deliveries(source, session, event_id, shown, delivered_at, used)
+                 VALUES ('claude', ?1, ?2, 1, unixepoch() - 7200, ?3)",
+                rusqlite::params![session, id, used],
+            )
+            .unwrap();
+    }
+    let ranked = workspace.recall_in("ranked", RETRY_PROMPT, &[]).unwrap();
+    assert_eq!(mentions(&ranked, shown[0]), None, "{ranked}");
+    let first = mentions(&ranked, missing[0]).expect("the used summary is recalled");
+    for id in &shown[1..] {
+        assert!(first < mentions(&ranked, *id).unwrap(), "{ranked}");
+    }
+
+    let fixed = workspace
+        .recall_in("fixed", RETRY_PROMPT, &[("MIB_ADAPTIVE_RANKING", "0")])
+        .unwrap();
+    assert_eq!(fixed, baseline, "the off switch restores the fixed order");
+}
+
+#[test]
+fn uncheckable_records_are_ranked_as_before() {
+    let workspace = Workspace::new();
+    workspace.seed();
+    workspace.run(&["observe"], None);
+    let prompt = "Fix the websocket retry regression again";
+    let first = workspace
+        .recall_in("a", prompt, &[])
+        .expect("the summary is recalled");
+    for session in ["b", "c"] {
+        assert!(workspace.recall_in(session, prompt, &[]).is_some());
+    }
+    // The summary names no files or commits, so its use can never be seen.
+    workspace.age(3600);
+    workspace.run(&["observe"], None);
+    assert!(workspace.judgments().iter().all(|(_, used)| used.is_none()));
+    let stats = workspace.stats_json();
+    assert_eq!(stats["recall_checked"], 0, "{stats}");
+    assert_eq!(stats["demoted"], 0, "{stats}");
+    let again = workspace
+        .recall_in("d", prompt, &[])
+        .expect("still recalled");
+    let fixed = workspace
+        .recall_in("e", prompt, &[("MIB_ADAPTIVE_RANKING", "0")])
+        .unwrap();
+    assert_eq!(again, fixed);
+    assert_eq!(again, first);
+}
+
+#[test]
+fn a_recall_is_judged_after_sixty_later_records_or_thirty_quiet_minutes() {
+    let workspace = Workspace::new();
+    retry_decision(&workspace, "earlier", "src/retry.rs");
+    workspace.run(&["observe"], None);
+    assert!(workspace.recall_in("busy", RETRY_PROMPT, &[]).is_some());
+    let (root, project): (String, String) = workspace
+        .database()
+        .query_row("SELECT workspace, project FROM events LIMIT 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let filler = |count: usize, from: usize| {
+        let database = workspace.database();
+        for index in from..from + count {
+            database
+                .execute(
+                    "INSERT INTO events(source, session, event_key, kind, body, workspace, project)
+                     VALUES ('claude', 'busy', ?1, 'tool', 'Bash command: ls', ?2, ?3)",
+                    rusqlite::params![format!("filler-{index}"), root, project],
+                )
+                .unwrap();
+        }
+    };
+    let busy = || workspace.judgments().pop().unwrap().1;
+
+    filler(59, 0);
+    workspace.run(&["observe"], None);
+    assert_eq!(busy(), None, "59 later records and a live session");
+    filler(1, 59);
+    workspace.run(&["observe"], None);
+    assert_eq!(busy(), Some(0), "the sixtieth later record settles it");
+
+    // A session that touched the recalled file and then went quiet.
+    assert!(workspace.recall_in("quiet", RETRY_PROMPT, &[]).is_some());
+    workspace.hook(
+        "claude",
+        "quiet",
+        "PostToolUse",
+        json!({"turn_id": "ask", "tool_name": "Read", "tool_use_id": "read",
+            "tool_input": {"file_path": workspace.repo.join("src/retry.rs")}}),
+    );
+    workspace.age(29 * 60);
+    workspace.run(&["observe"], None);
+    assert_eq!(
+        workspace.judgments().pop().unwrap().1,
+        None,
+        "29 quiet minutes"
+    );
+    workspace.age(120);
+    workspace.run(&["observe"], None);
+    assert_eq!(
+        workspace.judgments().pop().unwrap().1,
+        Some(1),
+        "30 quiet minutes"
+    );
+    let stats = workspace.stats_json();
+    assert_eq!(stats["recall_checked"], 2, "{stats}");
+    assert_eq!(stats["recall_followed"], 1, "{stats}");
 }

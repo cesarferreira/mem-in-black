@@ -159,6 +159,7 @@ pub fn observe_once(data: &Storage) -> Result<()> {
     let settings = crate::summaries::load(&data.directory)?;
     let refresh = store.summary_refresh_bound()?;
     while observer::process_one(&store, &data.directory, &settings, refresh)? {}
+    while observer::judge_batch(&store)? {}
     Ok(())
 }
 
@@ -216,10 +217,21 @@ pub fn run(data: &Storage) -> Result<()> {
         let Ok(store) = Store::open(&worker_data) else {
             return;
         };
+        // Recalls are judged only when no summary is waiting, at most every 30 seconds.
+        let mut judged = None::<Instant>;
         loop {
             match observer::process_one(&store, &worker_data.directory, &settings, refresh) {
                 Ok(true) => {}
-                Ok(false) => thread::sleep(Duration::from_secs(2)),
+                Ok(false) => {
+                    if judged.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                        judged = Some(Instant::now());
+                        if observer::judge_batch(&store).unwrap_or(false) {
+                            judged = None;
+                            continue;
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(2));
+                }
                 Err(_) => thread::sleep(Duration::from_secs(5)),
             }
         }

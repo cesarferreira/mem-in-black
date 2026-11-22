@@ -1,5 +1,5 @@
 use crate::{
-    store::{Observation, Record, Store},
+    store::{DEMOTED_AFTER, Observation, Record, Store},
     workspace::Workspace,
 };
 use anyhow::{Context, Result};
@@ -836,6 +836,7 @@ fn action_recall(
             }
         }
         kept.sort_by_key(|record| std::cmp::Reverse((record.created_at, record.id)));
+        rank_by_use(store, &mut kept)?;
         kept.truncate(2);
     } else if let Some(command) = command {
         let body = format!("{name} command: {command}");
@@ -977,10 +978,19 @@ fn recall(
     let rarity = store.term_rarity(&words, &workspace.project, source, session)?;
     let total_rarity: f64 = rarity.values().sum();
     let candidates = store.recall_ids(&fused, &workspace.project, source, session)?;
-    let mut evidence: Vec<Record> = Vec::new();
+    let adaptive = adaptive_ranking_enabled();
+    let debug = std::env::var_os("MIB_DEBUG").is_some();
+    // Fresh candidates in fused order: (matching candidate, evidence, smoothed use rate).
+    let mut pool: Vec<(&Record, Record, f64)> = Vec::new();
     let mut matched = Vec::new();
     for record in &candidates {
-        if evidence.len() == 3 {
+        if pool.len()
+            == if adaptive {
+                RANKED_CANDIDATES
+            } else {
+                RECALL_LIMIT
+            }
+        {
             break;
         }
         let Some(outcome) = outcome(store, record)? else {
@@ -997,26 +1007,98 @@ fn recall(
         let meaning = semantic.iter().any(|(id, strong)| {
             *id == record.id && (*strong || (shared >= 1 && weight >= ASSISTED_RARITY))
         });
-        if std::env::var_os("MIB_DEBUG").is_some() {
+        let counts = if adaptive {
+            store
+                .usefulness(&[outcome.id])?
+                .remove(&outcome.id)
+                .unwrap_or_default()
+        } else {
+            (0, 0)
+        };
+        if debug {
             eprintln!(
-                "Mem in Black recall: #{} {} shared={shared} rarity={weight:.2} coverage={coverage:.2} keyword={keyword} semantic={meaning}",
-                outcome.id, outcome.kind
+                "Mem in Black recall: #{} {} shared={shared} rarity={weight:.2} coverage={coverage:.2} keyword={keyword} semantic={meaning} used={} ignored={}",
+                outcome.id, outcome.kind, counts.0, counts.1
             );
         }
         if !(keyword || meaning) {
             continue;
         }
-        matched.push(record);
-        if evidence.iter().all(|seen| seen.id != outcome.id)
-            && !store.was_delivered(source, session, outcome.id)?
-        {
-            evidence.push(outcome);
+        if demoted(counts) && coverage < DEMOTED_COVERAGE {
+            if debug {
+                eprintln!("Mem in Black recall: #{} demoted", outcome.id);
+            }
+            continue;
         }
+        if pool.iter().any(|(_, seen, _)| seen.id == outcome.id)
+            || store.was_delivered(source, session, outcome.id)?
+        {
+            matched.push(record);
+        } else {
+            pool.push((record, outcome, use_rate(counts)));
+        }
+    }
+    // Stable, so equal rates keep the fused order.
+    if adaptive {
+        pool.sort_by(|a, b| b.2.total_cmp(&a.2));
+    }
+    pool.truncate(RECALL_LIMIT);
+    let mut evidence = Vec::new();
+    for (record, outcome, _) in pool {
+        matched.push(record);
+        evidence.push(outcome);
     }
     let shown: Vec<_> = evidence.iter().collect();
     store.record_delivery(source, session, "prompt", &shown, &matched, |records| {
         render(workspace, records)
     })
+}
+
+fn adaptive_ranking_enabled() -> bool {
+    !matches!(
+        std::env::var("MIB_ADAPTIVE_RANKING").as_deref(),
+        Ok("0" | "false" | "off")
+    )
+}
+
+/// Candidates collected before the best [`RECALL_LIMIT`] are kept.
+const RANKED_CANDIDATES: usize = 6;
+/// Records one prompt can recall.
+const RECALL_LIMIT: usize = 3;
+/// A demoted record is still recalled when this much of the prompt's weight
+/// matches it.
+const DEMOTED_COVERAGE: f64 = 0.8;
+
+/// Share of a record's judged recalls that were used, smoothed so that a
+/// record with no history sits between a used one and an ignored one.
+fn use_rate((used, ignored): (i64, i64)) -> f64 {
+    (used + 1) as f64 / (used + ignored + 2) as f64
+}
+
+/// Ignored in [`DEMOTED_AFTER`] sessions and never used.
+fn demoted((used, ignored): (i64, i64)) -> bool {
+    used == 0 && ignored >= DEMOTED_AFTER
+}
+
+/// Orders records by [`use_rate`], keeping their order when rates are equal,
+/// and prints each one's counts under `MIB_DEBUG`.
+fn rank_by_use(store: &Store, records: &mut [Record]) -> Result<()> {
+    if !adaptive_ranking_enabled() || records.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = records.iter().map(|record| record.id).collect();
+    let counts = store.usefulness(&ids)?;
+    if std::env::var_os("MIB_DEBUG").is_some() {
+        for record in records.iter() {
+            let (used, ignored) = counts[&record.id];
+            eprintln!(
+                "Mem in Black action recall: #{} used={used} ignored={ignored}",
+                record.id
+            );
+        }
+    }
+    records.sort_by(|a, b| use_rate(counts[&b.id]).total_cmp(&use_rate(counts[&a.id])));
+    Ok(())
 }
 
 enum Handoff {
