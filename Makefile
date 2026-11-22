@@ -1,4 +1,4 @@
-.PHONY: all build build-release install install-release clean test ci check fmt lint run demo release
+.PHONY: all build build-release install install-release clean test ci check fmt lint run demo release bench bench-validate
 
 LEVEL ?= minor
 
@@ -54,6 +54,15 @@ run:
 demo: install
 	@echo "=== mem-in-black demo ==="
 	mib --help
+
+# Task benchmark. Calls a real model: it spends your tokens (see bench/README.md).
+# Usage: make bench BENCH_ARGS="--task handoff-currency --runs 3 --model haiku"
+bench: build
+	node bench/run.mjs $(BENCH_ARGS)
+
+# Check every benchmark task without calling a model (free)
+bench-validate: build
+	node bench/run.mjs --validate $(BENCH_ARGS)
 
 # Bump version, regenerate CHANGELOG.md, tag, and push (requires cargo-release + git-cliff)
 release:

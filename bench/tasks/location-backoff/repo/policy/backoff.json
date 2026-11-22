@@ -1,0 +1,1 @@
+{ "baseMs": 400, "factor": 2, "attempts": 8, "capMs": 60000 }

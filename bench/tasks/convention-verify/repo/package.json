@@ -1,0 +1,5 @@
+{
+  "name": "textools",
+  "version": "1.0.0",
+  "scripts": { "test": "echo \"no tests here, see scripts/\" && exit 0" }
+}

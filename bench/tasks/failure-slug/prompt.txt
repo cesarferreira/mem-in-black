@@ -1,0 +1,1 @@
+slug() mangles accented titles such as Straße and Łódź Café. Make test.js pass.

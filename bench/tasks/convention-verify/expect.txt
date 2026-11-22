@@ -1,0 +1,2 @@
+sh scripts/verify.sh
+node scripts/gen-manifest.js

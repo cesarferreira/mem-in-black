@@ -1,0 +1,1 @@
+Change the error message for a negative amount in the cli to say: Amount must be zero or more.

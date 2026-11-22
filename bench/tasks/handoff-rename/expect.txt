@@ -1,0 +1,2 @@
+is deprecated, use "maxRetries"
+config.json

@@ -1,0 +1,1 @@
+currency flag price CLI rates.json

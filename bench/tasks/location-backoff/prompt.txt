@@ -1,0 +1,1 @@
+The CLI waits far too long before giving up when the API is down. Make the total retry wait at most 5 seconds, but keep at least 3 attempts.

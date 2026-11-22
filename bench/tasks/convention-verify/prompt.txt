@@ -1,0 +1,1 @@
+Add a reverse command to tools.js and a test for it, and make sure the project's checks pass.
