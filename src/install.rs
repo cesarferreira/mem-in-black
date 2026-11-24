@@ -465,16 +465,17 @@ fn hooks_file(
         host.name()
     );
     let mut events = vec![
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop",
-        "PreToolUse",
-        "PostToolUse",
+        ("SessionStart", "Showing recent activity"),
+        ("UserPromptSubmit", "Recalling prompt context"),
+        ("Stop", "Recording the assistant response"),
+        ("PreToolUse", "Recalling tool context"),
+        ("PostToolUse", "Recording tool output"),
     ];
     if matches!(host, Host::Claude) {
-        events.push("PostToolUseFailure");
+        events.push(("PostToolUseFailure", "Recording tool failure"));
     }
-    for event in events {
+    for (event, activity) in events {
+        let status_message = (host == Host::Codex).then(|| format!("Mem in Black: {activity}"));
         let groups = hooks
             .entry(event)
             .or_insert_with(|| json!([]))
@@ -499,6 +500,13 @@ fn hooks_file(
                 }
                 found = true;
                 hook["command"] = json!(command);
+                if let Some(message) = &status_message
+                    && hook["statusMessage"]
+                        .as_str()
+                        .is_none_or(|existing| existing.trim().is_empty())
+                {
+                    hook["statusMessage"] = json!(message);
+                }
                 true
             });
             if list.is_empty() && before > 0 {
@@ -507,7 +515,11 @@ fn hooks_file(
         }
         groups.retain(|group| !group.is_null());
         if !found {
-            groups.push(json!({"hooks":[{"type":"command","command":command,"timeout":2}]}));
+            let mut hook = json!({"type":"command","command":command,"timeout":2});
+            if let Some(message) = status_message {
+                hook["statusMessage"] = json!(message);
+            }
+            groups.push(json!({"hooks":[hook]}));
         }
     }
     Ok((path, serde_json::to_string_pretty(&doc)? + "\n"))

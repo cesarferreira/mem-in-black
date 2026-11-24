@@ -631,6 +631,11 @@ fn installer_preserves_existing_config_and_is_idempotent() {
         claude_settings["hooks"]["Stop"].as_array().unwrap().len(),
         2
     );
+    assert!(
+        claude_settings["hooks"]["Stop"][1]["hooks"][0]
+            .get("statusMessage")
+            .is_none()
+    );
     let codex_settings = std::fs::read_to_string(codex.join("config.toml")).unwrap();
     assert!(codex_settings.contains("model = 'custom'"));
     assert!(codex_settings.contains("[mcp_servers.other]"));
@@ -659,6 +664,19 @@ fn installer_preserves_existing_config_and_is_idempotent() {
             .len(),
         1
     );
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "PreToolUse",
+        "PostToolUse",
+    ] {
+        assert!(
+            codex_hooks["hooks"][event][0]["hooks"][0]["statusMessage"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("Mem in Black: "))
+        );
+    }
 }
 
 #[test]
@@ -1481,6 +1499,14 @@ fn reinstall_updates_its_own_hook_when_data_dir_changes() {
     let workspace = Workspace::new();
     let home = workspace.temp.path().join("profiles");
     workspace.run(&["install", "--home", home.to_str().unwrap()], None);
+    let hooks_path = home.join(".codex/hooks.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
+    config["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("statusMessage");
+    config["hooks"]["PreToolUse"][0]["hooks"][0]["statusMessage"] = json!("Custom recall label");
+    std::fs::write(&hooks_path, config.to_string()).unwrap();
     let updated_data = workspace.temp.path().join("new location");
     workspace.run(
         &[
@@ -1492,10 +1518,17 @@ fn reinstall_updates_its_own_hook_when_data_dir_changes() {
         ],
         None,
     );
-    let config: Value =
-        serde_json::from_slice(&std::fs::read(home.join(".codex/hooks.json")).unwrap()).unwrap();
+    let config: Value = serde_json::from_slice(&std::fs::read(hooks_path).unwrap()).unwrap();
     let groups = config["hooks"]["UserPromptSubmit"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["hooks"][0]["statusMessage"],
+        "Mem in Black: Recalling prompt context"
+    );
+    assert_eq!(
+        config["hooks"]["PreToolUse"][0]["hooks"][0]["statusMessage"],
+        "Custom recall label"
+    );
     assert!(
         groups[0]["hooks"][0]["command"]
             .as_str()
