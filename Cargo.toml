@@ -5,9 +5,15 @@ edition = "2024"
 rust-version = "1.99"
 description = "We remember so your agents don't have to. Local memory for coding agents."
 license = "MIT"
-publish = false
 authors = ["Cesar Ferreira"]
 repository = "https://github.com/cesarferreira/mem-in-black"
+# Keep the published crate small: the README screenshot, the benchmark suite and
+# the planning docs are not needed to build or run mib.
+exclude = [
+    "assets/",
+    "bench/",
+    "docs/",
+]
 
 [[bin]]
 name = "mib"
