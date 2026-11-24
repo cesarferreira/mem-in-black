@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-11-24
+
+### 🐛 Bug Fixes
+
+- Label Mem in Black Codex hooks
+
+### 📚 Documentation
+
+- Add a How it works diagram to the README ([#11](https://github.com/cesarferreira/mem-in-black/issues/11))
+- Trim the README to scannable sections ([#12](https://github.com/cesarferreira/mem-in-black/issues/12))
 ## [0.3.0] - 2026-11-24
 
 ### 🚀 Features
