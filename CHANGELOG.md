@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-11-24
+
+### 🚀 Features
+
+- Recall earlier work when an agent edits a file or reruns a check ([#3](https://github.com/cesarferreira/mem-in-black/issues/3))
+- Add a task benchmark for memory against no memory ([#4](https://github.com/cesarferreira/mem-in-black/issues/4))
+- Explain a line or file with mib why ([#5](https://github.com/cesarferreira/mem-in-black/issues/5))
+- Rank recall by whether earlier deliveries were used ([#6](https://github.com/cesarferreira/mem-in-black/issues/6))
+- Remember abandoned, reverted and disputed approaches and recall them first when a file is edited again ([#7](https://github.com/cesarferreira/mem-in-black/issues/7))
+- Condense repeated work into project facts ([#8](https://github.com/cesarferreira/mem-in-black/issues/8))
+
+### 🐛 Bug Fixes
+
+- Address review findings in dead ends, judging, facts and mib why ([#9](https://github.com/cesarferreira/mem-in-black/issues/9))
+
+### 📚 Documentation
+
+- Plan point-of-action memory ([#2](https://github.com/cesarferreira/mem-in-black/issues/2))
+- Add screenshot and crates.io badges to README header
+- Document installing from crates.io
+
+### ⚙️ Miscellaneous Tasks
+
+- Publish mem-in-black to crates.io
 ## [0.2.0] - 2026-11-21
 
 ### 🚀 Features
