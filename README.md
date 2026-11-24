@@ -13,6 +13,8 @@
   <p>
     <a href="#install">Install</a>
     &nbsp;·&nbsp;
+    <a href="#how-it-works">How it works</a>
+    &nbsp;·&nbsp;
     <a href="#semantic-search">Semantic search</a>
     &nbsp;·&nbsp;
     <a href="#configuration">Configuration</a>
@@ -129,6 +131,35 @@ Agents can also call the MCP tools `search`, `timeline`, `get_observations`,
 `why` (a line or file back to the request and decision behind it),
 `save_memory` (with `replaces` to correct old records) and `forget`.
 Pass `memories_only: true` to `search` for decisions and completed work.
+
+## How it works
+
+Each agent event runs `mib hook`, which stores the event locally and can send a
+short recall brief back to the agent. A background worker turns finished turns
+into summaries and project facts. Agents look up more through MCP, and you use
+the CLI and viewer.
+
+```mermaid
+flowchart LR
+  A["Coding agent<br/>Claude Code, Codex,<br/>OpenCode, Pi"]
+  H["mib hook"]
+  DB[("Local SQLite")]
+  W["Background worker<br/>summaries, facts, embeddings"]
+  M["MCP tools"]
+  Y["You: CLI and viewer"]
+
+  A -->|prompts, tool calls, replies| H
+  H -->|store| DB
+  H -.->|recall brief| A
+  DB <--> W
+  A -->|search, why, save| M
+  M <--> DB
+  Y <--> DB
+```
+
+Everything above runs on your machine. Apart from the one-time embedding model
+download, only the summary and convention calls leave it, and only when model
+summaries are on (see [Summaries](#summaries)).
 
 ## Semantic search
 
