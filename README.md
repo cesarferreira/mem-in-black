@@ -4,12 +4,12 @@
   <p><strong>We remember so your agents don't have to.</strong></p>
 
   <p>
-    <a href="https://github.com/cesarferreira/mem-in-black/actions/workflows/rust-tests.yml">
-      <img alt="Tests" src="https://github.com/cesarferreira/mem-in-black/actions/workflows/rust-tests.yml/badge.svg?branch=main">
-    </a>
-    <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
+    <a href="https://github.com/cesarferreira/mem-in-black/actions/workflows/rust-tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/cesarferreira/mem-in-black/rust-tests.yml?branch=main&amp;logo=github&amp;label=tests"></a>
+    <a href="https://crates.io/crates/mem-in-black"><img alt="Crates.io" src="https://img.shields.io/crates/v/mem-in-black"></a>
+    <a href="https://crates.io/crates/mem-in-black"><img alt="Crates.io downloads" src="https://img.shields.io/crates/d/mem-in-black"></a>
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
   </p>
-
+  <img src="assets/screenshot.png" width="100%" alt="mib session-start brief in Claude Code">
   <p>
     <a href="#install">Install</a>
     &nbsp;·&nbsp;
