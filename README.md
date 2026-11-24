@@ -69,7 +69,14 @@ The script checks the download against the release's SHA-256 checksums and
 puts `mib` in `~/.local/bin`. Set `MIB_INSTALL_DIR` for another folder, or
 `MIB_VERSION=v0.1.1` for a specific release.
 
-To build from source instead, use [Rust](https://rustup.rs) 1.99 or newer:
+With [Rust](https://rustup.rs) 1.99 or newer, you can install from crates.io:
+
+```bash
+cargo install mem-in-black --locked
+mib install
+```
+
+To build from source instead:
 
 ```bash
 git clone https://github.com/cesarferreira/mem-in-black.git
