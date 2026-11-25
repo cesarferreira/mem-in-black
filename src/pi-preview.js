@@ -11,8 +11,8 @@ export default function (pi) {
       ? "always"
       : "never";
     try {
-      const result = await pi.exec(mem-in-black.binary, [
-        ...(mem-in-black.dataDirectory ? ["--data-dir", mem-in-black.dataDirectory] : []),
+      const result = await pi.exec(mib.binary, [
+        ...(mib.dataDirectory ? ["--data-dir", mib.dataDirectory] : []),
         "preview", "--workspace", ctx.cwd, "--color", color,
       ], { timeout: 2000 });
       if (result.code === 0 && result.stdout.trim()) {

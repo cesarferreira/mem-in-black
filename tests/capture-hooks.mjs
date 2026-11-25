@@ -11,6 +11,7 @@ const binary = resolve(process.env.MIB_TEST_BINARY ?? "target/debug/mib");
 const content = (text) => [{ type: "text", text }];
 process.env.MIB_NO_AUTOSTART = "1";
 process.env.MIB_SUMMARIES = "off";
+process.env.MIB_STARTUP_PREVIEW = "1";
 
 async function fixture(test, host, path) {
   const home = await mkdtemp(join(tmpdir(), "mib-capture-"));
@@ -22,6 +23,36 @@ async function fixture(test, host, path) {
   const { default: plugin } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
   return { home, command, plugin };
 }
+
+test("Pi loads the installed startup extension and displays the preview", async (test) => {
+  const { home, plugin } = await fixture(test, "pi", ".pi/agent/extensions/mem-in-black-startup.js");
+  const tty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+  test.after(() => {
+    if (tty) Object.defineProperty(process.stdout, "isTTY", tty);
+    else delete process.stdout.isTTY;
+  });
+
+  const handlers = new Map();
+  const calls = [];
+  plugin({
+    on: (name, handler) => handlers.set(name, handler),
+    exec: async (command, args) => {
+      calls.push([command, ...args]);
+      return { code: 0, stdout: "Previous work\nUpdated the parser\n" };
+    },
+  });
+  const widgets = [];
+  const context = { cwd: home, hasUI: true, ui: { setWidget: (...args) => widgets.push(args) } };
+  await handlers.get("session_start")({ reason: "startup" }, context);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].slice(0, -1), [
+    binary, "--data-dir", join(home, "memory"), "preview", "--workspace", home, "--color",
+  ]);
+  assert.deepEqual(widgets, [["mem-in-black-startup", ["Previous work", "Updated the parser"]]]);
+  await handlers.get("before_agent_start")({}, context);
+  assert.deepEqual(widgets.at(-1), ["mem-in-black-startup", undefined]);
+});
 
 async function memory(command, source, tools = ["tool"]) {
   await command("observe");
